@@ -1,9 +1,11 @@
-pub mod domain;
-pub mod storage;
-pub mod server;
+use crate::cli::run;
+
 pub mod cli;
 mod config;
+pub mod domain;
+pub mod server;
+pub mod storage;
 
 fn main() {
-    println!("Hello, world!");
+    run();
 }

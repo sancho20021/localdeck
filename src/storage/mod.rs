@@ -1,3 +1,4 @@
 mod schema;
-mod db;
-mod observe;
+pub mod db;
+mod fs;
+pub mod operations;

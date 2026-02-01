@@ -1,5 +1,6 @@
-use std::{any, path::Path};
+use std::path::Path;
 
+use anyhow::Context;
 use blake3::Hash;
 
 /// Represents the track ID.
@@ -18,7 +19,53 @@ impl TrackId {
         self.0.to_hex().to_string()
     }
 
+    pub fn from_hex<S: AsRef<[u8]>>(hex: S) -> anyhow::Result<Self> {
+        Ok(Self(
+            blake3::Hash::from_hex(hex).with_context(|| "Failed to parse track id")?,
+        ))
+    }
+
+    /// reads file and hashes it
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        Ok(Self(blake3::hash(path)?))
+        let contents =
+            std::fs::read(path).with_context(|| "Failed to calculate track id of a file")?;
+        Ok(Self::from_bytes(&contents))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use crate::domain::hash::TrackId;
+
+    #[test]
+    fn same_contents_same_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.mp3");
+        let b = tmp.path().join("b.mp3");
+
+        std::fs::write(&a, b"same").unwrap();
+        std::fs::write(&b, b"same").unwrap();
+
+        let ha = TrackId::from_file(&a).unwrap();
+        let hb = TrackId::from_file(&b).unwrap();
+
+        assert_eq!(ha, hb);
+    }
+
+    #[test]
+    fn different_contents_different_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a.mp3");
+        let b = tmp.path().join("b.mp3");
+
+        std::fs::write(&a, b"something").unwrap();
+        std::fs::write(&b, b"soomething").unwrap();
+
+        let ha = TrackId::from_file(&a).unwrap();
+        let hb = TrackId::from_file(&b).unwrap();
+
+        assert_ne!(ha, hb);
     }
 }
