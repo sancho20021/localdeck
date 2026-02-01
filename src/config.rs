@@ -20,6 +20,8 @@ impl Config {
 pub struct Database {
     pub in_memory: bool,
     pub path: Option<PathBuf>,
+    pub usb_label: Option<String>,
+    pub relative_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

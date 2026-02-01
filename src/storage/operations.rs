@@ -1,13 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    time::SystemTime,
 };
 
 use crate::{
     config,
     domain::hash::TrackId,
     storage::{
-        db::SecondsSinceUnix,
+        db::{SecondsSinceUnix, system_time_to_i64},
         fs::{FsSnapshot, ObservedFile},
         schema::{columns, tables},
     },
@@ -17,13 +18,31 @@ use columns::*;
 use rusqlite::params;
 use tables::*;
 
-pub type Diff = HashMap<TrackId, HashSet<FileChange>>;
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum FileChange {
-    New(PathBuf),
-    Deleted(PathBuf),
+#[derive(Debug)]
+pub struct TrackChange {
+    pub db_locations: HashSet<PathBuf>,
+    pub fs_locations: HashSet<PathBuf>,
 }
+
+impl TrackChange {
+    pub fn new_locations(&self) -> HashSet<PathBuf> {
+        &self.fs_locations - &self.db_locations
+    }
+
+    pub fn deleted_locations(&self) -> HashSet<PathBuf> {
+        &self.db_locations - &self.fs_locations
+    }
+
+    pub fn is_new(&self) -> bool {
+        self.db_locations.is_empty()
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.fs_locations.is_empty()
+    }
+}
+
+pub type Diff = HashMap<TrackId, TrackChange>;
 
 #[derive(Debug)]
 pub struct DBSnapshot {
@@ -66,31 +85,52 @@ pub fn diff(fs: &FsSnapshot, ds: &DBSnapshot) -> Diff {
     let fs_files = fs.files.clone().into_iter().collect::<HashSet<_>>();
     let db_files = ds.files.clone().into_iter().collect::<HashSet<_>>();
 
-    let mut diff: Diff = HashMap::new();
+    let mut locs = Diff::new();
 
-    let new = &fs_files - &db_files;
-    let deleted = &db_files - &fs_files;
-
-    for file in new {
-        if let Some(v) = diff.get_mut(&file.track_id) {
-            v.insert(FileChange::New(file.path));
+    for file in fs_files {
+        if let Some(locs) = locs.get_mut(&file.track_id) {
+            locs.fs_locations.insert(file.path);
         } else {
-            diff.insert(file.track_id, HashSet::from([FileChange::New(file.path)]));
-        }
-    }
-
-    for file in deleted {
-        if let Some(v) = diff.get_mut(&file.track_id) {
-            v.insert(FileChange::Deleted(file.path));
-        } else {
-            diff.insert(
+            locs.insert(
                 file.track_id,
-                HashSet::from([FileChange::Deleted(file.path)]),
+                TrackChange {
+                    fs_locations: HashSet::from([file.path]),
+                    db_locations: HashSet::new(),
+                },
             );
         }
     }
 
-    diff
+    for file in db_files {
+        if let Some(locs) = locs.get_mut(&file.track_id) {
+            locs.db_locations.insert(file.path);
+        } else {
+            locs.insert(
+                file.track_id,
+                TrackChange {
+                    db_locations: HashSet::from([file.path]),
+                    fs_locations: HashSet::new(),
+                },
+            );
+        }
+    }
+
+    let unchanged = locs
+        .iter()
+        .filter_map(|(track, change)| {
+            if change.db_locations == change.fs_locations {
+                Some(track.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for track in unchanged {
+        locs.remove(&track);
+    }
+
+    locs
 }
 
 /// aka git status
@@ -110,19 +150,18 @@ pub fn status(
 
 /// Updates the database by adding new files from the diff.
 pub fn update_db_with_new_files(
+    update_time: SystemTime,
     diff_result: &Diff,
     db: &mut rusqlite::Connection,
 ) -> anyhow::Result<()> {
+    let time_secs = system_time_to_i64(update_time)?;
     let tx = db.transaction()?;
 
     let new = diff_result.iter().flat_map(|(id, changes)| {
-        changes.iter().filter_map(|change| {
-            if let FileChange::New(path) = change {
-                Some((id.clone(), path.clone()))
-            } else {
-                None
-            }
-        })
+        changes
+            .new_locations()
+            .into_iter()
+            .map(|path| (id.clone(), path))
     });
 
     for (track_id, path) in new {
@@ -131,6 +170,11 @@ pub fn update_db_with_new_files(
             params![track_id.to_hex(), path.to_string_lossy()],
         )?;
     }
+
+    tx.execute(
+        &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
+        params![time_secs],
+    )?;
 
     tx.commit()?;
     Ok(())
@@ -150,7 +194,7 @@ mod tests {
         domain::hash::TrackId,
         storage::{
             fs::{FsSnapshot, ObservedFile},
-            operations::{DBSnapshot, Diff, FileChange, diff, scan_db, update_db_with_new_files},
+            operations::{DBSnapshot, Diff, TrackChange, diff, scan_db, update_db_with_new_files},
             schema::{self, *},
         },
     };
@@ -213,13 +257,16 @@ mod tests {
         assert_eq!(diff_result.len(), 2);
 
         assert_eq!(
-            diff_result.get(&mock_trackid(2)).unwrap(),
-            &HashSet::from([FileChange::Deleted(PathBuf::from("b.mp3"))])
+            diff_result
+                .get(&mock_trackid(2))
+                .unwrap()
+                .deleted_locations(),
+            HashSet::from([PathBuf::from("b.mp3")])
         );
 
         assert_eq!(
-            diff_result.get(&mock_trackid(3)).unwrap(),
-            &HashSet::from([FileChange::New(PathBuf::from("c.mp3"))])
+            diff_result.get(&mock_trackid(3)).unwrap().new_locations(),
+            HashSet::from([PathBuf::from("c.mp3")])
         );
 
         Ok(())
@@ -254,29 +301,36 @@ mod tests {
 
         // Track 1 moved → old path deleted, new path new
         assert_eq!(
-            diff_result.get(&mock_trackid(1)).unwrap(),
-            &HashSet::from([
-                FileChange::Deleted(PathBuf::from("a.mp3")),
-                FileChange::New(PathBuf::from("a_new.mp3")),
-            ])
+            diff_result.get(&mock_trackid(1)).unwrap().new_locations(),
+            HashSet::from([PathBuf::from("a_new.mp3")])
+        );
+        assert_eq!(
+            diff_result
+                .get(&mock_trackid(1))
+                .unwrap()
+                .deleted_locations(),
+            HashSet::from([PathBuf::from("a.mp3")])
         );
 
         // Track 2 → b2.mp3 deleted
         assert_eq!(
-            diff_result.get(&mock_trackid(2)).unwrap(),
-            &HashSet::from([FileChange::Deleted(PathBuf::from("b2.mp3"))])
+            diff_result
+                .get(&mock_trackid(2))
+                .unwrap()
+                .deleted_locations(),
+            HashSet::from([PathBuf::from("b2.mp3")])
         );
 
         // Track 3 → copy c2.mp3 added
         assert_eq!(
-            diff_result.get(&mock_trackid(3)).unwrap(),
-            &HashSet::from([FileChange::New(PathBuf::from("c2.mp3"))])
+            diff_result.get(&mock_trackid(3)).unwrap().new_locations(),
+            HashSet::from([PathBuf::from("c2.mp3")])
         );
 
         // Track 4 → new file
         assert_eq!(
-            diff_result.get(&mock_trackid(4)).unwrap(),
-            &HashSet::from([FileChange::New(PathBuf::from("d.mp3"))])
+            diff_result.get(&mock_trackid(4)).unwrap().new_locations(),
+            HashSet::from([PathBuf::from("d.mp3")])
         );
 
         Ok(())
@@ -305,23 +359,32 @@ mod tests {
         // Track 1 moved → new path "a_new.mp3"
         diff_result.insert(
             mock_trackid(1),
-            HashSet::from([FileChange::New(PathBuf::from("a_new.mp3"))]),
+            TrackChange {
+                fs_locations: HashSet::from([PathBuf::from("a_new.mp3"), PathBuf::from("a.mp3")]),
+                db_locations: HashSet::from([PathBuf::from("a.mp3")]),
+            },
         );
 
-        // Track 2 partially removed → new copy "b2.mp3"
+        // Track 2 new copy "b2.mp3"
         diff_result.insert(
             mock_trackid(2),
-            HashSet::from([FileChange::New(PathBuf::from("b2.mp3"))]),
+            TrackChange {
+                fs_locations: HashSet::from([PathBuf::from("b1.mp3"), PathBuf::from("b2.mp3")]),
+                db_locations: HashSet::from([PathBuf::from("b1.mp3")]),
+            },
         );
 
         // Track 3 completely new
         diff_result.insert(
             mock_trackid(3),
-            HashSet::from([FileChange::New(PathBuf::from("c.mp3"))]),
+            TrackChange {
+                db_locations: HashSet::new(),
+                fs_locations: HashSet::from([PathBuf::from("c.mp3")]),
+            },
         );
 
         // Call the function
-        update_db_with_new_files(&diff_result, &mut conn)?;
+        update_db_with_new_files(SystemTime::now(), &diff_result, &mut conn)?;
 
         // Reuse scan_db to read DB snapshot
         let db_snapshot = scan_db(&mut conn)?;

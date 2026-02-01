@@ -1,13 +1,16 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use chrono::{DateTime, Local};
 use rusqlite::Connection;
 
-use crate::{config::Database, storage::schema};
+use crate::{
+    config::Database,
+    storage::{schema, usb::find_mount_by_label},
+};
 
 pub type SecondsSinceUnix = i64;
 
@@ -19,14 +22,31 @@ fn open_from_file(path: &Path) -> anyhow::Result<rusqlite::Connection> {
     Ok(Connection::open(path)?)
 }
 
+fn resolve_database_path(db: &Database) -> anyhow::Result<Option<PathBuf>> {
+    if db.in_memory {
+        return Ok(None);
+    }
+
+    if let Some(path) = &db.path {
+        return Ok(Some(path.clone()));
+    }
+
+    if let (Some(label), Some(rel)) = (&db.usb_label, &db.relative_path) {
+        let mount = find_mount_by_label(label)
+            .with_context(|| format!("USB with label '{label}' not found"))?;
+
+        return Ok(Some(mount.join(rel)));
+    }
+
+    bail!("database config invalid: no path or usb_label provided");
+}
+
 pub fn open(config: &Database) -> anyhow::Result<rusqlite::Connection> {
-    let db = if config.in_memory {
-        open_in_memory()?
-    } else {
-        let path = config.path.clone().ok_or(anyhow!(
-            "Path to database is missing, provide it via config file or flags"
-        ))?;
+    let path = resolve_database_path(config)?;
+    let db = if let Some(path) = path {
         open_from_file(&path)?
+    } else {
+        open_in_memory()?
     };
     schema::init(&db)?;
     Ok(db)
@@ -63,6 +83,8 @@ mod tests {
         let db = open(&Database {
             in_memory: true,
             path: None,
+            usb_label: None,
+            relative_path: None,
         })
         .unwrap();
 

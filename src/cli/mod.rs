@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use crate::config;
 use crate::storage::db::i64_seconds_to_local_time;
-use crate::storage::operations::FileChange;
 use crate::storage::{db, operations};
 
 #[derive(Parser)]
@@ -45,16 +44,31 @@ pub fn run() {
                 i64_seconds_to_local_time(db_snapshot.updated_at).unwrap(),
                 db_snapshot.files.len()
             );
-            println!("Certain files' locations do not match database:");
+            if !diff_result.is_empty() {
+                println!(
+                    "Certain files' locations do not match database. Run \"update\" to update the database:"
+                );
 
-            for (track_id, changes) in &diff_result {
-                for change in changes {
-                    match change {
-                        FileChange::New(path) => {
-                            println!("  [NEW]   {} -> {:?}", track_id.to_hex(), path);
+                for (track_id, changes) in &diff_result {
+                    if changes.is_new() {
+                        println!("  [NEW]  {}, found at:", track_id.to_hex());
+                        for location in changes.new_locations() {
+                            println!("    - {}", location.to_string_lossy());
                         }
-                        FileChange::Deleted(path) => {
-                            println!("  [DELETED] {} -> {:?}", track_id.to_hex(), path);
+                    } else if changes.is_deleted() {
+                        println!("  [DELETED]  {}, previously located at:", track_id.to_hex());
+                        for location in changes.deleted_locations() {
+                            println!("    - {}", location.to_string_lossy());
+                        }
+                    } else {
+                        println!("  [MOVED / COPIED]  {}", track_id.to_hex());
+                        println!("  removed locations:");
+                        for location in changes.deleted_locations() {
+                            println!("    - {}", location.to_string_lossy());
+                        }
+                        println!("  new locations:");
+                        for location in changes.new_locations() {
+                            println!("    - {}", location.to_string_lossy());
                         }
                     }
                 }
@@ -62,9 +76,10 @@ pub fn run() {
         }
 
         Commands::Update {} => {
-            let (_, _, diff_result) = operations::status(&cfg.library_source, &mut conn).unwrap();
-            operations::update_db_with_new_files(&diff_result, &mut conn).unwrap();
-            println!("Database updated with new files.");
+            let (fs, _, diff_result) = operations::status(&cfg.library_source, &mut conn).unwrap();
+            let time = fs.observed_at;
+            operations::update_db_with_new_files(time, &diff_result, &mut conn).unwrap();
+            println!("Database updated, new files: {}", diff_result.len());
         }
     }
 }
