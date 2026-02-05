@@ -7,8 +7,14 @@ use blake3::Hash;
 ///
 /// One can get track ID from a music file,
 /// and then use it to search for that file in the filesystem.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrackId(pub Hash);
+
+impl std::fmt::Display for TrackId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
 
 impl TrackId {
     pub fn from_bytes(bytes: &[u8]) -> Self {

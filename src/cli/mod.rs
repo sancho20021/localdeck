@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::config;
 use crate::storage::db::i64_seconds_to_local_time;
+use crate::storage::operations::Storage;
 use crate::storage::{db, operations};
 
 #[derive(Parser)]
@@ -31,12 +32,10 @@ pub fn run() {
 
     let cfg = config::Config::load(cli.config.to_str().unwrap()).unwrap();
 
-    let mut conn = db::open(&cfg.database).unwrap();
-
     match &cli.command {
         Commands::Status {} => {
-            let (fs_snapshot, db_snapshot, diff_result) =
-                operations::status(&cfg.library_source, &mut conn).unwrap();
+            let mut storage = Storage::new(cfg.database, cfg.library_source).unwrap();
+            let (fs_snapshot, db_snapshot, diff_result) = storage.status().unwrap();
 
             println!("Filesystem contains {} files", fs_snapshot.files.len());
             println!(
@@ -51,17 +50,17 @@ pub fn run() {
 
                 for (track_id, changes) in &diff_result {
                     if changes.is_new() {
-                        println!("  [NEW]  {}, found at:", track_id.to_hex());
+                        println!("  [NEW]  {}, found at:", track_id);
                         for location in changes.new_locations() {
                             println!("    - {}", location.to_string_lossy());
                         }
                     } else if changes.is_deleted() {
-                        println!("  [DELETED]  {}, previously located at:", track_id.to_hex());
+                        println!("  [DELETED]  {}, previously located at:", track_id);
                         for location in changes.deleted_locations() {
                             println!("    - {}", location.to_string_lossy());
                         }
                     } else {
-                        println!("  [MOVED / COPIED]  {}", track_id.to_hex());
+                        println!("  [MOVED / COPIED]  {}", track_id);
                         println!("  removed locations:");
                         for location in changes.deleted_locations() {
                             println!("    - {}", location.to_string_lossy());
@@ -76,10 +75,12 @@ pub fn run() {
         }
 
         Commands::Update {} => {
-            let (fs, _, diff_result) = operations::status(&cfg.library_source, &mut conn).unwrap();
-            let time = fs.observed_at;
-            operations::update_db_with_new_files(time, &diff_result, &mut conn).unwrap();
-            println!("Database updated, new files: {}", diff_result.len());
+            let mut storage = Storage::new(cfg.database, cfg.library_source).unwrap();
+            let files = storage.update_db_with_new_files().unwrap();
+            println!("Database updated, new files ({}):", files.len());
+            for file in &files {
+                println!("    - {} at {}", file.track_id, file.path.to_string_lossy());
+            }
         }
     }
 }

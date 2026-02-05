@@ -78,6 +78,39 @@ pub fn scan_dirs(follow_symlinks: bool, roots: &Vec<PathBuf>) -> anyhow::Result<
     Ok(scanned_dirs.into_iter().flatten().collect())
 }
 
+/// Best-effort check that a path points to a real, playable music file.
+///
+/// This does NOT decode audio, but rules out:
+/// - missing paths
+/// - directories / special files
+/// - wrong extensions
+/// - empty files
+/// - unreadable files
+pub fn is_valid_music_path(path: &Path) -> bool {
+    // Must exist and be a file
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+
+    if !meta.is_file() {
+        return false;
+    }
+
+    // Must look like music by extension
+    if !is_music_file(path) {
+        return false;
+    }
+
+    // Must not be empty
+    if meta.len() == 0 {
+        return false;
+    }
+
+    // Must be readable (cheap probe)
+    std::fs::File::open(path).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{

@@ -7,6 +7,7 @@ pub struct Config {
     pub version: u32,
     pub database: Database,
     pub library_source: LibrarySource,
+    pub http: HttpConfig,
 }
 
 impl Config {
@@ -14,6 +15,12 @@ impl Config {
         let contents = std::fs::read_to_string(path).expect("Failed to read user config");
         toml::from_str(&contents).with_context(|| "Failed to parse config TOML")
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpConfig {
+    pub bind_addr: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,7 +31,7 @@ pub struct Database {
     pub relative_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct LibrarySource {
     pub roots: Vec<PathBuf>,
     pub follow_symlinks: bool,
