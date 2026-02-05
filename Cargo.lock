@@ -662,6 +662,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "mime_guess",
  "rouille",
  "rusqlite",
  "serde",

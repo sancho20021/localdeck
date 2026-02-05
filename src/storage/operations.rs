@@ -6,7 +6,10 @@ use std::{
 
 use crate::{
     config::{self, LibrarySource},
-    domain::{hash::TrackId, track::Track},
+    domain::{
+        hash::TrackId,
+        track::{Track, TrackMetadata},
+    },
     storage::{
         self,
         db::{self, SecondsSinceUnix, system_time_to_i64},
@@ -53,8 +56,16 @@ pub struct DBSnapshot {
 
 /// Main structure that implements all storage logic
 pub struct Storage {
-    db: rusqlite::Connection,
+    pub(crate) db: rusqlite::Connection,
     source: LibrarySource,
+}
+
+#[derive(Debug)]
+pub struct TrackListEntry {
+    pub track_id: TrackId,
+    pub metadata: TrackMetadata,
+    pub available_files: Vec<PathBuf>,
+    pub unavailable_files: Vec<PathBuf>,
 }
 
 impl Storage {
@@ -244,6 +255,47 @@ impl Storage {
 
         locs
     }
+
+    /// List unique tracks, optionally including unavailable ones
+    pub fn list_tracks(&mut self) -> anyhow::Result<Vec<TrackListEntry>> {
+        let (fs_snapshot, db_snapshot, _) = self.status()?;
+
+        // Map track_id -> available paths on disk
+        let mut available_map: HashMap<TrackId, Vec<PathBuf>> = HashMap::new();
+        for file in fs_snapshot.files {
+            available_map
+                .entry(file.track_id)
+                .or_default()
+                .push(file.path);
+        }
+
+        // Map track_id -> all paths recorded in DB
+        let mut db_map: HashMap<TrackId, Vec<PathBuf>> = HashMap::new();
+        for file in db_snapshot.files {
+            db_map.entry(file.track_id).or_default().push(file.path);
+        }
+
+        let mut result = Vec::new();
+
+        for (track_id, db_paths) in db_map.into_iter() {
+            let available_paths = available_map.get(&track_id).cloned().unwrap_or_default();
+
+            // Compute unavailable paths: DB paths that are not currently available
+            let unavailable_paths = db_paths
+                .into_iter()
+                .filter(|p| !available_paths.contains(p))
+                .collect::<Vec<_>>();
+
+            result.push(TrackListEntry {
+                track_id,
+                metadata: TrackMetadata::default(), // todo: fill from DB if metadata stored
+                available_files: available_paths,
+                unavailable_files: unavailable_paths,
+            });
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +303,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::SystemTime,
     };
 
@@ -259,6 +311,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
+        config::LibrarySource,
         domain::hash::TrackId,
         storage::{
             fs::{FsSnapshot, ObservedFile},
@@ -274,6 +327,19 @@ mod tests {
 
     fn mock_trackid_str(x: i32) -> String {
         mock_trackid(x).to_hex()
+    }
+
+    fn setup_storage(tmp_dir: &Path) -> anyhow::Result<Storage> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        Ok(Storage::from_existing_conn(
+            conn,
+            LibrarySource {
+                roots: vec![tmp_dir.to_path_buf()],
+                follow_symlinks: false,
+            },
+        ))
     }
 
     #[test]
@@ -598,6 +664,88 @@ mod tests {
         assert!(
             err.to_string().contains("track") && err.to_string().contains("not found in database")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_tracks_fully_available() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let mut storage = setup_storage(dir.path())?;
+        let path = dir.path().join("song.mp3");
+        fs::write(&path, b"x")?;
+
+        let track_id = TrackId::from_file(&path)?;
+
+        storage.db.execute(
+            &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
+            params![track_id.to_hex(), path.to_string_lossy()],
+        )?;
+
+        let tracks = storage.list_tracks()?;
+        assert_eq!(tracks.len(), 1);
+
+        let entry = &tracks[0];
+        assert_eq!(entry.track_id, track_id);
+        assert_eq!(entry.available_files, vec![path.clone()]);
+        assert!(entry.unavailable_files.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_tracks_partially_available() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let mut storage = setup_storage(dir.path())?;
+
+        let available_path = dir.path().join("song1.mp3");
+        fs::write(&available_path, b"x")?;
+        let unavailable_path = dir.path().join("song2.mp3"); // not created
+
+        let track_id = TrackId::from_file(&available_path)?;
+
+        // Insert both available and unavailable paths into DB
+        storage.db.execute(
+            &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
+            params![track_id.to_hex(), available_path.to_string_lossy()],
+        )?;
+        storage.db.execute(
+            &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
+            params![track_id.to_hex(), unavailable_path.to_string_lossy()],
+        )?;
+
+        let tracks = storage.list_tracks()?;
+        assert_eq!(tracks.len(), 1);
+
+        let entry = &tracks[0];
+        assert_eq!(entry.track_id, track_id);
+        assert_eq!(entry.available_files, vec![available_path.clone()]);
+        assert_eq!(entry.unavailable_files, vec![unavailable_path.clone()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_tracks_fully_unavailable() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let mut storage = setup_storage(dir.path())?;
+
+        let path = dir.path().join("song.mp3"); // not created on disk
+
+        let track_id = TrackId::from_bytes(&[0, 1, 2]);
+
+        storage.db.execute(
+            &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
+            params![track_id.to_hex(), path.to_string_lossy()],
+        )?;
+
+        let tracks = storage.list_tracks()?;
+        assert_eq!(tracks.len(), 1);
+
+        let entry = &tracks[0];
+        assert_eq!(entry.track_id, track_id);
+        assert!(entry.available_files.is_empty());
+        assert_eq!(entry.unavailable_files, vec![path.clone()]);
 
         Ok(())
     }

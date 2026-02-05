@@ -53,6 +53,10 @@ in_memory = true
 [library_source]
 roots = ["/home/sancho20021/Music"]
 follow_symlinks = true
+
+[http]
+bind_addr = "127.0.0.1"
+port = 8080
 "#;
 
         // Deserialize TOML into Config
@@ -86,6 +90,10 @@ path = "/tmp/localdex.db"
 [library_source]
 roots = ["/home/sancho20021/Music"]
 follow_symlinks = false
+
+[http]
+bind_addr = "127.0.0.1"
+port = 8080
 "#;
 
         let cfg: Config = toml::from_str(toml_str)?;
