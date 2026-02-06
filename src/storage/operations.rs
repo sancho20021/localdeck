@@ -13,6 +13,7 @@ use crate::{
     storage::{
         self,
         db::{self, SecondsSinceUnix, system_time_to_i64},
+        error::StorageError,
         fs::{FsSnapshot, ObservedFile},
         schema::{columns, tables},
     },
@@ -70,7 +71,10 @@ pub struct TrackListEntry {
 
 impl Storage {
     /// when called, opens a data base connection
-    pub fn new(db_config: config::Database, lib_config: LibrarySource) -> anyhow::Result<Self> {
+    pub fn new(
+        db_config: config::Database,
+        lib_config: LibrarySource,
+    ) -> Result<Self, StorageError> {
         let db: rusqlite::Connection = db::open(&db_config)?;
         Ok(Self::from_existing_conn(db, lib_config))
     }
@@ -82,7 +86,7 @@ impl Storage {
         }
     }
 
-    pub fn scan_db(&mut self) -> anyhow::Result<DBSnapshot> {
+    pub fn scan_db(&mut self) -> Result<DBSnapshot, StorageError> {
         let tx = self.db.transaction()?;
 
         let (files, updated_at) = {
@@ -92,7 +96,10 @@ impl Storage {
                     let track_id_hex: String = row.get(0)?;
                     let path: String = row.get(1)?;
 
-                    Ok((TrackId::from_hex(&track_id_hex), path.into()))
+                    Ok((
+                        TrackId::from_hex(&track_id_hex).map_err(|e| StorageError::Internal(e)),
+                        path.into(),
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let updated_at: SecondsSinceUnix = tx.query_row(
@@ -108,7 +115,7 @@ impl Storage {
         let files = files
             .into_iter()
             .map(|(track, path)| Ok(ObservedFile::new(track?, path)))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, StorageError>>()?;
 
         Ok(DBSnapshot { updated_at, files })
     }
@@ -118,7 +125,7 @@ impl Storage {
         &mut self,
         update_time: SystemTime,
         diff_result: &Diff,
-    ) -> anyhow::Result<Vec<ObservedFile>> {
+    ) -> Result<Vec<ObservedFile>, StorageError> {
         let time_secs = system_time_to_i64(update_time)?;
         let tx = self.db.transaction()?;
 
@@ -148,8 +155,8 @@ impl Storage {
         Ok(new)
     }
 
-    pub fn update_db_with_new_files(&mut self) -> anyhow::Result<Vec<ObservedFile>> {
-        let (fs, _, diff_result) = self.status().unwrap();
+    pub fn update_db_with_new_files(&mut self) -> Result<Vec<ObservedFile>, StorageError> {
+        let (fs, _, diff_result) = self.status()?;
         let time = fs.observed_at;
         self._update_db_with_new_files(time, &diff_result)
     }
@@ -159,7 +166,7 @@ impl Storage {
     /// reads files in the file system,
     /// reads file records in the database,
     /// returns both, and difference between the database and the file system
-    pub fn status(&mut self) -> anyhow::Result<(FsSnapshot, DBSnapshot, Diff)> {
+    pub fn status(&mut self) -> Result<(FsSnapshot, DBSnapshot, Diff), StorageError> {
         let fs = FsSnapshot::scan(&self.source)?;
         let db = self.scan_db()?;
         let diff = Self::diff(&fs, &db);
@@ -169,19 +176,22 @@ impl Storage {
     /// retrieves location of the track, checking that it is present in the file system
     ///
     /// If multiple locations point to the same track, chooses one of them.
-    pub fn get_track(&mut self, track_id: TrackId) -> anyhow::Result<(Track, PathBuf)> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT path FROM files WHERE track_id = ?1")?;
+    pub fn get_track(&mut self, track_id: TrackId) -> Result<(Track, PathBuf), StorageError> {
+        let paths = (|| {
+            let mut stmt = self
+                .db
+                .prepare("SELECT path FROM files WHERE track_id = ?1")?;
 
-        let paths = stmt
-            .query_map(params![track_id.to_string()], |row| {
-                Ok(PathBuf::from(row.get::<_, String>(0)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            Ok(stmt
+                .query_map(params![track_id.to_string()], |row| {
+                    Ok(PathBuf::from(row.get::<_, String>(0)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?)
+        })()
+        .map_err(StorageError::Database)?;
 
         if paths.is_empty() {
-            return Err(anyhow::anyhow!("track {} not found in database", track_id));
+            return Err(StorageError::TrackNotFound(track_id));
         }
 
         if let Some(path) = paths
@@ -197,10 +207,7 @@ impl Storage {
                 path,
             ))
         } else {
-            Err(anyhow::anyhow!(
-                "track {} exists in database, but no valid music files were found on disk",
-                track_id
-            ))
+            Err(StorageError::InvalidTrackFile { track: track_id })
         }
     }
 
@@ -257,7 +264,7 @@ impl Storage {
     }
 
     /// List unique tracks, optionally including unavailable ones
-    pub fn list_tracks(&mut self) -> anyhow::Result<Vec<TrackListEntry>> {
+    pub fn list_tracks(&mut self) -> Result<Vec<TrackListEntry>, StorageError> {
         let (fs_snapshot, db_snapshot, _) = self.status()?;
 
         // Map track_id -> available paths on disk
@@ -314,6 +321,7 @@ mod tests {
         config::LibrarySource,
         domain::hash::TrackId,
         storage::{
+            error::StorageError,
             fs::{FsSnapshot, ObservedFile},
             operations::{DBSnapshot, Diff, Storage, TrackChange},
             schema::{self, *},
@@ -608,10 +616,7 @@ mod tests {
 
         let err = storage.get_track(track_id).unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("no valid music files were found on disk")
-        );
+        assert!(matches!(err, StorageError::InvalidTrackFile { .. }));
 
         Ok(())
     }
@@ -661,9 +666,7 @@ mod tests {
 
         let err = storage.get_track(track_id).unwrap_err();
 
-        assert!(
-            err.to_string().contains("track") && err.to_string().contains("not found in database")
-        );
+        assert!(matches!(err, StorageError::TrackNotFound(..)));
 
         Ok(())
     }

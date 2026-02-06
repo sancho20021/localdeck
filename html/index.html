@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>LocalDex Player</title>
+<style>
+body {
+  margin: 0;
+  background: black;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+}
+
+audio {
+  width: 80%;
+}
+</style>
+</head>
+
+<body>
+
+<audio id="player" controls autoplay></audio>
+
+<script>
+const parts = window.location.pathname.split("/");
+const id = parts[parts.length - 1];
+
+document.getElementById("player").src =
+  `/tracks/${id}/stream`;
+</script>
+
+</body>
+</html>
