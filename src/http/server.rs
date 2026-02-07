@@ -52,7 +52,7 @@ impl HttpServer {
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
         let track_id = match TrackId::from_hex(&id) {
             Ok(id) => id,
-            Err(e) => return ApiError::from(StorageError::from(e)).into_response(),
+            Err(_) => return ApiError::from(StorageError::InvalidTrackId).into_response(),
         };
 
         let result = {

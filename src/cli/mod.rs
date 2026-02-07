@@ -116,9 +116,14 @@ pub fn run() {
 
             for track in tracks {
                 println!("Track: {}", track.track_id.to_hex());
-                println!("  Available files:");
-                for path in &track.available_files {
-                    println!("    - {}", path.to_string_lossy());
+
+                if !track.available_files.is_empty() {
+                    println!("  Available files:");
+                    for path in &track.available_files {
+                        println!("    - {}", path.to_string_lossy());
+                    }
+                } else {
+                    println!("  No available files found :(");
                 }
 
                 if *show_unavailable && !track.unavailable_files.is_empty() {

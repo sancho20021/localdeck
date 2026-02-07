@@ -20,5 +20,5 @@ pub enum StorageError {
     InvalidTrackId,
 
     #[error("internal error: {0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
 }

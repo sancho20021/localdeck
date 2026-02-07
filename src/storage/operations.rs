@@ -126,7 +126,7 @@ impl Storage {
         update_time: SystemTime,
         diff_result: &Diff,
     ) -> Result<Vec<ObservedFile>, StorageError> {
-        let time_secs = system_time_to_i64(update_time)?;
+        let time_secs = system_time_to_i64(update_time).map_err(StorageError::Internal)?;
         let tx = self.db.transaction()?;
 
         let new = diff_result
@@ -167,6 +167,7 @@ impl Storage {
     /// reads file records in the database,
     /// returns both, and difference between the database and the file system
     pub fn status(&mut self) -> Result<(FsSnapshot, DBSnapshot, Diff), StorageError> {
+        println!("Scanning the music on file system...");
         let fs = FsSnapshot::scan(&self.source)?;
         let db = self.scan_db()?;
         let diff = Self::diff(&fs, &db);
@@ -346,6 +347,7 @@ mod tests {
             LibrarySource {
                 roots: vec![tmp_dir.to_path_buf()],
                 follow_symlinks: false,
+                ignored_dirs: vec![],
             },
         ))
     }

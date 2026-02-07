@@ -32,9 +32,9 @@ impl TrackId {
     }
 
     /// reads file and hashes it
-    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
+    pub fn from_file(path: &Path) -> Result<Self, std::io::Error> {
         let contents =
-            std::fs::read(path).with_context(|| "Failed to calculate track id of a file")?;
+            std::fs::read(path)?;
         Ok(Self::from_bytes(&contents))
     }
 }

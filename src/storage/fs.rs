@@ -27,7 +27,7 @@ pub struct FsSnapshot {
 impl FsSnapshot {
     pub fn scan(config: &config::LibrarySource) -> Result<Self, StorageError> {
         let observed_at = SystemTime::now();
-        let files = scan_dirs(config.follow_symlinks, &config.roots)?;
+        let files = scan_dirs(config.follow_symlinks, &config.roots, &config.ignored_dirs)?;
         Ok(Self { observed_at, files })
     }
 }
@@ -45,23 +45,38 @@ impl ObservedFile {
 }
 
 /// Recursively scans all music files in the given directory. Retrieves their paths and track ids
-pub fn scan_dir(follow_symlinks: bool, root: &Path) -> Result<Vec<ObservedFile>, StorageError> {
+pub fn scan_dir(
+    follow_symlinks: bool,
+    root: &Path,
+    ignored_dirs: &[PathBuf],
+) -> Result<Vec<ObservedFile>, StorageError> {
     let root_str = root.to_string_lossy();
-    let paths = WalkDir::new(root)
-        .follow_links(follow_symlinks)
+
+    let walker = WalkDir::new(root).follow_links(follow_symlinks);
+
+    let paths = walker
+        // filter out ignored directories
         .into_iter()
-        .filter_map(|e| {
-            if let Ok(e) = e {
-                Some(e)
-            } else {
-                println!("error while scanning dir {root_str}, skipping an entry: {e:?}");
+        .filter_entry(|entry| {
+            let entry_path = entry.path();
+            // keep the entry if it's not inside any ignored directory
+            !ignored_dirs
+                .iter()
+                .any(|ignored| entry_path.starts_with(ignored))
+        })
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            Err(err) => {
+                println!("error while scanning dir {root_str}, skipping an entry: {err:?}");
                 None
             }
         })
         .map(|e| e.path().to_path_buf())
-        .filter(|e| is_music_file(&e))
-        .collect::<Vec<_>>();
+        .filter(|e| is_music_file(e))
+        .collect::<Vec<PathBuf>>();
+
     let ids = paths.iter().map(|path| TrackId::from_file(path));
+
     paths
         .iter()
         .zip(ids)
@@ -73,10 +88,11 @@ pub fn scan_dir(follow_symlinks: bool, root: &Path) -> Result<Vec<ObservedFile>,
 pub fn scan_dirs(
     follow_symlinks: bool,
     roots: &Vec<PathBuf>,
+    ignored_dirs: &[PathBuf],
 ) -> Result<Vec<ObservedFile>, StorageError> {
     let scanned_dirs = roots
         .iter()
-        .map(|root| scan_dir(follow_symlinks, root))
+        .map(|root| scan_dir(follow_symlinks, root, ignored_dirs))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(scanned_dirs.into_iter().flatten().collect())
 }
@@ -116,6 +132,8 @@ pub fn is_valid_music_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use crate::{
         config,
         storage::fs::{FsSnapshot, scan_dir},
@@ -137,7 +155,7 @@ mod tests {
         std::fs::write(&song2, b"bbb").unwrap();
         std::fs::write(&not_music, b"ccc").unwrap();
 
-        let files = scan_dir(false, root).unwrap();
+        let files = scan_dir(false, root, &[]).unwrap();
 
         assert_eq!(files.len(), 2);
 
@@ -165,6 +183,7 @@ mod tests {
         let config = config::LibrarySource {
             follow_symlinks: false,
             roots: vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()],
+            ignored_dirs: vec![],
         };
 
         let snapshot = FsSnapshot::scan(&config).unwrap();
@@ -174,5 +193,34 @@ mod tests {
         let paths: Vec<_> = snapshot.files.iter().map(|f| f.path.as_path()).collect();
         assert!(paths.contains(&song1.as_path()));
         assert!(paths.contains(&song2.as_path()));
+    }
+
+    #[test]
+    fn scan_respects_ignored_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Music files
+        let song1 = root.join("song1.mp3");
+        let song2 = root.join("song2.flac");
+
+        // Ignored directory
+        let ignored_dir = root.join("ignored");
+        std::fs::create_dir_all(&ignored_dir).unwrap();
+        let ignored_song = ignored_dir.join("ignored_song.mp3");
+
+        std::fs::write(&song1, b"aaa").unwrap();
+        std::fs::write(&song2, b"bbb").unwrap();
+        std::fs::write(&ignored_song, b"ccc").unwrap();
+
+        let files = scan_dir(false, root, &[ignored_dir.clone()]).unwrap();
+
+        // Should find only the two non-ignored music files
+        assert_eq!(files.len(), 2);
+
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_path()).collect();
+        assert!(paths.contains(&song1.as_path()));
+        assert!(paths.contains(&song2.as_path()));
+        assert!(!paths.contains(&ignored_song.as_path()));
     }
 }

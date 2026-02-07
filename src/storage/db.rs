@@ -22,7 +22,7 @@ fn open_from_file(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> 
     Connection::open(path)
 }
 
-fn resolve_database_path(db: &Database) -> anyhow::Result<Option<PathBuf>> {
+fn resolve_database_path(db: &Database) -> Result<Option<PathBuf>, anyhow::Error> {
     if db.in_memory {
         return Ok(None);
     }
@@ -42,7 +42,7 @@ fn resolve_database_path(db: &Database) -> anyhow::Result<Option<PathBuf>> {
 }
 
 pub fn open(config: &Database) -> Result<rusqlite::Connection, StorageError> {
-    let path = resolve_database_path(config)?;
+    let path = resolve_database_path(config).map_err(StorageError::Internal)?;
     let db = if let Some(path) = path {
         open_from_file(&path)?
     } else {

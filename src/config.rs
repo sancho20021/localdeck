@@ -35,6 +35,8 @@ pub struct Database {
 pub struct LibrarySource {
     pub roots: Vec<PathBuf>,
     pub follow_symlinks: bool,
+    #[serde(default)]
+    pub ignored_dirs: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -53,6 +55,7 @@ in_memory = true
 [library_source]
 roots = ["/home/sancho20021/Music"]
 follow_symlinks = true
+ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 
 [http]
 bind_addr = "127.0.0.1"
