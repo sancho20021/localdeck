@@ -1,4 +1,3 @@
-use anyhow::Context;
 use rusqlite::Connection;
 
 pub mod tables {
@@ -14,8 +13,8 @@ pub mod columns {
     pub const UPDATED_AT: &str = "updated_at";
 }
 
-pub use tables::*;
 pub use columns::*;
+pub use tables::*;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -29,7 +28,6 @@ CREATE TABLE IF NOT EXISTS updates (
 );
 "#;
 
-pub fn init(conn: &Connection) -> anyhow::Result<()> {
+pub fn init(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(SCHEMA)
-        .with_context(|| "Failed to apply schema to the database")
 }

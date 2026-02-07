@@ -9,17 +9,17 @@ use rusqlite::Connection;
 
 use crate::{
     config::Database,
-    storage::{schema, usb::find_mount_by_label},
+    storage::{error::StorageError, schema, usb::find_mount_by_label},
 };
 
 pub type SecondsSinceUnix = i64;
 
-fn open_in_memory() -> anyhow::Result<rusqlite::Connection> {
-    Ok(Connection::open_in_memory()?)
+fn open_in_memory() -> Result<rusqlite::Connection, rusqlite::Error> {
+    Connection::open_in_memory()
 }
 
-fn open_from_file(path: &Path) -> anyhow::Result<rusqlite::Connection> {
-    Ok(Connection::open(path)?)
+fn open_from_file(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
+    Connection::open(path)
 }
 
 fn resolve_database_path(db: &Database) -> anyhow::Result<Option<PathBuf>> {
@@ -41,7 +41,7 @@ fn resolve_database_path(db: &Database) -> anyhow::Result<Option<PathBuf>> {
     bail!("database config invalid: no path or usb_label provided");
 }
 
-pub fn open(config: &Database) -> anyhow::Result<rusqlite::Connection> {
+pub fn open(config: &Database) -> Result<rusqlite::Connection, StorageError> {
     let path = resolve_database_path(config)?;
     let db = if let Some(path) = path {
         open_from_file(&path)?

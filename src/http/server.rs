@@ -8,7 +8,8 @@ use std::{
 use crate::{
     config::HttpConfig,
     domain::{hash::TrackId, track::Track},
-    storage::operations::Storage,
+    http::error::ApiError,
+    storage::{error::StorageError, operations::Storage},
 };
 
 pub struct HttpServer {
@@ -33,23 +34,25 @@ impl HttpServer {
 
     fn handle_request(request: &Request, storage: &Arc<Mutex<Storage>>) -> Response {
         rouille::router!(request,
+        (GET) (/tracks/{id: String}) => {
+            Self::handle_get_track(id, storage)
+        },
 
-            (GET) (/tracks/{id: String}) => {
-                Self::handle_get_track(id, storage)
-            },
+        (GET) (/tracks/{id: String}/stream) => {
+            Self::handle_get_track_stream(id, storage)
+        },
+        (GET) (/listen/{_id: String}) => {
+                    Self::handle_listen_page()
+        },
 
-            (GET) (/tracks/{id: String}/stream) => {
-                Self::handle_get_track_stream(id, storage)
-            },
-
-            _ => Response::empty_404()
+        _ => Response::empty_404()
         )
     }
 
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
         let track_id = match TrackId::from_hex(&id) {
             Ok(id) => id,
-            Err(_) => return Response::text("invalid track id").with_status_code(400),
+            Err(e) => return ApiError::from(StorageError::from(e)).into_response(),
         };
 
         let result = {
@@ -60,14 +63,14 @@ impl HttpServer {
         match result {
             Ok((track, path)) => Response::json(&TrackResponse::from_domain(&track, path)),
 
-            Err(e) => Response::text(e.to_string()).with_status_code(404),
+            Err(e) => ApiError::from(e).into_response(),
         }
     }
 
     fn handle_get_track_stream(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
         let track_id = match TrackId::from_hex(&id) {
             Ok(id) => id,
-            Err(_) => return Response::text("invalid track id").with_status_code(400),
+            Err(_) => return ApiError::from(StorageError::InvalidTrackId).into_response(),
         };
 
         // Lock storage and fetch track
@@ -100,23 +103,16 @@ impl HttpServer {
                             );
                         response
                     }
-                    Err(_) => {
-                        println!(
-                            "STREAM {} -> 404 file not found: {}",
-                            id,
-                            path.to_string_lossy()
-                        );
-
-                        Response::text("file not found on disk").with_status_code(404)
-                    }
+                    Err(e) => ApiError::from(StorageError::Fs(e)).into_response(),
                 }
             }
 
-            Err(e) => {
-                println!("STREAM {} -> 404 {}", id, e);
-                Response::text(e.to_string()).with_status_code(404)
-            }
+            Err(e) => ApiError::from(e).into_response(),
         }
+    }
+
+    fn handle_listen_page() -> Response {
+        Response::html(include_str!("../../html/index.html"))
     }
 
     fn mime_for_track(path: &PathBuf) -> String {

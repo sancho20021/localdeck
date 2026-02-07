@@ -7,7 +7,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{config, domain::hash::TrackId};
+use crate::{config, domain::hash::TrackId, storage::error::StorageError};
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
 
@@ -25,7 +25,7 @@ pub struct FsSnapshot {
 }
 
 impl FsSnapshot {
-    pub fn scan(config: &config::LibrarySource) -> anyhow::Result<Self> {
+    pub fn scan(config: &config::LibrarySource) -> Result<Self, StorageError> {
         let observed_at = SystemTime::now();
         let files = scan_dirs(config.follow_symlinks, &config.roots)?;
         Ok(Self { observed_at, files })
@@ -45,7 +45,7 @@ impl ObservedFile {
 }
 
 /// Recursively scans all music files in the given directory. Retrieves their paths and track ids
-pub fn scan_dir(follow_symlinks: bool, root: &Path) -> anyhow::Result<Vec<ObservedFile>> {
+pub fn scan_dir(follow_symlinks: bool, root: &Path) -> Result<Vec<ObservedFile>, StorageError> {
     let root_str = root.to_string_lossy();
     let paths = WalkDir::new(root)
         .follow_links(follow_symlinks)
@@ -70,11 +70,14 @@ pub fn scan_dir(follow_symlinks: bool, root: &Path) -> anyhow::Result<Vec<Observ
 }
 
 /// Recursively scans all music files in given directories. Retrieves their paths and track ids
-pub fn scan_dirs(follow_symlinks: bool, roots: &Vec<PathBuf>) -> anyhow::Result<Vec<ObservedFile>> {
+pub fn scan_dirs(
+    follow_symlinks: bool,
+    roots: &Vec<PathBuf>,
+) -> Result<Vec<ObservedFile>, StorageError> {
     let scanned_dirs = roots
         .iter()
         .map(|root| scan_dir(follow_symlinks, root))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(scanned_dirs.into_iter().flatten().collect())
 }
 
