@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
+use log::info;
 use std::path::PathBuf;
 
 use crate::config;
 use crate::storage::db::i64_seconds_to_local_time;
 use crate::storage::operations::Storage;
-use crate::storage::{db, operations};
 
 #[derive(Parser)]
 #[command(name = "localdec")]
@@ -34,10 +34,20 @@ pub enum Commands {
         #[arg(short, long)]
         show_unavailable: bool,
     },
+    /// Find a track
+    Find {
+        /// Artist, Track Name, or part of the filename to search for
+        track: String,
+    },
 }
 
 /// Entrypoint for CLI
 pub fn run() {
+    env_logger::builder()
+        .target(env_logger::Target::Stdout)
+        .init();
+    info!("Initialized logging to stdout");
+
     let cli = Cli::parse();
 
     let cfg = config::Config::load(cli.config.to_str().unwrap()).unwrap();
@@ -132,6 +142,18 @@ pub fn run() {
                         println!("    - {}", path.to_string_lossy());
                     }
                 }
+            }
+        }
+        Commands::Find { track: name } => {
+            let mut storage = Storage::new(cfg.database, cfg.library_source)
+                .expect("Failed to initialize storage");
+            let tracks = storage.find_files(name).unwrap();
+            if !tracks.is_empty() {
+                for (trackid, path) in tracks {
+                    println!("    - {trackid} at {path}");
+                }
+            } else {
+                println!("No tracks found :(");
             }
         }
     }

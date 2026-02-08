@@ -304,6 +304,55 @@ impl Storage {
 
         Ok(result)
     }
+
+    /// searches for a file where path matches the query
+    /// todo: extend it with track metadata once metadata is stored in database
+    pub fn find_files(&mut self, query: &str) -> Result<Vec<(TrackId, String)>, StorageError> {
+        let tx = self.db.transaction()?;
+
+        let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID}, {PATH} FROM {FILES}"))?;
+
+        // Normalize the query string: lowercase, remove spaces and some punctuation
+        let norm_query = query
+            .to_lowercase()
+            .replace(' ', "")
+            .replace('-', "")
+            .replace('_', "")
+            .replace('.', "");
+
+        let results = stmt
+            .query_map([], |row| {
+                let track_id_hex: String = row.get(0)?;
+                let path: String = row.get(1)?;
+
+                // Normalize path the same way
+                let norm_path = path
+                    .to_lowercase()
+                    .replace(' ', "")
+                    .replace('-', "")
+                    .replace('_', "")
+                    .replace('.', "");
+
+                // If normalized path contains normalized query, keep it
+                if norm_path.contains(&norm_query) {
+                    let track_id = TrackId::from_hex(&track_id_hex);
+                    if let Ok(track_id) = track_id {
+                        Ok(Some((track_id, path)))
+                    } else {
+                        log::warn!("Database table {FILES} contain invalid trackid {track_id_hex}");
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            })?
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        drop(stmt);
+
+        tx.commit()?;
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
@@ -315,7 +364,7 @@ mod tests {
         time::SystemTime,
     };
 
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
     use crate::{
@@ -753,5 +802,54 @@ mod tests {
         assert_eq!(entry.unavailable_files, vec![path.clone()]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_find_files() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create table
+        conn.execute("CREATE TABLE files (track_id TEXT, path TEXT)", [])
+            .unwrap();
+
+        // Insert some test rows
+        let data = vec![
+            (mock_trackid_str(1), "Some Artist - Track Name.mp3"),
+            (mock_trackid_str(2), "AnotherArtist_TrackName.flac"),
+            (mock_trackid_str(3), "completely-different-track.mp3"),
+        ];
+
+        for (id, path) in &data {
+            conn.execute(
+                "INSERT INTO files (track_id, path) VALUES (?1, ?2)",
+                [&id[..], &path[..]],
+            )
+            .unwrap();
+        }
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        // Search for a liberal match
+        let results = storage.find_files("trackname").unwrap();
+
+        // Should match first two entries
+        assert_eq!(
+            results,
+            vec![
+                (mock_trackid(1), "Some Artist - Track Name.mp3".to_string()),
+                (mock_trackid(2), "AnotherArtist_TrackName.flac".to_string())
+            ]
+        );
+
+        // Search with different casing and spaces
+        let results2 = storage.find_files("another artist track").unwrap();
+        assert_eq!(
+            results2,
+            vec![(mock_trackid(2), "AnotherArtist_TrackName.flac".to_string())]
+        );
+
+        // Search for non-existent track
+        let results3 = storage.find_files("nonexistent").unwrap();
+        assert!(results3.is_empty());
     }
 }

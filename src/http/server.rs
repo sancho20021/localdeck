@@ -1,3 +1,4 @@
+use log::info;
 use rouille::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,20 +34,29 @@ impl HttpServer {
     }
 
     fn handle_request(request: &Request, storage: &Arc<Mutex<Storage>>) -> Response {
-        rouille::router!(request,
-        (GET) (/tracks/{id: String}) => {
-            Self::handle_get_track(id, storage)
-        },
+        Self::log_request(request);
 
-        (GET) (/tracks/{id: String}/stream) => {
-            Self::handle_get_track_stream(id, storage)
-        },
-        (GET) (/listen/{_id: String}) => {
-                    Self::handle_listen_page()
-        },
+        let response = rouille::router!(request,
+            (GET) (/tracks/{id: String}) => {
+                Self::handle_get_track(id, storage)
+            },
 
-        _ => Response::empty_404()
-        )
+            (GET) (/tracks/{id: String}/stream) => {
+                Self::handle_get_track_stream(id, storage)
+            },
+            (GET) (/listen/{_id: String}) => {
+                        Self::handle_listen_page()
+            },
+
+            _ => Response::empty_404()
+        );
+
+        info!("Response: {} {}", request.method(), response.status_code);
+        response
+    }
+
+    fn log_request(request: &Request) {
+        info!("{} {}", request.method(), request.url());
     }
 
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
@@ -86,7 +96,7 @@ impl HttpServer {
 
                 match std::fs::File::open(&path) {
                     Ok(file) => {
-                        println!(
+                        log::debug!(
                             "STREAM {} -> 200 OK, path: {}, MIME type: {}",
                             id,
                             path.to_string_lossy(),
