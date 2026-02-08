@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Track unavailable</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      text-align: center;
+      margin-top: 4rem;
+      background: #f9f9f9;
+      color: #333;
+    }
+
+    button {
+      font-size: 1.2rem;
+      padding: 1rem 2rem;
+      border-radius: 12px;
+      border: none;
+      background: #1a73e8; /* calm blue */
+      color: white;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+
+    button:hover {
+      background: #155ab6;
+    }
+
+    p {
+      margin: 0.5rem 0;
+    }
+  </style>
+</head>
+<body>
+  <p>Track not available on main-deck.</p>
+  <p>Status: {{STATUS}}</p>
+  <p>Error: {{REASON}}</p>
+  <button onclick="location.href='{{YT_URL}}'">
+    Open on YouTube
+  </button>
+</body>
+</html>

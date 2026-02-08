@@ -9,6 +9,16 @@ pub enum ApiError {
     Internal(String),
 }
 
+impl ApiError {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            ApiError::NotFound(_) => 404,
+            ApiError::BadRequest(_) => 400,
+            ApiError::Internal(_) => 500,
+        }
+    }
+}
+
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
         match err {
@@ -29,17 +39,18 @@ impl From<StorageError> for ApiError {
     }
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::NotFound(msg) | ApiError::BadRequest(msg) | ApiError::Internal(msg) => {
+                write!(f, "{}", msg)
+            }
+        }
+    }
+}
+
 impl ApiError {
     pub fn into_response(self) -> Response {
-        match self {
-            ApiError::NotFound(msg) =>
-                Response::text(msg).with_status_code(404),
-
-            ApiError::BadRequest(msg) =>
-                Response::text(msg).with_status_code(400),
-
-            ApiError::Internal(msg) =>
-                Response::text(msg).with_status_code(500),
-        }
+        Response::text(format!("{self}")).with_status_code(self.status_code())
     }
 }
