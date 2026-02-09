@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -19,6 +19,7 @@ use crate::{
     },
 };
 
+use anyhow::anyhow;
 use columns::*;
 use rusqlite::params;
 use tables::*;
@@ -67,6 +68,16 @@ pub struct TrackListEntry {
     pub metadata: TrackMetadata,
     pub available_files: Vec<PathBuf>,
     pub unavailable_files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct ForgetReport {
+    /// files removed
+    pub removed_files: usize,
+    /// tracks where some of its location removed
+    pub affected_tracks: usize,
+    /// tracks which no longer exist
+    pub removed_tracks: usize,
 }
 
 impl Storage {
@@ -353,6 +364,106 @@ impl Storage {
         tx.commit()?;
         Ok(results)
     }
+
+    /// removes all files inside specified directory from the database
+    /// useful when some files got moved or deleted
+    pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
+        let path = path.canonicalize().map_err(|e| StorageError::Fs(e))?;
+        let time_secs = system_time_to_i64(SystemTime::now()).map_err(StorageError::Internal)?;
+
+        let tx = self.db.transaction()?;
+
+        let prefix = path.to_string_lossy();
+
+        // --------------------------------------------------
+        // Collect affected track ids BEFORE deletion
+        // --------------------------------------------------
+
+        let mut stmt = tx.prepare(&format!(
+            "SELECT DISTINCT {TRACK_ID} FROM {FILES}
+         WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
+        ))?;
+
+        let affected_track_ids = stmt
+            .query_map(params![prefix, format!("{}/%", prefix)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        drop(stmt);
+
+        let affected_tracks = affected_track_ids.len();
+
+        // --------------------------------------------------
+        // Count entries to delete
+        // --------------------------------------------------
+
+        let removed_files: usize = tx
+            .query_row::<isize, _, _>(
+                &format!(
+                    "SELECT COUNT(*) FROM {FILES}
+             WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
+                ),
+                params![prefix, format!("{}/%", prefix)],
+                |row| row.get(0),
+            )?
+            .try_into()
+            .map_err(|e| {
+                StorageError::Internal(anyhow!(
+                    "Strange conversion error to usize after select count: {e}"
+                ))
+            })?;
+
+        // --------------------------------------------------
+        // Delete entries
+        // --------------------------------------------------
+
+        tx.execute(
+            &format!(
+                "DELETE FROM {FILES}
+             WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
+            ),
+            params![prefix, format!("{}/%", prefix)],
+        )?;
+
+        // --------------------------------------------------
+        // Count removed tracks (tracks with zero files left)
+        // --------------------------------------------------
+
+        let mut removed_tracks = 0;
+
+        for track_id in &affected_track_ids {
+            let remaining: isize = tx.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {FILES}
+                 WHERE {TRACK_ID} = ?1"
+                ),
+                params![track_id],
+                |row| row.get(0),
+            )?;
+
+            if remaining == 0 {
+                removed_tracks += 1;
+            }
+        }
+
+        // --------------------------------------------------
+        // Record update timestamp
+        // --------------------------------------------------
+
+        tx.execute(
+            &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
+            params![time_secs],
+        )?;
+
+        tx.commit()?;
+
+        Ok(ForgetReport {
+            removed_tracks,
+            affected_tracks,
+            removed_files,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -368,7 +479,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        config::LibrarySource,
+        config::{LibrarySource, Location},
         domain::hash::TrackId,
         storage::{
             error::StorageError,
@@ -394,7 +505,9 @@ mod tests {
         Ok(Storage::from_existing_conn(
             conn,
             LibrarySource {
-                roots: vec![tmp_dir.to_path_buf()],
+                roots: vec![Location::File {
+                    path: tmp_dir.to_path_buf(),
+                }],
                 follow_symlinks: false,
                 ignored_dirs: vec![],
             },
@@ -807,10 +920,7 @@ mod tests {
     #[test]
     fn test_find_files() {
         let conn = Connection::open_in_memory().unwrap();
-
-        // Create table
-        conn.execute("CREATE TABLE files (track_id TEXT, path TEXT)", [])
-            .unwrap();
+        schema::init(&conn).unwrap();
 
         // Insert some test rows
         let data = vec![
@@ -851,5 +961,76 @@ mod tests {
         // Search for non-existent track
         let results3 = storage.find_files("nonexistent").unwrap();
         assert!(results3.is_empty());
+    }
+
+    fn insert_file(conn: &Connection, track_id: &str, path: &str) {
+        conn.execute(
+            &format!("INSERT INTO {FILES} (track_id, path) VALUES (?1, ?2)"),
+            params![track_id, path],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_forget_path_removes_files_and_tracks() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
+        let mut storage = storage;
+
+        // Mock files
+        let file_a = "/music/track_a1.mp3";
+        let file_a2 = "/music/subdir/track_a2.mp3";
+        let file_b = "/music/track_b.mp3";
+        let file_c = "/hello/track_c.mp3"; // outside deleted path
+        let file_a3 = "/hello/track_a3.mp3"; // outside deleted path
+
+        let track_a = "trackid_a";
+        let track_b = "trackid_b";
+        let track_c = "trackid_c";
+
+        insert_file(&storage.db, track_a, file_a);
+        insert_file(&storage.db, track_a, file_a2);
+        insert_file(&storage.db, track_a, file_a3);
+        insert_file(&storage.db, track_b, file_b);
+        insert_file(&storage.db, track_c, file_c);
+
+        // Forget top-level directory
+        let path_to_forget = Path::new("/music");
+        let report = storage.forget_path(path_to_forget).unwrap();
+
+        assert_eq!(report.removed_files, 3); // a1 + a2 + b
+        assert_eq!(report.affected_tracks, 2); // a + b
+        assert_eq!(report.removed_tracks, 1); // b
+
+        // Remaining DB entries
+        let remaining: Vec<String> = storage
+            .db
+            .prepare("SELECT track_id FROM files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(remaining.len() == 2);
+    }
+
+    #[test]
+    fn test_forget_path_empty_dir_no_crash() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
+        let mut storage = storage;
+
+        // Forget a directory that doesn't exist
+        let path_to_forget = Path::new("/nonexistent");
+        let report = storage.forget_path(path_to_forget).unwrap();
+
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.affected_tracks, 0);
+        assert_eq!(report.removed_tracks, 0);
     }
 }

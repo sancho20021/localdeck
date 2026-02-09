@@ -1,15 +1,15 @@
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use chrono::{DateTime, Local};
 use rusqlite::Connection;
 
 use crate::{
     config::Database,
-    storage::{error::StorageError, schema, usb::find_mount_by_label},
+    storage::{error::StorageError, resolve_location, schema},
 };
 
 pub type SecondsSinceUnix = i64;
@@ -22,31 +22,13 @@ fn open_from_file(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> 
     Connection::open(path)
 }
 
-fn resolve_database_path(db: &Database) -> Result<Option<PathBuf>, anyhow::Error> {
-    if db.in_memory {
-        return Ok(None);
-    }
-
-    if let Some(path) = &db.path {
-        return Ok(Some(path.clone()));
-    }
-
-    if let (Some(label), Some(rel)) = (&db.usb_label, &db.relative_path) {
-        let mount = find_mount_by_label(label)
-            .with_context(|| format!("USB with label '{label}' not found"))?;
-
-        return Ok(Some(mount.join(rel)));
-    }
-
-    bail!("database config invalid: no path or usb_label provided");
-}
-
 pub fn open(config: &Database) -> Result<rusqlite::Connection, StorageError> {
-    let path = resolve_database_path(config).map_err(StorageError::Internal)?;
-    let db = if let Some(path) = path {
-        open_from_file(&path)?
-    } else {
-        open_in_memory()?
+    let db = match config {
+        Database::InMemory => open_in_memory()?,
+        Database::OnDisk { location } => {
+            let path = resolve_location(location).map_err(StorageError::Internal)?;
+            open_from_file(&path)?
+        }
     };
     schema::init(&db)?;
     Ok(db)
@@ -80,13 +62,7 @@ mod tests {
 
     #[test]
     fn open_in_memory_db_initializes_schema() {
-        let db = open(&Database {
-            in_memory: true,
-            path: None,
-            usb_label: None,
-            relative_path: None,
-        })
-        .unwrap();
+        let db = open(&Database::InMemory).unwrap();
 
         let mut stmt = db
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")

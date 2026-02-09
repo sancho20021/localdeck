@@ -1,13 +1,10 @@
 use anyhow::anyhow;
 use log::info;
-use rouille::{Request, Response, url};
+use rouille::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    net::TcpStream,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use crate::{
@@ -518,7 +515,7 @@ mod tests {
         let body = parse_text_response(response);
 
         assert!(
-            body.contains("No YouTube link"),
+            body.contains("no youtube link"),
             "expected no-youtube fallback message, got: {}",
             body
         );

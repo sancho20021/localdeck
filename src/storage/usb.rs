@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "windows"))]
+use anyhow::{self, bail};
+
 use std::path::PathBuf;
 
 #[cfg(not(target_os = "windows"))]

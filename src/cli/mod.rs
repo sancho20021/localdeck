@@ -39,6 +39,13 @@ pub enum Commands {
         /// Artist, Track Name, or part of the filename to search for
         track: String,
     },
+    /// Remove specified path from the database.
+    ///
+    /// Useful to stop tracking moved or deleted files
+    Forget {
+        /// Directory or file to remove from database
+        path: PathBuf,
+    },
 }
 
 /// Entrypoint for CLI
@@ -154,6 +161,19 @@ pub fn run() {
                 }
             } else {
                 println!("No tracks found :(");
+            }
+        }
+        Commands::Forget { path } => {
+            let mut storage = Storage::new(cfg.database, cfg.library_source)
+                .expect("Failed to initialize storage");
+            let report = storage.forget_path(path).unwrap();
+            if report.affected_tracks == 0 {
+                println!("No tracks located under {} found", path.to_string_lossy());
+            } else {
+                println!(
+                    "Forget operation completed:\n  Removed files: {}\n  Affected tracks: {}\n  Removed tracks: {}",
+                    report.removed_files, report.affected_tracks, report.removed_tracks
+                );
             }
         }
     }

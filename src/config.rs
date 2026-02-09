@@ -23,18 +23,25 @@ pub struct HttpConfig {
     pub port: u16,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Database {
-    pub in_memory: bool,
-    pub path: Option<PathBuf>,
-    pub usb_label: Option<String>,
-    pub relative_path: Option<String>,
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type")]
+pub enum Database {
+    InMemory,
+    OnDisk { location: Location },
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type")]
+pub enum Location {
+    File { path: PathBuf },
+    Usb { label: String, path: PathBuf },
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct LibrarySource {
-    pub roots: Vec<PathBuf>,
+    pub roots: Vec<Location>,
     pub follow_symlinks: bool,
+    /// directories on computer that should be ignored when scanning the library. Does not work with USB directories
     #[serde(default)]
     pub ignored_dirs: Vec<PathBuf>,
 }
@@ -50,10 +57,10 @@ mod tests {
 version = 1
 
 [database]
-in_memory = true
+type = "InMemory"
 
 [library_source]
-roots = ["/home/sancho20021/Music"]
+roots = [{type = "File", path = "/home/sancho20021/Music"}]
 follow_symlinks = true
 ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 
@@ -69,12 +76,14 @@ port = 8080
         assert_eq!(cfg.version, 1);
 
         // Check database variant
-        assert!(cfg.database.in_memory);
+        assert!(cfg.database == Database::InMemory);
 
         // Check library source
         assert_eq!(
             cfg.library_source.roots,
-            vec![PathBuf::from("/home/sancho20021/Music")]
+            vec![Location::File {
+                path: PathBuf::from("/home/sancho20021/Music")
+            }]
         );
         assert!(cfg.library_source.follow_symlinks);
 
@@ -87,11 +96,11 @@ port = 8080
 version = 1
 
 [database]
-in_memory = false
-path = "/tmp/localdex.db"
+type = "OnDisk"
+location = { type = "File", path = "/tmp/localdex.db" }
 
 [library_source]
-roots = ["/home/sancho20021/Music"]
+roots = [{type = "File", path = "/home/sancho20021/Music"}]
 follow_symlinks = false
 
 [http]
@@ -105,13 +114,57 @@ port = 8080
         assert_eq!(cfg.version, 1);
 
         // Check database variant
-        assert!(!cfg.database.in_memory);
-        assert_eq!(cfg.database.path, Some(PathBuf::from("/tmp/localdex.db")));
+        assert!(
+            matches!(cfg.database, Database::OnDisk { location: Location::File { path } } if path == PathBuf::from("/tmp/localdex.db"))
+        );
 
         // Check library source
         assert_eq!(
             cfg.library_source.roots,
-            vec![PathBuf::from("/home/sancho20021/Music")]
+            vec![Location::File {
+                path: PathBuf::from("/home/sancho20021/Music")
+            }]
+        );
+        assert!(!cfg.library_source.follow_symlinks);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_usb_database_config() -> anyhow::Result<()> {
+        let toml_str = r#"
+version = 1
+
+[database]
+type = "OnDisk"
+location = { type = "Usb", label = "MUSIC", path = "localdex.db" }
+
+[library_source]
+roots = [{type = "File", path = "/home/sancho20021/Music"}]
+follow_symlinks = false
+
+[http]
+bind_addr = "127.0.0.1"
+port = 8080
+"#;
+
+        let cfg: Config = toml::from_str(toml_str)?;
+
+        // Check version
+        assert_eq!(cfg.version, 1);
+
+        // Check database variant
+        assert!(
+            matches!(cfg.database, Database::OnDisk { location: Location::Usb { label, path } }
+                if label == "MUSIC" && path == PathBuf::from("localdex.db"))
+        );
+
+        // Check library source
+        assert_eq!(
+            cfg.library_source.roots,
+            vec![Location::File {
+                path: PathBuf::from("/home/sancho20021/Music")
+            }]
         );
         assert!(!cfg.library_source.follow_symlinks);
 

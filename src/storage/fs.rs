@@ -7,7 +7,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{config, domain::hash::TrackId, storage::error::StorageError};
+use crate::{
+    config::{self, Location},
+    domain::hash::TrackId,
+    storage::{error::StorageError, resolve_location},
+};
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
 
@@ -47,12 +51,14 @@ impl ObservedFile {
 /// Recursively scans all music files in the given directory. Retrieves their paths and track ids
 pub fn scan_dir(
     follow_symlinks: bool,
-    root: &Path,
+    root: &Location,
     ignored_dirs: &[PathBuf],
 ) -> Result<Vec<ObservedFile>, StorageError> {
+    let root = resolve_location(root)
+        .map_err(|e| StorageError::Internal(e.context("failed to resolve library source root")))?;
     let root_str = root.to_string_lossy();
 
-    let walker = WalkDir::new(root).follow_links(follow_symlinks);
+    let walker = WalkDir::new(&root).follow_links(follow_symlinks);
 
     let paths = walker
         // filter out ignored directories
@@ -87,7 +93,7 @@ pub fn scan_dir(
 /// Recursively scans all music files in given directories. Retrieves their paths and track ids
 pub fn scan_dirs(
     follow_symlinks: bool,
-    roots: &Vec<PathBuf>,
+    roots: &Vec<Location>,
     ignored_dirs: &[PathBuf],
 ) -> Result<Vec<ObservedFile>, StorageError> {
     let scanned_dirs = roots
@@ -135,7 +141,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        config,
+        config::{self, Location},
         storage::fs::{FsSnapshot, scan_dir},
     };
 
@@ -144,18 +150,19 @@ mod tests {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
+        let root_path = tmp.path().to_path_buf();
+        let root = Location::from_path(&root_path);
 
         // fake files
-        let song1 = root.join("song1.mp3");
-        let song2 = root.join("song2.flac");
-        let not_music = root.join("notes.txt");
+        let song1 = root_path.join("song1.mp3");
+        let song2 = root_path.join("song2.flac");
+        let not_music = root_path.join("notes.txt");
 
         std::fs::write(&song1, b"aaa").unwrap();
         std::fs::write(&song2, b"bbb").unwrap();
         std::fs::write(&not_music, b"ccc").unwrap();
 
-        let files = scan_dir(false, root, &[]).unwrap();
+        let files = scan_dir(false, &root, &[]).unwrap();
 
         assert_eq!(files.len(), 2);
 
@@ -182,7 +189,10 @@ mod tests {
 
         let config = config::LibrarySource {
             follow_symlinks: false,
-            roots: vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()],
+            roots: vec![
+                Location::from_path(dir1.path()),
+                Location::from_path(dir2.path()),
+            ],
             ignored_dirs: vec![],
         };
 
@@ -213,7 +223,7 @@ mod tests {
         std::fs::write(&song2, b"bbb").unwrap();
         std::fs::write(&ignored_song, b"ccc").unwrap();
 
-        let files = scan_dir(false, root, &[ignored_dir.clone()]).unwrap();
+        let files = scan_dir(false, &Location::from_path(root), &[ignored_dir.clone()]).unwrap();
 
         // Should find only the two non-ignored music files
         assert_eq!(files.len(), 2);
