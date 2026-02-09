@@ -7,6 +7,8 @@ pub enum ApiError {
     NotFound(String),
     BadRequest(String),
     Internal(String),
+    /// invalid byte range requested
+    InvalidRange,
 }
 
 impl ApiError {
@@ -15,6 +17,7 @@ impl ApiError {
             ApiError::NotFound(_) => 404,
             ApiError::BadRequest(_) => 400,
             ApiError::Internal(_) => 500,
+            ApiError::InvalidRange => 416,
         }
     }
 }
@@ -44,6 +47,9 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::NotFound(msg) | ApiError::BadRequest(msg) | ApiError::Internal(msg) => {
                 write!(f, "{}", msg)
+            }
+            ApiError::InvalidRange => {
+                write!(f, "invalid byte range")
             }
         }
     }

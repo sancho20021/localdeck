@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use columns::*;
 use rusqlite::params;
 use tables::*;
@@ -368,7 +368,6 @@ impl Storage {
     /// removes all files inside specified directory from the database
     /// useful when some files got moved or deleted
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
-        let path = path.canonicalize().map_err(|e| StorageError::Fs(e))?;
         let time_secs = system_time_to_i64(SystemTime::now()).map_err(StorageError::Internal)?;
 
         let tx = self.db.transaction()?;

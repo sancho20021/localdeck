@@ -3,6 +3,8 @@ use log::info;
 use rouille::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -41,7 +43,7 @@ impl HttpServer {
             },
 
             (GET) (/tracks/{id: String}/stream) => {
-                Self::handle_get_track_stream(id, &self.storage)
+                Self::handle_get_track_stream(id, request, &self.storage)
             },
             (GET) (/listen/{_id: String}) => {
                         Self::handle_listen_page()
@@ -78,11 +80,15 @@ impl HttpServer {
         }
     }
 
+    /// streams music file, respecting byterange
     /// returns Response with ok status, or ApiError
-    fn get_track_stream(id: String, storage: &Arc<Mutex<Storage>>) -> Result<Response, ApiError> {
+    fn get_track_stream(
+        id: String,
+        request: &Request,
+        storage: &Arc<Mutex<Storage>>,
+    ) -> Result<Response, ApiError> {
         let track_id = TrackId::from_hex(&id).map_err(|_| StorageError::InvalidTrackId)?;
 
-        // Lock storage and fetch track
         let mut storage = storage.lock().map_err(|e| {
             StorageError::Internal(anyhow!(
                 "Could not access localdeck storage under lock: {e}"
@@ -91,21 +97,98 @@ impl HttpServer {
         let (track, path) = storage.get_track(track_id)?;
         let mime = Self::mime_for_track(&path);
 
-        let file = std::fs::File::open(&path).map_err(StorageError::Fs)?;
+        let mut file = File::open(&path).map_err(StorageError::Fs)?;
+        let file_size = file.metadata().map_err(StorageError::Fs)?.len();
+
+        // ---------------------------------------------
+        // Parse Range header if present
+        // ---------------------------------------------
+        let range_header = request.header("Range");
+        if let Some(range) = range_header {
+            // Expect something like "bytes=123-456"
+            if let Some((start, end)) = Self::parse_http_range(range, file_size)? {
+                let chunk_size = end - start + 1;
+                let mut buffer = vec![0u8; chunk_size as usize];
+
+                file.seek(SeekFrom::Start(start))
+                    .map_err(StorageError::Fs)?;
+                file.read_exact(&mut buffer).map_err(StorageError::Fs)?;
+
+                log::debug!(
+                    "STREAM {} -> 206 Partial Content, path: {}, MIME type: {}, bytes {}-{}",
+                    id,
+                    path.to_string_lossy(),
+                    mime,
+                    start,
+                    end
+                );
+
+                let resp = Response::from_data(mime, buffer)
+                    .with_status_code(206)
+                    .with_additional_header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .with_additional_header("Accept-Ranges", "bytes")
+                    .with_additional_header(
+                        "X-Track-Artist",
+                        track.metadata.artist.unwrap_or_default(),
+                    )
+                    .with_additional_header(
+                        "X-Track-Title",
+                        track.metadata.title.unwrap_or_default(),
+                    );
+
+                return Ok(resp);
+            }
+        }
+
+        // No Range header, return full file
         log::debug!(
             "STREAM {} -> 200 OK, path: {}, MIME type: {}",
             id,
             path.to_string_lossy(),
             mime
         );
-
         Ok(Response::from_file(mime, file)
+            .with_additional_header("Accept-Ranges", "bytes")
             .with_additional_header("X-Track-Artist", track.metadata.artist.unwrap_or_default())
             .with_additional_header("X-Track-Title", track.metadata.title.unwrap_or_default()))
     }
 
-    fn handle_get_track_stream(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
-        match Self::get_track_stream(id, storage) {
+    /// parse "bytes=start-end" header
+    /// Returns (start, end) or error
+    fn parse_http_range(range: &str, file_size: u64) -> Result<Option<(u64, u64)>, ApiError> {
+        if !range.starts_with("bytes=") {
+            return Ok(None);
+        }
+
+        let range = &range[6..]; // strip "bytes="
+        let parts: Vec<&str> = range.split('-').collect();
+        if parts.len() != 2 {
+            return Ok(None);
+        }
+
+        let start = parts[0].parse::<u64>().unwrap_or(0);
+        let end = if !parts[1].is_empty() {
+            parts[1].parse::<u64>().unwrap_or(file_size - 1)
+        } else {
+            file_size - 1
+        };
+
+        if start > end || end >= file_size {
+            return Err(ApiError::InvalidRange);
+        }
+
+        Ok(Some((start, end)))
+    }
+
+    fn handle_get_track_stream(
+        id: String,
+        request: &Request,
+        storage: &Arc<Mutex<Storage>>,
+    ) -> Response {
+        match Self::get_track_stream(id, request, storage) {
             Ok(r) => r,
             Err(e) => e.into_response(),
         }
@@ -155,7 +238,7 @@ impl HttpServer {
 
         let youtube_id = request.get_param("y");
 
-        match Self::get_track_stream(hash, &self.storage) {
+        match Self::get_track_stream(hash, request, &self.storage) {
             Ok(resp) => resp,
 
             Err(err) => {
@@ -268,7 +351,7 @@ mod tests {
         mock_trackid(x).to_hex()
     }
 
-    fn create_server_with_track(track_id: i32, path: &str) -> HttpServer {
+    fn create_server_with_track(track_id: TrackId, path: &str) -> HttpServer {
         let storage = setup_storage().unwrap();
 
         {
@@ -278,7 +361,7 @@ mod tests {
                 .db
                 .execute(
                     &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
-                    params![mock_trackid_str(track_id), path],
+                    params![track_id.to_hex(), path],
                 )
                 .unwrap();
         }
@@ -454,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_play_streams_track_successfully() {
-        let server = create_server_with_track(123, "somewhere"); // storage contains track
+        let server = create_server_with_track(mock_trackid(123), "somewhere"); // storage contains track
 
         let request = Request::fake_http("GET", "/play?h=123", vec![], vec![]);
 
@@ -545,5 +628,94 @@ mod tests {
             "expected missing-hash error, got: {}",
             body
         );
+    }
+
+    #[test]
+    fn test_stream_headers() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("song.mp3");
+        fs::write(&file_path, b"x").unwrap();
+
+        let track_id = mock_trackid(12345);
+        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+
+        let request =
+            Request::fake_http("GET", format!("/tracks/{track_id}/stream"), vec![], vec![]);
+        let response =
+            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage)
+                .expect("streaming should succeed");
+
+        // Check that Accept-Ranges header is present
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("Accept-Ranges")),
+            true
+        );
+
+        // Check status code
+        assert!(
+            response.status_code == 200 || response.status_code == 206,
+            "expected 200 or 206, got {}",
+            response.status_code
+        );
+    }
+
+    #[test]
+    fn test_stream_partial_range() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("song.mp3");
+        fs::write(&file_path, b"asdfghjkas").unwrap();
+
+        let track_id = mock_trackid(12345);
+        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+
+        // Request a partial range
+        let request = Request::fake_http(
+            "GET",
+            format!("/tracks/{track_id}/stream"),
+            vec![("Range".into(), "bytes=2-5".into())],
+            vec![],
+        );
+
+        let response =
+            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage)
+                .expect("partial streaming should succeed");
+
+        assert_eq!(response.status_code, 206);
+
+        let content_range = response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Range"))
+            .expect("Content-Range header should be present")
+            .1
+            .to_string();
+
+        assert_eq!(content_range, "bytes 2-5/10");
+    }
+
+    #[test]
+    fn test_stream_invalid_range_returns_416() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("song.mp3");
+        fs::write(&file_path, b"x").unwrap();
+
+        let track_id = mock_trackid(12345);
+        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+
+        // Request a range beyond file size
+        let request = Request::fake_http(
+            "GET",
+            "/tracks/{track_id}/stream",
+            vec![("Range".into(), "bytes=20-30".into())],
+            vec![],
+        );
+
+        let response =
+            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage);
+
+        assert!(matches!(response, Err(ApiError::InvalidRange)));
     }
 }
