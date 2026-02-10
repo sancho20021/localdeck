@@ -34,6 +34,7 @@ impl HttpServer {
         rouille::start_server(addr, move |request| self.handle_request(request));
     }
 
+    /// Never change the /play route as it will be printed on qrs or nfc
     fn handle_request(&self, request: &Request) -> Response {
         Self::log_request(request);
 
@@ -228,7 +229,9 @@ impl HttpServer {
 
     /// tries to stream just like /track/stream route.
     ///
-    /// if fails, offers to redirect to youtube
+    /// if fails, offers to redirect to youtube.
+    ///
+    /// Never change the api interface of this method as this route is used on printed qrs / nfcs.
     fn handle_play(&self, request: &Request) -> Response {
         let hash = if let Some(hash) = request.get_param("h") {
             hash

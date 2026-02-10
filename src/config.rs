@@ -8,6 +8,14 @@ pub struct Config {
     pub database: Database,
     pub library_source: LibrarySource,
     pub http: HttpConfig,
+    pub public_endpoint: PublicEndpoint,
+}
+
+/// "public" endpoint that will be used on QR codes and NFCs
+#[derive(Debug, Deserialize)]
+pub struct PublicEndpoint {
+    /// example: http://main-deck:8080
+    pub base_url: String,
 }
 
 impl Config {
@@ -67,6 +75,9 @@ ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 [http]
 bind_addr = "127.0.0.1"
 port = 8080
+
+[public_endpoint]
+base_url = "hello"
 "#;
 
         // Deserialize TOML into Config
@@ -106,6 +117,10 @@ follow_symlinks = false
 [http]
 bind_addr = "127.0.0.1"
 port = 8080
+
+
+[public_endpoint]
+base_url = "hello:8080"
 "#;
 
         let cfg: Config = toml::from_str(toml_str)?;
@@ -146,6 +161,9 @@ follow_symlinks = false
 [http]
 bind_addr = "127.0.0.1"
 port = 8080
+
+[public_endpoint]
+base_url = "hello"
 "#;
 
         let cfg: Config = toml::from_str(toml_str)?;

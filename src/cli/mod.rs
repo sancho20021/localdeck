@@ -2,9 +2,10 @@ use clap::{Parser, Subcommand};
 use log::info;
 use std::path::PathBuf;
 
-use crate::config;
+use crate::domain::hash::TrackId;
 use crate::storage::db::i64_seconds_to_local_time;
 use crate::storage::operations::Storage;
+use crate::{config, public_endpoint};
 
 #[derive(Parser)]
 #[command(name = "localdec")]
@@ -46,6 +47,9 @@ pub enum Commands {
         /// Directory or file to remove from database
         path: PathBuf,
     },
+    /// Generate url for a track to be printed on qr code or nfc chip
+    /// Currently does not include youtube link
+    Url { track_id: String },
 }
 
 /// Entrypoint for CLI
@@ -175,6 +179,11 @@ pub fn run() {
                     report.removed_files, report.affected_tracks, report.removed_tracks
                 );
             }
+        }
+        Commands::Url { track_id } => {
+            let track_id = TrackId::from_hex(track_id).unwrap();
+            let url = public_endpoint::get_play_url(&cfg.public_endpoint, track_id, None);
+            println!("{url}");
         }
     }
 }
