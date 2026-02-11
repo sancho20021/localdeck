@@ -9,6 +9,15 @@ pub struct Config {
     pub library_source: LibrarySource,
     pub http: HttpConfig,
     pub public_endpoint: PublicEndpoint,
+    pub data: Data,
+}
+
+/// LocalDeck data dir: used for storing artwork, database, etc
+#[derive(Debug, Deserialize)]
+pub struct Data {
+    root_dir: Location,
+    /// must be relative to root_dir
+    artwork_dir: PathBuf,
 }
 
 /// "public" endpoint that will be used on QR codes and NFCs
@@ -72,6 +81,10 @@ roots = [{type = "File", path = "/home/sancho20021/Music"}]
 follow_symlinks = true
 ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 
+[data]
+root_dir = { type = "File", path = "/home/sancho20021/hello" }
+artwork_dir = "artwork"
+
 [http]
 bind_addr = "127.0.0.1"
 port = 8080
@@ -104,87 +117,33 @@ base_url = "hello"
     #[test]
     fn test_parse_file_database_config() -> anyhow::Result<()> {
         let toml_str = r#"
-version = 1
-
-[database]
 type = "OnDisk"
 location = { type = "File", path = "/tmp/localdex.db" }
-
-[library_source]
-roots = [{type = "File", path = "/home/sancho20021/Music"}]
-follow_symlinks = false
-
-[http]
-bind_addr = "127.0.0.1"
-port = 8080
-
-
-[public_endpoint]
-base_url = "hello:8080"
 "#;
 
-        let cfg: Config = toml::from_str(toml_str)?;
-
-        // Check version
-        assert_eq!(cfg.version, 1);
+        let cfg: Database = toml::from_str(toml_str)?;
 
         // Check database variant
         assert!(
-            matches!(cfg.database, Database::OnDisk { location: Location::File { path } } if path == PathBuf::from("/tmp/localdex.db"))
+            matches!(cfg, Database::OnDisk { location: Location::File { path } } if path == PathBuf::from("/tmp/localdex.db"))
         );
-
-        // Check library source
-        assert_eq!(
-            cfg.library_source.roots,
-            vec![Location::File {
-                path: PathBuf::from("/home/sancho20021/Music")
-            }]
-        );
-        assert!(!cfg.library_source.follow_symlinks);
-
         Ok(())
     }
 
     #[test]
     fn test_parse_usb_database_config() -> anyhow::Result<()> {
         let toml_str = r#"
-version = 1
-
-[database]
 type = "OnDisk"
 location = { type = "Usb", label = "MUSIC", path = "localdex.db" }
-
-[library_source]
-roots = [{type = "File", path = "/home/sancho20021/Music"}]
-follow_symlinks = false
-
-[http]
-bind_addr = "127.0.0.1"
-port = 8080
-
-[public_endpoint]
-base_url = "hello"
 "#;
 
-        let cfg: Config = toml::from_str(toml_str)?;
-
-        // Check version
-        assert_eq!(cfg.version, 1);
+        let cfg: Database = toml::from_str(toml_str)?;
 
         // Check database variant
         assert!(
-            matches!(cfg.database, Database::OnDisk { location: Location::Usb { label, path } }
+            matches!(cfg, Database::OnDisk { location: Location::Usb { label, path } }
                 if label == "MUSIC" && path == PathBuf::from("localdex.db"))
         );
-
-        // Check library source
-        assert_eq!(
-            cfg.library_source.roots,
-            vec![Location::File {
-                path: PathBuf::from("/home/sancho20021/Music")
-            }]
-        );
-        assert!(!cfg.library_source.follow_symlinks);
 
         Ok(())
     }

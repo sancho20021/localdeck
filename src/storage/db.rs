@@ -30,6 +30,7 @@ pub fn open(config: &Database) -> Result<rusqlite::Connection, StorageError> {
             open_from_file(&path)?
         }
     };
+    db.pragma_update(None, "foreign_keys", true)?;
     schema::init(&db)?;
     Ok(db)
 }

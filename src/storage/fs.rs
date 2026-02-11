@@ -98,7 +98,10 @@ pub fn scan_dirs(
 ) -> Result<Vec<ObservedFile>, StorageError> {
     let scanned_dirs = roots
         .iter()
-        .map(|root| scan_dir(follow_symlinks, root, ignored_dirs))
+        .map(|root| {
+            println!("Scanning {root}");
+            scan_dir(follow_symlinks, root, ignored_dirs)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(scanned_dirs.into_iter().flatten().collect())
 }

@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     config::HttpConfig,
-    domain::{hash::TrackId, track::Track},
+    domain::{hash::TrackId, track::TrackMetadata},
     http::error::ApiError,
     storage::{error::StorageError, operations::Storage},
 };
@@ -75,7 +75,9 @@ impl HttpServer {
         };
 
         match result {
-            Ok((track, path)) => Response::json(&TrackResponse::from_domain(&track, path)),
+            Ok((track, path, metadata)) => {
+                Response::json(&TrackResponse::from_domain(&track, path, metadata))
+            }
 
             Err(e) => ApiError::from(e).into_response(),
         }
@@ -95,11 +97,22 @@ impl HttpServer {
                 "Could not access localdeck storage under lock: {e}"
             ))
         })?;
-        let (track, path) = storage.get_track(track_id)?;
+        let (_, path, meta) = storage.get_track(track_id)?;
         let mime = Self::mime_for_track(&path);
 
         let mut file = File::open(&path).map_err(StorageError::Fs)?;
         let file_size = file.metadata().map_err(StorageError::Fs)?.len();
+
+        let with_extra_headers = |resp: Response| -> Response {
+            let mut resp = resp.with_additional_header("Accept-Ranges", "bytes");
+
+            if let Some(meta) = meta {
+                resp = resp
+                    .with_additional_header("X-Track-Artist", meta.artist)
+                    .with_additional_header("X-Track-Title", meta.title);
+            }
+            resp
+        };
 
         // ---------------------------------------------
         // Parse Range header if present
@@ -124,21 +137,14 @@ impl HttpServer {
                     end
                 );
 
-                let resp = Response::from_data(mime, buffer)
-                    .with_status_code(206)
-                    .with_additional_header(
-                        "Content-Range",
-                        format!("bytes {}-{}/{}", start, end, file_size),
-                    )
-                    .with_additional_header("Accept-Ranges", "bytes")
-                    .with_additional_header(
-                        "X-Track-Artist",
-                        track.metadata.artist.unwrap_or_default(),
-                    )
-                    .with_additional_header(
-                        "X-Track-Title",
-                        track.metadata.title.unwrap_or_default(),
-                    );
+                let resp = with_extra_headers(
+                    Response::from_data(mime, buffer)
+                        .with_status_code(206)
+                        .with_additional_header(
+                            "Content-Range",
+                            format!("bytes {}-{}/{}", start, end, file_size),
+                        ),
+                );
 
                 return Ok(resp);
             }
@@ -151,10 +157,7 @@ impl HttpServer {
             path.to_string_lossy(),
             mime
         );
-        Ok(Response::from_file(mime, file)
-            .with_additional_header("Accept-Ranges", "bytes")
-            .with_additional_header("X-Track-Artist", track.metadata.artist.unwrap_or_default())
-            .with_additional_header("X-Track-Title", track.metadata.title.unwrap_or_default()))
+        Ok(with_extra_headers(Response::from_file(mime, file)))
     }
 
     /// parse "bytes=start-end" header
@@ -280,24 +283,30 @@ impl HttpServer {
 struct TrackResponse {
     track_id: String,
     path: PathBuf,
-    metadata: TrackMetadataResponse,
+    metadata: Option<TrackMetadataResponse>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct TrackMetadataResponse {
-    artist: Option<String>,
-    title: Option<String>,
+    pub artist: String,
+    pub title: String,
+    pub year: Option<u32>,
+    pub label: Option<String>,
+    pub artwork: Option<String>,
 }
 
 impl TrackResponse {
-    fn from_domain(track: &Track, path: PathBuf) -> Self {
+    fn from_domain(track: &TrackId, path: PathBuf, meta: Option<TrackMetadata>) -> Self {
         Self {
-            track_id: track.id.to_hex(),
+            track_id: track.to_string(),
             path,
-            metadata: TrackMetadataResponse {
-                artist: track.metadata.artist.clone(),
-                title: track.metadata.title.clone(),
-            },
+            metadata: meta.map(|metadata| TrackMetadataResponse {
+                artist: metadata.artist.clone(),
+                title: metadata.title.clone(),
+                year: metadata.year,
+                label: metadata.label.clone(),
+                artwork: metadata.artwork.clone().map(|a| a.0),
+            }),
         }
     }
 }
@@ -317,13 +326,14 @@ mod tests {
     use crate::{
         domain::hash::TrackId,
         storage::operations::Storage,
-        storage::schema::{self, FILES, PATH, TRACK_ID},
+        storage::schema::{FILES, PATH, TRACK_ID},
     };
 
     use rouille::Request;
-    use rusqlite::{Connection, params};
+    use rusqlite::params;
     use std::{
         fs,
+        str::FromStr,
         sync::{Arc, Mutex},
     };
     use tempfile::tempdir;
@@ -331,7 +341,7 @@ mod tests {
     pub fn parse_text_response(response: rouille::Response) -> String {
         let mut buf = String::new();
         let mut reader = response.data.into_reader_and_size().0;
-        reader.read_to_string(&mut buf);
+        reader.read_to_string(&mut buf).unwrap();
         buf
     }
 
@@ -354,17 +364,18 @@ mod tests {
         mock_trackid(x).to_hex()
     }
 
-    fn create_server_with_track(track_id: TrackId, path: &str) -> HttpServer {
+    fn create_server_with_tracks<S: AsRef<str>>(
+        tracks: impl IntoIterator<Item = (TrackId, S)>,
+    ) -> HttpServer {
         let storage = setup_storage().unwrap();
 
         {
-            let locked = storage.lock().unwrap();
-
+            let mut locked = storage.lock().unwrap();
             locked
-                .db
-                .execute(
-                    &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
-                    params![track_id.to_hex(), path],
+                .insert_tracks(
+                    tracks
+                        .into_iter()
+                        .map(|(t, p)| (t, PathBuf::from_str(p.as_ref()).unwrap())),
                 )
                 .unwrap();
         }
@@ -377,12 +388,10 @@ mod tests {
     }
 
     fn setup_storage() -> anyhow::Result<Arc<Mutex<Storage>>> {
-        let conn = Connection::open_in_memory()?;
-        schema::init(&conn)?;
-        Ok(Arc::new(Mutex::new(Storage::from_existing_conn(
-            conn,
+        Ok(Arc::new(Mutex::new(Storage::new(
+            crate::config::Database::InMemory,
             Default::default(),
-        ))))
+        )?)))
     }
 
     // --------------------------------------------------
@@ -391,37 +400,26 @@ mod tests {
 
     #[test]
     fn test_http_get_track_success() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
-
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
 
-        let track_id = TrackId::from_file(&file_path)?;
-
-        {
-            let locked = storage.lock().unwrap();
-
-            locked.db.execute(
-                &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
-                params![track_id.to_hex(), file_path.to_string_lossy()],
-            )?;
-        }
+        let server = create_server_with_tracks([(mock_trackid(1), file_path.to_string_lossy())]);
 
         let request = Request::fake_http(
             "GET",
-            format!("/tracks/{}", track_id.to_hex()),
+            format!("/tracks/{}", mock_trackid_str(1)),
             vec![],
             vec![],
         );
 
-        let response = create_server(&storage).handle_request(&request);
+        let response = server.handle_request(&request);
 
         assert_eq!(response.status_code, 200);
 
         let body: TrackResponse = parse_json_response(response)?;
 
-        assert_eq!(body.track_id, track_id.to_hex());
+        assert_eq!(body.track_id, mock_trackid_str(1));
         assert_eq!(body.path, file_path);
 
         Ok(())
@@ -465,31 +463,20 @@ mod tests {
 
     #[test]
     fn test_http_get_track_stream_success() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
-
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
 
-        let track_id = TrackId::from_file(&file_path)?;
-
-        {
-            let locked = storage.lock().unwrap();
-
-            locked.db.execute(
-                &format!("INSERT INTO {FILES} ({TRACK_ID}, {PATH}) VALUES (?1, ?2)"),
-                params![track_id.to_hex(), file_path.to_string_lossy()],
-            )?;
-        }
+        let server = create_server_with_tracks([(mock_trackid(1), file_path.to_string_lossy())]);
 
         let request = Request::fake_http(
             "GET",
-            format!("/tracks/{}/stream", track_id.to_hex()),
+            format!("/tracks/{}/stream", mock_trackid_str(1)),
             vec![],
             vec![],
         );
 
-        let response = create_server(&storage).handle_request(&request);
+        let response = server.handle_request(&request);
 
         assert_eq!(response.status_code, 200);
 
@@ -540,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_play_streams_track_successfully() {
-        let server = create_server_with_track(mock_trackid(123), "somewhere"); // storage contains track
+        let server = create_server_with_tracks([(mock_trackid(123), "somewhere")]); // storage contains track
 
         let request = Request::fake_http("GET", "/play?h=123", vec![], vec![]);
 
@@ -640,7 +627,7 @@ mod tests {
         fs::write(&file_path, b"x").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         let request =
             Request::fake_http("GET", format!("/tracks/{track_id}/stream"), vec![], vec![]);
@@ -672,7 +659,7 @@ mod tests {
         fs::write(&file_path, b"asdfghjkas").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         // Request a partial range
         let request = Request::fake_http(
@@ -706,7 +693,7 @@ mod tests {
         fs::write(&file_path, b"x").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_track(track_id, &file_path.to_string_lossy());
+        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         // Request a range beyond file size
         let request = Request::fake_http(
@@ -720,5 +707,66 @@ mod tests {
             HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage);
 
         assert!(matches!(response, Err(ApiError::InvalidRange)));
+    }
+
+    #[test]
+    fn test_http_get_track_with_metadata() -> anyhow::Result<()> {
+        use std::fs;
+        use tempfile::tempdir;
+
+        // ---------- Setup temp directory and music file ----------
+        let dir = tempdir()?;
+        let file_path = dir.path().join("song.mp3");
+        fs::write(&file_path, b"x")?;
+
+        let track_id = mock_trackid(42);
+        let track_id_str = mock_trackid_str(42);
+
+        // ---------- Setup server with track and metadata ----------
+        // `create_server_with_tracks` should accept metadata if we extend it
+        let server = create_server_with_tracks([(track_id, file_path.to_string_lossy())]);
+
+        // Insert metadata directly into the test DB
+        server.storage.lock().unwrap().db.execute(
+            r#"
+            INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            [
+                &track_id.to_string(),
+                "Test Song",
+                "Test Artist",
+                "2026",
+                "Test Label",
+                "cover.jpg",
+            ],
+        )?;
+
+        // ---------- Make the HTTP request ----------
+        let request =
+            Request::fake_http("GET", format!("/tracks/{}", track_id_str), vec![], vec![]);
+        let response = server.handle_request(&request);
+
+        assert_eq!(response.status_code, 200);
+
+        // ---------- Parse JSON response ----------
+        let body: TrackResponse = parse_json_response(response)?;
+
+        // ---------- Assertions ----------
+        assert_eq!(body.track_id, track_id_str);
+        assert_eq!(body.path, file_path);
+
+        // Metadata assertions
+        let metadata = body.metadata.expect("Metadata should be present");
+        assert_eq!(metadata.title, "Test Song");
+        assert_eq!(metadata.artist, "Test Artist");
+        assert_eq!(metadata.year, Some(2026));
+        assert_eq!(metadata.label.as_deref(), Some("Test Label"));
+        assert_eq!(
+            metadata.artwork.as_ref().map(|a| a.as_str()),
+            Some("cover.jpg")
+        );
+
+        Ok(())
     }
 }
