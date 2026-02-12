@@ -3,8 +3,9 @@ use log::info;
 use std::path::PathBuf;
 
 use crate::domain::hash::TrackId;
+use crate::domain::track::{ArtworkRef, TrackMetadata};
 use crate::storage::db::i64_seconds_to_local_time;
-use crate::storage::operations::Storage;
+use crate::storage::operations::{MetadataUpdate, Storage};
 use crate::{config, public_endpoint};
 
 #[derive(Parser)]
@@ -50,6 +51,54 @@ pub enum Commands {
     /// Generate url for a track to be printed on qr code or nfc chip
     /// Currently does not include youtube link
     Url { track_id: String },
+
+    /// Add, Get, or update metadata for a track
+    Metadata {
+        /// Track ID
+        track_id: String,
+
+        /// Track title
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Artist name
+        #[arg(long)]
+        artist: Option<String>,
+
+        /// Release year
+        #[arg(long)]
+        year: Option<u32>,
+
+        /// Label / publisher
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Artwork URL
+        #[arg(long)]
+        artwork: Option<String>,
+
+        /// Allow overwriting existing metadata
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
+impl Commands {
+    fn to_metadata_update(
+        title: Option<String>,
+        artist: Option<String>,
+        year: Option<u32>,
+        label: Option<String>,
+        artwork: Option<String>,
+    ) -> MetadataUpdate {
+        MetadataUpdate {
+            title,
+            artist,
+            year,
+            label,
+            artwork: artwork.map(ArtworkRef),
+        }
+    }
 }
 
 /// Entrypoint for CLI
@@ -63,7 +112,7 @@ pub fn run() {
 
     let cfg = config::Config::load(cli.config.to_str().unwrap()).unwrap();
 
-    match &cli.command {
+    match cli.command {
         Commands::Status {} => {
             let mut storage = Storage::new(cfg.database, cfg.library_source).unwrap();
             let (fs_snapshot, db_snapshot, diff_result) = storage.status().unwrap();
@@ -147,7 +196,7 @@ pub fn run() {
                     println!("  No available files found :(");
                 }
 
-                if *show_unavailable && !track.unavailable_files.is_empty() {
+                if show_unavailable && !track.unavailable_files.is_empty() {
                     println!("  Unavailable files:");
                     for path in &track.unavailable_files {
                         println!("    - {}", path.to_string_lossy());
@@ -158,7 +207,7 @@ pub fn run() {
         Commands::Find { track: name } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-            let tracks = storage.find_files(name).unwrap();
+            let tracks = storage.find_files(&name).unwrap();
             if !tracks.is_empty() {
                 for (trackid, path) in tracks {
                     println!("    - {trackid} at {path}");
@@ -170,7 +219,7 @@ pub fn run() {
         Commands::Forget { path } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-            let report = storage.forget_path(path).unwrap();
+            let report = storage.forget_path(&path).unwrap();
             if report.affected_tracks == 0 {
                 println!("No tracks located under {} found", path.to_string_lossy());
             } else {
@@ -185,5 +234,62 @@ pub fn run() {
             let url = public_endpoint::get_play_url(&cfg.public_endpoint, track_id, None);
             println!("{url}");
         }
+
+        Commands::Metadata {
+            track_id,
+            title,
+            artist,
+            year,
+            label,
+            artwork,
+            overwrite,
+        } => {
+            let mut storage = Storage::new(cfg.database, cfg.library_source)
+                .expect("Failed to initialize storage");
+
+            let track_id = TrackId::from_hex(&track_id).unwrap();
+
+            if title.is_none()
+                && artist.is_none()
+                && year.is_none()
+                && label.is_none()
+                && artwork.is_none()
+            {
+                let meta = storage.get_track_metadata(track_id).unwrap();
+                if let Some(meta) = meta {
+                    println!("{}", pretty_metadata(meta));
+                } else {
+                    println!("No metadata for this track found :(");
+                }
+            } else {
+                let update = Commands::to_metadata_update(title, artist, year, label, artwork);
+
+                storage
+                    .update_track_metadata(track_id, update, overwrite)
+                    .unwrap();
+                println!("Metadata updated for {}", track_id);
+            }
+        }
     }
+}
+
+pub fn pretty_metadata(m: TrackMetadata) -> String {
+    let mut lines = Vec::new();
+
+    lines.push(format!("Title : {}", m.title));
+    lines.push(format!("Artist: {}", m.artist));
+
+    if let Some(year) = m.year {
+        lines.push(format!("Year  : {}", year));
+    }
+
+    if let Some(label) = m.label {
+        lines.push(format!("Label : {}", label));
+    }
+
+    if let Some(artwork) = m.artwork {
+        lines.push(format!("Artwork: {}", artwork.0));
+    }
+
+    lines.join("\n")
 }

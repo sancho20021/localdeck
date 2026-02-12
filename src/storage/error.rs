@@ -21,4 +21,9 @@ pub enum StorageError {
 
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
+    #[error("not allowed to modify metadata of track {0}")]
+    MetadataOverwriteDenied(TrackId),
+
+    #[error("required metadata (title, artist, ...) not provided for track {0}")]
+    RequiredMetaMissing(TrackId),
 }

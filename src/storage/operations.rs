@@ -8,7 +8,7 @@ use crate::{
     config::{self, LibrarySource},
     domain::{
         hash::TrackId,
-        track::{ArtworkRef, Track, TrackMetadata},
+        track::{ArtworkRef, TrackMetadata},
     },
     storage::{
         self,
@@ -21,7 +21,7 @@ use crate::{
 
 use anyhow::anyhow;
 use columns::*;
-use rusqlite::params;
+use rusqlite::{ErrorCode, Transaction, params};
 use tables::*;
 
 #[derive(Debug)]
@@ -131,6 +131,16 @@ impl Storage {
         Ok(DBSnapshot { updated_at, files })
     }
 
+    fn insert_update_time(tx: &Transaction) -> Result<(), StorageError> {
+        let time_secs = system_time_to_i64(SystemTime::now()).map_err(StorageError::Internal)?;
+        // ---------- Record update timestamp ----------
+        tx.execute(
+            &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
+            params![time_secs],
+        )?;
+        Ok(())
+    }
+
     /// Inserts new tracks entries into the database
     ///
     /// Existing tracks or files are not duplicated.
@@ -162,14 +172,7 @@ impl Storage {
             // rusqlite returns 1 if row inserted, 0 if ignored
             files_inserted += inserted as usize;
         }
-
-        let time_secs = system_time_to_i64(SystemTime::now()).map_err(StorageError::Internal)?;
-
-        // ---------- Record update timestamp ----------
-        tx.execute(
-            &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
-            params![time_secs],
-        )?;
+        Self::insert_update_time(&tx)?;
 
         tx.commit()?; // commit everything at once
         Ok(files_inserted)
@@ -220,13 +223,40 @@ impl Storage {
         Ok((fs, db, diff))
     }
 
+    pub fn get_track_metadata(
+        &mut self,
+        track_id: TrackId,
+    ) -> Result<Option<TrackMetadata>, StorageError> {
+        // ---------- Load metadata ----------
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL}
+            FROM {TRACK_METADATA}
+            WHERE {TRACK_ID} = ?1"
+        ))?;
+
+        let mut rows = stmt.query(params![&track_id.to_string()])?;
+        let row = if let Some(row) = rows.next()? {
+            row
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(TrackMetadata {
+            title: row.get(0)?,
+            artist: row.get(1)?,
+            year: row.get(2)?,
+            label: row.get(3)?,
+            artwork: row.get::<_, Option<String>>(4)?.map(ArtworkRef),
+        }))
+    }
+
     /// retrieves location of the track, checking that it is present in the file system
     ///
     /// If multiple locations point to the same track, chooses one of them.
-    pub fn get_track(
+    pub fn find_track_file(
         &mut self,
         track_id: TrackId,
-    ) -> Result<(TrackId, PathBuf, Option<TrackMetadata>), StorageError> {
+    ) -> Result<(TrackId, PathBuf), StorageError> {
         let paths = (|| {
             let mut stmt = self
                 .db
@@ -244,39 +274,24 @@ impl Storage {
             return Err(StorageError::TrackNotFound(track_id));
         }
 
-        // ---------- Load metadata ----------
-        let metadata: Option<TrackMetadata> = (|| {
-            let mut stmt = self.db.prepare(&format!(
-                "SELECT {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL}
-            FROM {TRACK_METADATA}
-            WHERE {TRACK_ID} = ?1"
-            ))?;
-
-            let mut rows = stmt.query(params![&track_id.to_string()])?;
-            let row = if let Some(row) = rows.next()? {
-                row
-            } else {
-                return Ok::<_, rusqlite::Error>(None);
-            };
-
-            Ok(Some(TrackMetadata {
-                title: row.get(0)?,
-                artist: row.get(1)?,
-                year: row.get(2)?,
-                label: row.get(3)?,
-                artwork: row.get::<_, Option<String>>(4)?.map(ArtworkRef),
-            }))
-        })()?;
-
         if let Some(path) = paths
             .into_iter()
             .filter(|p| storage::fs::is_valid_music_path(p))
             .next()
         {
-            Ok((track_id, path, metadata))
+            Ok((track_id, path))
         } else {
             Err(StorageError::InvalidTrackFile { track: track_id })
         }
+    }
+
+    pub fn find_track_file_with_meta(
+        &mut self,
+        track: TrackId,
+    ) -> Result<(PathBuf, Option<TrackMetadata>), StorageError> {
+        let (_, path) = self.find_track_file(track)?;
+        let meta = self.get_track_metadata(track)?;
+        Ok((path, meta))
     }
 
     fn diff(fs: &FsSnapshot, ds: &DBSnapshot) -> Diff {
@@ -504,11 +519,7 @@ impl Storage {
         // --------------------------------------------------
         // Record update timestamp
         // --------------------------------------------------
-
-        tx.execute(
-            &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
-            params![time_secs],
-        )?;
+        Self::insert_update_time(&tx)?;
 
         tx.commit()?;
 
@@ -518,6 +529,144 @@ impl Storage {
             removed_files,
         })
     }
+
+    pub fn update_track_metadata(
+        &mut self,
+        track_id: TrackId,
+        new_meta: MetadataUpdate,
+        allow_overwrite: bool,
+    ) -> Result<(), StorageError> {
+        let tx = self.db.transaction()?;
+
+        // ---------- Step 2: load current metadata ----------
+        let current_meta: Option<TrackMetadata> = (|| {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL}
+             FROM {TRACK_METADATA}
+             WHERE {TRACK_ID} = ?1"
+            ))?;
+
+            let mut rows = stmt.query(params![track_id.to_string()])?;
+
+            if let Some(row) = rows.next()? {
+                Ok::<_, rusqlite::Error>(Some(TrackMetadata {
+                    title: row.get(0)?,
+                    artist: row.get(1)?,
+                    year: row.get(2)?,
+                    label: row.get(3)?,
+                    artwork: row.get::<_, Option<String>>(4)?.map(ArtworkRef),
+                }))
+            } else {
+                Ok(None)
+            }
+        })()?;
+
+        let merged = Self::update_meta(track_id, current_meta, new_meta, allow_overwrite)?;
+
+        // ---------- Step 5: upsert ----------
+        let _ = tx
+            .execute(
+                &format!(
+                    "INSERT INTO {TRACK_METADATA}
+            ({TRACK_ID}, {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL})
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT({TRACK_ID}) DO UPDATE SET
+                {TITLE} = excluded.{TITLE},
+                {ARTIST} = excluded.{ARTIST},
+                {YEAR} = excluded.{YEAR},
+                {LABEL} = excluded.{LABEL},
+                {ARTWORK_URL} = excluded.{ARTWORK_URL}
+            "
+                ),
+                params![
+                    track_id.to_string(),
+                    merged.title,
+                    merged.artist,
+                    merged.year,
+                    merged.label,
+                    merged.artwork.map(|a| a.0),
+                ],
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(error, _)
+                    if error.code == ErrorCode::ConstraintViolation =>
+                {
+                    StorageError::TrackNotFound(track_id)
+                }
+                e => StorageError::Database(e),
+            })?;
+        Self::insert_update_time(&tx)?;
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn update_meta(
+        track: TrackId,
+        old: Option<TrackMetadata>,
+        new: MetadataUpdate,
+        allow_overwrite: bool,
+    ) -> Result<TrackMetadata, StorageError> {
+        // ---------- Step 3: conflict detection ----------
+        if let Some(existing) = &old {
+            if !allow_overwrite {
+                let conflict = new.title.is_some()
+                    || new.artist.is_some()
+                    || (existing.year.is_some() && new.year.is_some())
+                    || (existing.label.is_some() && new.label.is_some())
+                    || (existing.artwork.is_some() && new.artwork.is_some());
+
+                if conflict {
+                    return Err(StorageError::MetadataOverwriteDenied(track));
+                }
+            }
+        }
+
+        fn prioritize<T>(high: Option<T>, low: Option<T>) -> Option<T> {
+            high.or(low)
+        }
+
+        let mut merged_meta = if let Some(old) = old {
+            old
+        } else {
+            TrackMetadata {
+                title: new
+                    .title
+                    .clone()
+                    .ok_or(StorageError::RequiredMetaMissing(track))?,
+                artist: new
+                    .artist
+                    .clone()
+                    .ok_or(StorageError::RequiredMetaMissing(track))?,
+                year: None,
+                label: None,
+                artwork: None,
+            }
+        };
+
+        if allow_overwrite {
+            merged_meta.title = new.title.unwrap_or(merged_meta.title);
+            merged_meta.artist = new.artist.unwrap_or(merged_meta.artist);
+            merged_meta.year = prioritize(new.year, merged_meta.year);
+            merged_meta.label = prioritize(new.label, merged_meta.label);
+            merged_meta.artwork = prioritize(new.artwork, merged_meta.artwork);
+        } else {
+            merged_meta.year = prioritize(merged_meta.year, new.year);
+            merged_meta.label = prioritize(merged_meta.label, new.label);
+            merged_meta.artwork = prioritize(merged_meta.artwork, new.artwork);
+        }
+        Ok(merged_meta)
+    }
+}
+
+#[derive(Debug)]
+pub struct MetadataUpdate {
+    pub artist: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<u32>,
+    pub label: Option<String>,
+    pub artwork: Option<ArtworkRef>,
 }
 
 #[cfg(test)]
@@ -540,7 +689,7 @@ mod tests {
             self,
             error::StorageError,
             fs::{FsSnapshot, ObservedFile},
-            operations::{DBSnapshot, Diff, Storage, TrackChange},
+            operations::{DBSnapshot, Diff, MetadataUpdate, Storage, TrackChange},
             schema::{self, *},
         },
     };
@@ -820,11 +969,10 @@ mod tests {
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let (track, path, metadata) = storage.get_track(track_id)?;
+        let (track, path) = storage.find_track_file(track_id)?;
 
         assert_eq!(track, track_id);
         assert_eq!(path, file_path);
-        assert!(metadata.is_none());
 
         Ok(())
     }
@@ -846,7 +994,7 @@ mod tests {
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let err = storage.get_track(track_id).unwrap_err();
+        let err = storage.find_track_file(track_id).unwrap_err();
 
         assert!(matches!(err, StorageError::InvalidTrackFile { .. }));
 
@@ -879,7 +1027,7 @@ mod tests {
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let (_, path, _) = storage.get_track(track_id)?;
+        let (_, path) = storage.find_track_file(track_id)?;
 
         assert_eq!(path, good);
 
@@ -895,7 +1043,7 @@ mod tests {
 
         let track_id = mock_trackid(42);
 
-        let err = storage.get_track(track_id).unwrap_err();
+        let err = storage.find_track_file(track_id).unwrap_err();
 
         assert!(matches!(err, StorageError::TrackNotFound(..)));
 
@@ -903,20 +1051,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_track_with_metadata() {
+    fn test_get_track_metadata() {
         // ---------- Setup in-memory DB ----------
         let temp_dir = tempdir().unwrap();
         let mut storage = setup_storage(temp_dir.path()).unwrap();
         // ---------- Insert test data ----------
         let track_id = mock_trackid(123);
 
-        // create a temporary valid file
-        let music_path = temp_dir.path().join("song.mp3");
-        // Create valid music file
-        fs::write(&music_path, b"x").unwrap();
-
         insert_tracks(&mut storage.db, [track_id]);
-        insert_track_files(&mut storage.db, [(track_id, music_path.to_string_lossy())]);
 
         storage
             .db
@@ -936,13 +1078,10 @@ mod tests {
             )
             .unwrap();
 
-        // ---------- Call get_track ----------
-        let (returned_id, path, metadata) = storage.get_track(track_id.into()).unwrap();
+        let meta = storage.get_track_metadata(track_id.into()).unwrap();
 
         // ---------- Assertions ----------
-        assert_eq!(returned_id, track_id);
-        assert_eq!(path, music_path);
-        let metadata = metadata.expect("Metadata should be present");
+        let metadata = meta.expect("Metadata should be present");
         assert_eq!(metadata.title, "Test Song");
         assert_eq!(metadata.artist, "Test Artist");
         assert_eq!(metadata.year, Some(2026));
@@ -1139,5 +1278,311 @@ mod tests {
         assert_eq!(report.removed_files, 0);
         assert_eq!(report.affected_tracks, 0);
         assert_eq!(report.removed_tracks, 0);
+    }
+
+    mod update_meta_tests {
+        use crate::{
+            domain::track::{ArtworkRef, TrackMetadata},
+            storage::operations::MetadataUpdate,
+        };
+
+        use super::*;
+
+        fn tid() -> TrackId {
+            mock_trackid(1)
+        }
+
+        fn old_meta() -> TrackMetadata {
+            TrackMetadata {
+                title: "Old Title".into(),
+                artist: "Old Artist".into(),
+                year: Some(2000),
+                label: Some("Old Label".into()),
+                artwork: Some(ArtworkRef("old.jpg".into())),
+            }
+        }
+
+        #[test]
+        fn insert_new_metadata_success() {
+            let new = MetadataUpdate {
+                title: Some("New Title".into()),
+                artist: Some("New Artist".into()),
+                year: Some(2020),
+                label: None,
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), None, new, false).unwrap();
+
+            assert_eq!(meta.title, "New Title");
+            assert_eq!(meta.artist, "New Artist");
+            assert_eq!(meta.year, Some(2020));
+        }
+
+        #[test]
+        fn insert_missing_required_fails() {
+            let new = MetadataUpdate {
+                title: Some("Title".into()),
+                artist: None,
+                year: None,
+                label: None,
+                artwork: None,
+            };
+
+            let err = Storage::update_meta(tid(), None, new, false).unwrap_err();
+
+            assert!(matches!(err, StorageError::RequiredMetaMissing(_)));
+        }
+
+        #[test]
+        fn merge_without_overwrite_fills_missing() {
+            let mut old = old_meta();
+            old.year = None;
+
+            let new = MetadataUpdate {
+                title: None,
+                artist: None,
+                year: Some(2023),
+                label: None,
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), Some(old), new, false).unwrap();
+
+            assert_eq!(meta.year, Some(2023));
+        }
+
+        #[test]
+        fn merge_without_overwrite_conflict_optional() {
+            let new = MetadataUpdate {
+                title: None,
+                artist: None,
+                year: Some(2025),
+                label: None,
+                artwork: None,
+            };
+
+            let err = Storage::update_meta(tid(), Some(old_meta()), new, false).unwrap_err();
+
+            assert!(matches!(err, StorageError::MetadataOverwriteDenied(_)));
+        }
+
+        #[test]
+        fn merge_without_overwrite_conflict_title() {
+            let new = MetadataUpdate {
+                title: Some("New".into()),
+                artist: None,
+                year: None,
+                label: None,
+                artwork: None,
+            };
+
+            let err = Storage::update_meta(tid(), Some(old_meta()), new, false).unwrap_err();
+
+            assert!(matches!(err, StorageError::MetadataOverwriteDenied(_)));
+        }
+
+        #[test]
+        fn overwrite_optional_fields() {
+            let new = MetadataUpdate {
+                title: None,
+                artist: None,
+                year: Some(2030),
+                label: Some("New Label".into()),
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), Some(old_meta()), new, true).unwrap();
+
+            assert_eq!(meta.year, Some(2030));
+            assert_eq!(meta.label.as_deref(), Some("New Label"));
+        }
+
+        #[test]
+        fn overwrite_title_artist() {
+            let new = MetadataUpdate {
+                title: Some("New Title".into()),
+                artist: Some("New Artist".into()),
+                year: None,
+                label: None,
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), Some(old_meta()), new, true).unwrap();
+
+            assert_eq!(meta.title, "New Title");
+            assert_eq!(meta.artist, "New Artist");
+        }
+
+        #[test]
+        fn overwrite_keeps_old_when_none() {
+            let old = old_meta();
+
+            let new = MetadataUpdate {
+                title: None,
+                artist: None,
+                year: None,
+                label: None,
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), Some(old.clone()), new, true).unwrap();
+
+            assert_eq!(meta.year, old.year);
+            assert_eq!(meta.label, old.label);
+        }
+
+        #[test]
+        fn noop_update_returns_old() {
+            let old = old_meta();
+
+            let new = MetadataUpdate {
+                title: None,
+                artist: None,
+                year: None,
+                label: None,
+                artwork: None,
+            };
+
+            let meta = Storage::update_meta(tid(), Some(old.clone()), new, false).unwrap();
+
+            assert_eq!(meta.year, old.year);
+            assert_eq!(meta.label, old.label);
+        }
+    }
+
+    #[test]
+    fn test_update_track_metadata_track_missing() -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        let update = MetadataUpdate {
+            title: Some("Test Title".into()),
+            artist: Some("artist".into()),
+            year: None,
+            label: None,
+            artwork: None,
+        };
+
+        let result = storage.update_track_metadata(mock_trackid(42), update, false);
+
+        assert!(matches!(
+            result,
+            Err(StorageError::TrackNotFound(id)) if id == mock_trackid(42)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_track_metadata_insert_new_metadata() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        insert_tracks(&mut conn, [mock_trackid(1)]);
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        let update = MetadataUpdate {
+            title: Some("Song A".into()),
+            artist: Some("Artist A".into()),
+            year: Some(1999),
+            label: None,
+            artwork: None,
+        };
+
+        storage.update_track_metadata(mock_trackid(1), update, false)?;
+
+        // Verify
+        let meta = storage.get_track_metadata(mock_trackid(1))?;
+        let meta = meta.unwrap();
+        assert_eq!(meta.title, "Song A");
+        assert_eq!(meta.artist, "Artist A");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_track_metadata_reject_overwrite() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        insert_tracks(&mut conn, [mock_trackid(1)]);
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        // First insert
+        storage.update_track_metadata(
+            mock_trackid(1),
+            MetadataUpdate {
+                title: Some("Original".into()),
+                artist: Some("helo".into()),
+                year: None,
+                label: None,
+                artwork: None,
+            },
+            false,
+        )?;
+
+        // Attempt overwrite without permission
+        let result = storage.update_track_metadata(
+            mock_trackid(1),
+            MetadataUpdate {
+                title: Some("New Title".into()),
+                artist: Some("test".into()),
+                year: None,
+                label: None,
+                artwork: None,
+            },
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageError::MetadataOverwriteDenied { .. })
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_track_metadata_allow_overwrite() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        insert_tracks(&mut conn, [mock_trackid(1)]);
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        storage.update_track_metadata(
+            mock_trackid(1),
+            MetadataUpdate {
+                title: Some("Original".into()),
+                artist: Some("blabla".into()),
+                year: None,
+                label: None,
+                artwork: None,
+            },
+            false,
+        )?;
+
+        storage.update_track_metadata(
+            mock_trackid(1),
+            MetadataUpdate {
+                title: Some("Updated".into()),
+                artist: None,
+                year: None,
+                label: None,
+                artwork: None,
+            },
+            true,
+        )?;
+
+        let meta = storage.get_track_metadata(mock_trackid(1))?;
+        assert_eq!(meta.unwrap().title, "Updated");
+
+        Ok(())
     }
 }

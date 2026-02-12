@@ -69,14 +69,14 @@ impl HttpServer {
             Err(_) => return ApiError::from(StorageError::InvalidTrackId).into_response(),
         };
 
-        let result = {
+        let data = {
             let mut storage = storage.lock().unwrap();
-            storage.get_track(track_id)
+            storage.find_track_file_with_meta(track_id)
         };
 
-        match result {
-            Ok((track, path, metadata)) => {
-                Response::json(&TrackResponse::from_domain(&track, path, metadata))
+        match data {
+            Ok((path, metadata)) => {
+                Response::json(&TrackResponse::from_domain(&track_id, path, metadata))
             }
 
             Err(e) => ApiError::from(e).into_response(),
@@ -97,7 +97,7 @@ impl HttpServer {
                 "Could not access localdeck storage under lock: {e}"
             ))
         })?;
-        let (_, path, meta) = storage.get_track(track_id)?;
+        let (path, meta) = storage.find_track_file_with_meta(track_id)?;
         let mime = Self::mime_for_track(&path);
 
         let mut file = File::open(&path).map_err(StorageError::Fs)?;

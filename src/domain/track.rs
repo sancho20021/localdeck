@@ -7,7 +7,7 @@ pub struct Track {
     pub metadata: TrackMetadata,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TrackMetadata {
     pub artist: String,
     pub title: String,

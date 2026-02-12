@@ -38,6 +38,10 @@ impl From<StorageError> for ApiError {
             StorageError::Database(_) | StorageError::Fs(_) | StorageError::Internal(_) => {
                 ApiError::Internal("internal server error".into())
             }
+            StorageError::MetadataOverwriteDenied(id) => {
+                ApiError::BadRequest(format!("cannot overwrite metadata. track id: {id}").into())
+            }
+            StorageError::RequiredMetaMissing(_) => ApiError::BadRequest(err.to_string()),
         }
     }
 }
