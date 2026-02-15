@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::{MAIN_SEPARATOR_STR, Path, PathBuf},
     time::SystemTime,
 };
 
@@ -162,6 +162,7 @@ impl Storage {
                 params![&track_id_str],
             )?;
 
+            // todo: make sure the database stores paths in linux style to avoid mess
             let path_str = path.to_string_lossy();
 
             let inserted = tx.execute(
@@ -438,12 +439,11 @@ impl Storage {
     /// removes all files inside specified directory from the database
     /// useful when some files got moved or deleted
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
-        let time_secs = system_time_to_i64(SystemTime::now()).map_err(StorageError::Internal)?;
-
         let tx = self.db.transaction()?;
 
         let prefix = path.to_string_lossy();
 
+        let dir_prefix = format!("{}{}%", prefix, MAIN_SEPARATOR_STR);
         // --------------------------------------------------
         // Collect affected track ids BEFORE deletion
         // --------------------------------------------------
@@ -454,7 +454,7 @@ impl Storage {
         ))?;
 
         let affected_track_ids = stmt
-            .query_map(params![prefix, format!("{}/%", prefix)], |row| {
+            .query_map(params![prefix, dir_prefix], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -464,35 +464,15 @@ impl Storage {
         let affected_tracks = affected_track_ids.len();
 
         // --------------------------------------------------
-        // Count entries to delete
-        // --------------------------------------------------
-
-        let removed_files: usize = tx
-            .query_row::<isize, _, _>(
-                &format!(
-                    "SELECT COUNT(*) FROM {FILES}
-             WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
-                ),
-                params![prefix, format!("{}/%", prefix)],
-                |row| row.get(0),
-            )?
-            .try_into()
-            .map_err(|e| {
-                StorageError::Internal(anyhow!(
-                    "Strange conversion error to usize after select count: {e}"
-                ))
-            })?;
-
-        // --------------------------------------------------
         // Delete entries
         // --------------------------------------------------
 
-        tx.execute(
+        let removed_files = tx.execute(
             &format!(
                 "DELETE FROM {FILES}
              WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
             ),
-            params![prefix, format!("{}/%", prefix)],
+            params![prefix, dir_prefix],
         )?;
 
         // --------------------------------------------------
@@ -1261,6 +1241,44 @@ mod tests {
             .unwrap();
 
         assert!(remaining.len() == 2);
+    }
+
+    #[test]
+    fn test_forget_windows() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
+        let mut storage = storage;
+
+        let tracks = [mock_trackid(1)];
+        let track_files = [
+            (mock_trackid(1), "C:\\music\\track_a1.mp3"),
+            (mock_trackid(1), "C:\\music\\subdir\\track_a2.mp3"),
+        ];
+
+        insert_tracks(&storage.db, tracks);
+        insert_track_files(&storage.db, track_files);
+
+        // Forget top-level directory
+        let path_to_forget = Path::new("C:\\music");
+        let report = storage.forget_path(path_to_forget).unwrap();
+
+        assert_eq!(report.removed_files, 2);
+        assert_eq!(report.affected_tracks, 1);
+        assert_eq!(report.removed_tracks, 1);
+
+        // Remaining DB entries
+        let remaining: Vec<String> = storage
+            .db
+            .prepare("SELECT track_id FROM files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(remaining.is_empty());
     }
 
     #[test]
