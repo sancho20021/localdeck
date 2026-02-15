@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use super::hash::TrackId;
 
 /// Represent a music track
@@ -7,7 +9,7 @@ pub struct Track {
     pub metadata: TrackMetadata,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TrackMetadata {
     pub artist: String,
     pub title: String,
@@ -16,5 +18,6 @@ pub struct TrackMetadata {
     pub artwork: Option<ArtworkRef>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
 pub struct ArtworkRef(pub String);

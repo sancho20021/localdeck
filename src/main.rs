@@ -8,5 +8,5 @@ pub mod storage;
 mod public_endpoint;
 
 fn main() {
-    run();
+    run().unwrap();
 }

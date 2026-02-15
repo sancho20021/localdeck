@@ -1,6 +1,8 @@
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use log::info;
 use std::path::PathBuf;
+use std::process::exit;
 
 use crate::domain::hash::TrackId;
 use crate::domain::track::{ArtworkRef, TrackMetadata};
@@ -52,8 +54,25 @@ pub enum Commands {
     /// Currently does not include youtube link
     Url { track_id: String },
 
-    /// Add, Get, or update metadata for a track
-    Metadata {
+    /// get or edit metadata
+    Meta {
+        #[command(subcommand)]
+        action: MetaAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MetaAction {
+    /// Get track metadata
+    Get {
+        /// Track Id to fetch
+        track_id: String,
+        /// Use json format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add or update metadata
+    Add {
         /// Track ID
         track_id: String,
 
@@ -102,7 +121,7 @@ impl Commands {
 }
 
 /// Entrypoint for CLI
-pub fn run() {
+pub fn run() -> anyhow::Result<()> {
     env_logger::builder()
         .target(env_logger::Target::Stdout)
         .init();
@@ -110,17 +129,17 @@ pub fn run() {
 
     let cli = Cli::parse();
 
-    let cfg = config::Config::load(cli.config.to_str().unwrap()).unwrap();
+    let cfg = config::Config::load(&cli.config.to_string_lossy())?;
 
     match cli.command {
         Commands::Status {} => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source).unwrap();
-            let (fs_snapshot, db_snapshot, diff_result) = storage.status().unwrap();
+            let mut storage = Storage::new(cfg.database, cfg.library_source)?;
+            let (fs_snapshot, db_snapshot, diff_result) = storage.status()?;
 
             println!("Filesystem contains {} files", fs_snapshot.files.len());
             println!(
                 "Database was updated {} and contains {} files",
-                i64_seconds_to_local_time(db_snapshot.updated_at).unwrap(),
+                i64_seconds_to_local_time(db_snapshot.updated_at)?,
                 db_snapshot.files.len()
             );
             if !diff_result.is_empty() {
@@ -155,8 +174,8 @@ pub fn run() {
         }
 
         Commands::Update {} => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source).unwrap();
-            let files = storage.update_db_with_new_files().unwrap();
+            let mut storage = Storage::new(cfg.database, cfg.library_source)?;
+            let files = storage.update_db_with_new_files()?;
             println!("Database updated, new files ({}):", files.len());
             for file in &files {
                 println!("    - {} at {}", file.track_id, file.path.to_string_lossy());
@@ -182,7 +201,7 @@ pub fn run() {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
 
-            let tracks = storage.list_tracks().unwrap();
+            let tracks = storage.list_tracks()?;
 
             for track in tracks {
                 println!("Track: {}", track.track_id.to_hex());
@@ -207,7 +226,7 @@ pub fn run() {
         Commands::Find { track: name } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-            let tracks = storage.find_files(&name).unwrap();
+            let tracks = storage.find_files(&name)?;
             if !tracks.is_empty() {
                 for (trackid, path) in tracks {
                     println!("    - {trackid} at {path}");
@@ -219,7 +238,7 @@ pub fn run() {
         Commands::Forget { path } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-            let report = storage.forget_path(&path).unwrap();
+            let report = storage.forget_path(&path)?;
             if report.affected_tracks == 0 {
                 println!("No tracks located under {} found", path.to_string_lossy());
             } else {
@@ -230,47 +249,49 @@ pub fn run() {
             }
         }
         Commands::Url { track_id } => {
-            let track_id = TrackId::from_hex(track_id).unwrap();
+            let track_id = TrackId::from_hex(track_id)?;
             let url = public_endpoint::get_play_url(&cfg.public_endpoint, track_id, None);
             println!("{url}");
         }
 
-        Commands::Metadata {
-            track_id,
-            title,
-            artist,
-            year,
-            label,
-            artwork,
-            overwrite,
-        } => {
+        Commands::Meta { action } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-
-            let track_id = TrackId::from_hex(&track_id).unwrap();
-
-            if title.is_none()
-                && artist.is_none()
-                && year.is_none()
-                && label.is_none()
-                && artwork.is_none()
-            {
-                let meta = storage.get_track_metadata(track_id).unwrap();
-                if let Some(meta) = meta {
-                    println!("{}", pretty_metadata(meta));
-                } else {
-                    println!("No metadata for this track found :(");
+            match action {
+                MetaAction::Get { track_id, json } => {
+                    let track_id = TrackId::from_hex(&track_id)?;
+                    let meta = storage.get_track_metadata(track_id)?;
+                    if let Some(meta) = meta {
+                        let str = if json {
+                            serde_json::to_string(&meta)
+                                .expect("failed to serialize metadata to json")
+                        } else {
+                            pretty_metadata(meta)
+                        };
+                        println!("{str}");
+                    } else {
+                        bail!("No metadata for this track found :(");
+                    }
                 }
-            } else {
-                let update = Commands::to_metadata_update(title, artist, year, label, artwork);
+                MetaAction::Add {
+                    track_id,
+                    title,
+                    artist,
+                    year,
+                    label,
+                    artwork,
+                    overwrite,
+                } => {
+                    let track_id = TrackId::from_hex(&track_id)?;
+                    let update = Commands::to_metadata_update(title, artist, year, label, artwork);
 
-                storage
-                    .update_track_metadata(track_id, update, overwrite)
-                    .unwrap();
-                println!("Metadata updated for {}", track_id);
+                    storage.update_track_metadata(track_id, update, overwrite)?;
+                    println!("Metadata updated for {}", track_id);
+                }
             }
         }
     }
+    Ok(())
 }
 
 pub fn pretty_metadata(m: TrackMetadata) -> String {
