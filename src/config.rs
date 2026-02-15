@@ -1,6 +1,9 @@
 use anyhow::Context;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -28,7 +31,8 @@ pub struct PublicEndpoint {
 }
 
 impl Config {
-    pub fn load(path: &str) -> anyhow::Result<Config> {
+    /// load the config file. first tries the env var LOCALDECK_CONFIG, then the provided path
+    pub fn load(path: &Path) -> anyhow::Result<Config> {
         let contents = std::fs::read_to_string(path).expect("Failed to read user config");
         toml::from_str(&contents).with_context(|| "Failed to parse config TOML")
     }

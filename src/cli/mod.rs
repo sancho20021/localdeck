@@ -1,8 +1,10 @@
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use log::info;
+use std::env;
 use std::path::PathBuf;
 use std::process::exit;
+use std::str::FromStr;
 
 use crate::domain::hash::TrackId;
 use crate::domain::track::{ArtworkRef, TrackMetadata};
@@ -17,8 +19,9 @@ use crate::{config, public_endpoint};
 #[command(about = "Local music library manager")]
 pub struct Cli {
     /// Path to the config TOML file
-    #[arg(short, long, default_value = "../config.toml")]
-    pub config: PathBuf,
+    /// If not provided, reads it from LOCALDECK_CONFIG env var 
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -129,7 +132,13 @@ pub fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let cfg = config::Config::load(&cli.config.to_string_lossy())?;
+    let cfg_path = if let Some(path) = cli.config {
+        path
+    } else {
+        let path = env::var("LOCALDECK_CONFIG").context("Failed to get path to config. Provide it via flag or environment variable")?;
+        PathBuf::from(path)
+    };
+    let cfg = config::Config::load(&cfg_path)?;
 
     match cli.command {
         Commands::Status {} => {
