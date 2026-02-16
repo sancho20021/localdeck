@@ -30,7 +30,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Show library status
-    Status,
+    Status {
+        /// show tracks that were copied or moved.
+        /// 
+        /// If false (default), shows only deleted or new tracks
+        /// If true, shows deleted, new, copied, and moved tracks
+        #[arg(long)]
+        show_moved: bool
+    },
     /// Update library
     Update,
     /// Run http server hosting library
@@ -141,7 +148,7 @@ pub fn run() -> anyhow::Result<()> {
     let cfg = config::Config::load(&cfg_path)?;
 
     match cli.command {
-        Commands::Status {} => {
+        Commands::Status {show_moved} => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)?;
             let (fs_snapshot, db_snapshot, diff_result) = storage.status()?;
 
@@ -167,7 +174,7 @@ pub fn run() -> anyhow::Result<()> {
                         for location in changes.deleted_locations() {
                             println!("    - {}", location.to_string_lossy());
                         }
-                    } else {
+                    } else if show_moved {
                         println!("  [MOVED / COPIED]  {}", track_id);
                         println!("  removed locations:");
                         for location in changes.deleted_locations() {

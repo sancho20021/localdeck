@@ -69,6 +69,8 @@ pub struct TrackListEntry {
     pub unavailable_files: Vec<PathBuf>,
 }
 
+pub const DB_PATH_SEPARATOR: &str = "/";
+
 #[derive(Debug)]
 pub struct ForgetReport {
     /// files removed
@@ -163,7 +165,7 @@ impl Storage {
             )?;
 
             // todo: make sure the database stores paths in linux style to avoid mess
-            let path_str = path.to_string_lossy();
+            let path_str = path_to_string(&path);
 
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO files (track_id, path) VALUES (?1, ?2)",
@@ -441,9 +443,9 @@ impl Storage {
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
         let tx = self.db.transaction()?;
 
-        let prefix = path.to_string_lossy();
+        let prefix = path_to_string(path);
 
-        let dir_prefix = format!("{}{}%", prefix, MAIN_SEPARATOR_STR);
+        let dir_prefix = format!("{}{}%", prefix, DB_PATH_SEPARATOR);
         // --------------------------------------------------
         // Collect affected track ids BEFORE deletion
         // --------------------------------------------------
@@ -638,6 +640,14 @@ impl Storage {
         }
         Ok(merged_meta)
     }
+}
+
+/// converts a path to string with forward slashes.
+/// 
+/// Must be used on both windows and linux to keep path representation consistent
+/// within the database
+pub fn path_to_string(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', DB_PATH_SEPARATOR)
 }
 
 #[derive(Debug)]
@@ -1253,8 +1263,8 @@ mod tests {
 
         let tracks = [mock_trackid(1)];
         let track_files = [
-            (mock_trackid(1), "C:\\music\\track_a1.mp3"),
-            (mock_trackid(1), "C:\\music\\subdir\\track_a2.mp3"),
+            (mock_trackid(1), "C:/music/track_a1.mp3"),
+            (mock_trackid(1), "C:/music/subdir/track_a2.mp3"),
         ];
 
         insert_tracks(&storage.db, tracks);
