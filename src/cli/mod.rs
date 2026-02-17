@@ -19,7 +19,7 @@ use crate::{config, public_endpoint};
 #[command(about = "Local music library manager")]
 pub struct Cli {
     /// Path to the config TOML file
-    /// If not provided, reads it from LOCALDECK_CONFIG env var 
+    /// If not provided, reads it from LOCALDECK_CONFIG env var
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
@@ -29,14 +29,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Show library status
-    Status {
-        /// show tracks that were copied or moved.
-        /// 
-        /// If false (default), shows only deleted or new tracks
-        /// If true, shows deleted, new, copied, and moved tracks
-        #[arg(long)]
-        show_moved: bool
+    /// Check library status
+    Check {
+        #[command(subcommand)]
+        action: Option<CheckAction>,
     },
     /// Update library
     Update,
@@ -69,6 +65,16 @@ pub enum Commands {
         #[command(subcommand)]
         action: MetaAction,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CheckAction {
+    /// Check for new music files not present in database
+    New,
+    /// Check for tracks without any available files.
+    ///
+    /// Ignores tracks that have at least one available file.
+    Missing,
 }
 
 #[derive(Subcommand)]
@@ -142,50 +148,54 @@ pub fn run() -> anyhow::Result<()> {
     let cfg_path = if let Some(path) = cli.config {
         path
     } else {
-        let path = env::var("LOCALDECK_CONFIG").context("Failed to get path to config. Provide it via flag or environment variable")?;
+        let path = env::var("LOCALDECK_CONFIG")
+            .context("Failed to get path to config. Provide it via flag or environment variable")?;
         PathBuf::from(path)
     };
     let cfg = config::Config::load(&cfg_path)?;
 
     match cli.command {
-        Commands::Status {show_moved} => {
+        Commands::Check { action } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)?;
-            let (fs_snapshot, db_snapshot, diff_result) = storage.status()?;
-
-            println!("Filesystem contains {} files", fs_snapshot.files.len());
-            println!(
-                "Database was updated {} and contains {} files",
-                i64_seconds_to_local_time(db_snapshot.updated_at)?,
-                db_snapshot.files.len()
-            );
-            if !diff_result.is_empty() {
-                println!(
-                    "Certain files' locations do not match database. Run \"update\" to update the database:"
-                );
-
-                for (track_id, changes) in &diff_result {
-                    if changes.is_new() {
-                        println!("  [NEW]  {}, found at:", track_id);
-                        for location in changes.new_locations() {
-                            println!("    - {}", location.to_string_lossy());
+            if let Some(action) = action {
+                match action {
+                    CheckAction::New => {
+                        let new = storage.check_new()?;
+                        if !new.is_empty() {
+                            for (track, locs) in new {
+                                println!("  [NEW]  {}, found at:", track);
+                                for location in locs {
+                                    println!("    - {}", location.to_string_lossy());
+                                }
+                            }
+                        } else {
+                            println!("No new files discovered :)");
                         }
-                    } else if changes.is_deleted() {
-                        println!("  [DELETED]  {}, previously located at:", track_id);
-                        for location in changes.deleted_locations() {
-                            println!("    - {}", location.to_string_lossy());
-                        }
-                    } else if show_moved {
-                        println!("  [MOVED / COPIED]  {}", track_id);
-                        println!("  removed locations:");
-                        for location in changes.deleted_locations() {
-                            println!("    - {}", location.to_string_lossy());
-                        }
-                        println!("  new locations:");
-                        for location in changes.new_locations() {
-                            println!("    - {}", location.to_string_lossy());
+                    }
+                    CheckAction::Missing => {
+                        let missing = storage.check_missing()?;
+                        if !missing.is_empty() {
+                            println!("The following tracks do not have available files:");
+                            for (track, old_locs) in missing {
+                                println!("{track}");
+                                if !old_locs.is_empty() {
+                                    println!("Unavailable locations:");
+                                    for loc in old_locs {
+                                        println!("   - {}", loc.to_string_lossy());
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("No missing files!");
                         }
                     }
                 }
+            } else {
+                let ds = storage.scan_db()?;
+                println!(
+                    "Data base was updated {}",
+                    i64_seconds_to_local_time(ds.updated_at)?
+                );
             }
         }
 

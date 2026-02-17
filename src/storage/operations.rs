@@ -212,12 +212,43 @@ impl Storage {
         self._update_db_with_new_files(&diff_result)
     }
 
+    /// checks for new music files not present in database
+    pub fn check_new(&mut self) -> Result<HashMap<TrackId, HashSet<PathBuf>>, StorageError> {
+        println!("Scanning music on file system...");
+        let fs = FsSnapshot::scan(&self.source)?;
+        println!("Scanning music on database...");
+        let db = self.scan_db()?;
+        let diff = Self::diff(&fs, &db);
+        Ok(diff
+            .into_iter()
+            .map(|(track, change)| (track, change.new_locations()))
+            .filter(|(_, locs)| !locs.is_empty())
+            .collect())
+    }
+
+    /// checks for tracks without available files.
+    ///
+    /// ignores tracks that have at least one available file
+    pub fn check_missing(&mut self) -> Result<HashMap<TrackId, HashSet<PathBuf>>, StorageError> {
+        let tracks = self.list_tracks()?;
+        Ok(tracks
+            .into_iter()
+            .filter_map(|t| {
+                if t.available_files.is_empty() {
+                    Some((t.track_id, t.unavailable_files.into_iter().collect()))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
     /// aka git status
     ///
     /// reads files in the file system,
     /// reads file records in the database,
     /// returns both, and difference between the database and the file system
-    pub fn status(&mut self) -> Result<(FsSnapshot, DBSnapshot, Diff), StorageError> {
+    fn status(&mut self) -> Result<(FsSnapshot, DBSnapshot, Diff), StorageError> {
         println!("Scanning music on file system...");
         let fs = FsSnapshot::scan(&self.source)?;
         println!("Scanning music on database...");
@@ -349,7 +380,7 @@ impl Storage {
         locs
     }
 
-    /// List unique tracks, optionally including unavailable ones
+    /// List tracks with available and unavailable files
     pub fn list_tracks(&mut self) -> Result<Vec<TrackListEntry>, StorageError> {
         let (fs_snapshot, db_snapshot, _) = self.status()?;
 
@@ -456,9 +487,7 @@ impl Storage {
         ))?;
 
         let affected_track_ids = stmt
-            .query_map(params![prefix, dir_prefix], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(params![prefix, dir_prefix], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
         drop(stmt);
@@ -643,7 +672,7 @@ impl Storage {
 }
 
 /// converts a path to string with forward slashes.
-/// 
+///
 /// Must be used on both windows and linux to keep path representation consistent
 /// within the database
 pub fn path_to_string(p: &Path) -> String {
@@ -679,7 +708,7 @@ mod tests {
             self,
             error::StorageError,
             fs::{FsSnapshot, ObservedFile},
-            operations::{DBSnapshot, Diff, MetadataUpdate, Storage, TrackChange},
+            operations::{DBSnapshot, Diff, MetadataUpdate, Storage, TrackChange, path_to_string},
             schema::{self, *},
         },
     };
@@ -952,10 +981,7 @@ mod tests {
         let track_id = mock_trackid(1);
 
         insert_tracks(&mut conn, [track_id]);
-        insert_track_files(
-            &mut conn,
-            [(track_id, &file_path.to_string_lossy().to_string())],
-        );
+        insert_track_files(&mut conn, [(track_id, &path_to_string(&file_path))]);
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
@@ -980,7 +1006,7 @@ mod tests {
         let track_id = mock_trackid(3);
 
         insert_tracks(&mut conn, [track_id]);
-        insert_track_files(&mut conn, [(track_id, bad_path.to_string_lossy())]);
+        insert_track_files(&mut conn, [(track_id, path_to_string(&bad_path))]);
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
@@ -1010,8 +1036,8 @@ mod tests {
         insert_track_files(
             &mut conn,
             [
-                (track_id, bad.to_string_lossy()),
-                (track_id, good.to_string_lossy()),
+                (track_id, path_to_string(&bad)),
+                (track_id, path_to_string(&good)),
             ],
         );
 
@@ -1092,7 +1118,7 @@ mod tests {
         let track_id = TrackId::from_file(&path)?;
 
         insert_tracks(&mut storage.db, [track_id]);
-        insert_track_files(&mut storage.db, [(track_id, path.to_string_lossy())]);
+        insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
 
         let tracks = storage.list_tracks()?;
         assert_eq!(tracks.len(), 1);
@@ -1121,8 +1147,8 @@ mod tests {
         insert_track_files(
             &mut storage.db,
             [
-                (track_id, available_path.to_string_lossy()),
-                (track_id, unavailable_path.to_string_lossy()),
+                (track_id, path_to_string(&available_path)),
+                (track_id, path_to_string(&unavailable_path)),
             ],
         );
 
@@ -1147,7 +1173,7 @@ mod tests {
         let track_id = TrackId::from_bytes(&[0, 1, 2]);
 
         insert_tracks(&mut storage.db, [track_id]);
-        insert_track_files(&mut storage.db, [(track_id, path.to_string_lossy())]);
+        insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
 
         let tracks = storage.list_tracks()?;
         assert_eq!(tracks.len(), 1);
@@ -1612,5 +1638,171 @@ mod tests {
         assert_eq!(meta.unwrap().title, "Updated");
 
         Ok(())
+    }
+
+    mod check_tests {
+        use std::collections::HashSet;
+
+        use tempfile::tempdir;
+
+        use crate::{
+            domain::hash::TrackId,
+            storage::operations::{
+                path_to_string,
+                tests::{insert_track_files, insert_tracks, mock_trackid, setup_storage},
+            },
+        };
+
+        #[test]
+        fn test_check_new_no_new_files() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            std::fs::write(&path, b"x")?;
+
+            let track_id = TrackId::from_file(&path)?;
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+
+            let diff = storage.check_new()?;
+            assert!(diff.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_new_detects_new_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("new_song.mp3");
+            std::fs::write(&path, b"x")?;
+
+            let track_id = TrackId::from_file(&path)?;
+
+            // DB is empty
+
+            let diff = storage.check_new()?;
+
+            assert_eq!(diff.len(), 1);
+            assert!(diff.contains_key(&track_id));
+            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_new_detects_additional_location() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path1 = dir.path().join("song1.mp3");
+            let path2 = dir.path().join("song2.mp3");
+
+            std::fs::write(&path1, b"x")?;
+            std::fs::write(&path2, b"x")?;
+
+            let track_id = TrackId::from_file(&path1)?;
+
+            // DB only knows about first path
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path1))]);
+
+            let diff = storage.check_new()?;
+
+            assert_eq!(diff.len(), 1);
+            assert_eq!(diff[&track_id], HashSet::from([path2.clone()]));
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_new_ignores_missing_fs_tracks() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            let track_id = mock_trackid(123); // file not created
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+
+            let diff = storage.check_new()?;
+
+            assert!(diff.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_missing_no_missing_tracks() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            std::fs::write(&path, b"x")?;
+
+            let track_id = TrackId::from_file(&path)?;
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+
+            let diff = storage.check_missing()?;
+            assert!(diff.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_missing_detects_fully_missing_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            // file NOT created
+
+            let track_id = mock_trackid(123);
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+
+            let diff = storage.check_missing()?;
+
+            assert_eq!(diff.len(), 1);
+            assert!(diff.contains_key(&track_id));
+            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_missing_ignores_partially_available_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let available = dir.path().join("song1.mp3");
+            let missing = dir.path().join("song2.mp3");
+
+            std::fs::write(&available, b"x")?;
+
+            let track_id = TrackId::from_file(&available)?;
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(
+                &mut storage.db,
+                [
+                    (track_id, path_to_string(&available)),
+                    (track_id, path_to_string(&missing)),
+                ],
+            );
+
+            let diff = storage.check_missing()?;
+
+            assert!(diff.is_empty());
+
+            Ok(())
+        }
     }
 }
