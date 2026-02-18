@@ -8,7 +8,7 @@ use crate::{
     config::{self, LibrarySource},
     domain::{
         hash::TrackId,
-        track::{ArtworkRef, TrackMetadata},
+        track::{ArtworkRef, Track, TrackMetadata},
     },
     storage::{
         self,
@@ -131,6 +131,46 @@ impl Storage {
             .collect::<Result<Vec<_>, StorageError>>()?;
 
         Ok(DBSnapshot { updated_at, files })
+    }
+
+    pub fn scan_metadata(&mut self) -> Result<Vec<Track>, StorageError> {
+        let tx = self.db.transaction()?; // rusqlite::Error propagates here
+
+        let mut stmt = tx.prepare(
+            "SELECT track_id, title, artist, year, label, artwork_url FROM track_metadata",
+        )?;
+
+        // query_map returns Result<Rows<Result<Track, StorageError>>, rusqlite::Error>
+        let rows = stmt.query_map([], |row| {
+            let track_id_hex: String = row.get(0)?;
+
+            // explicitly handle TrackId conversion
+            let track_id = match TrackId::from_hex(&track_id_hex) {
+                Ok(id) => id,
+                Err(e) => return Ok(Err(StorageError::Internal(e))), // store error explicitly
+            };
+
+            Ok(Ok(Track {
+                id: track_id,
+                metadata: TrackMetadata {
+                    title: row.get(1)?,
+                    artist: row.get(2)?,
+                    year: row.get(3)?,
+                    label: row.get(4)?,
+                    artwork: row.get::<_, Option<String>>(5)?.map(ArtworkRef),
+                },
+            }))
+        })?;
+        // flatten results: first unwrap DB errors, then propagate custom errors
+        let metadata_list: Vec<Track> = rows
+            .collect::<Result<Vec<Result<Track, StorageError>>, rusqlite::Error>>()? // unwrap DB errors
+            .into_iter()
+            .collect::<Result<Vec<Track>, StorageError>>()?; // propagate TrackId errors
+        drop(stmt);
+
+        tx.commit()?;
+
+        Ok(metadata_list)
     }
 
     fn insert_update_time(tx: &Transaction) -> Result<(), StorageError> {
@@ -420,9 +460,12 @@ impl Storage {
         Ok(result)
     }
 
-    /// searches for a file where path matches the query
+    /// searches for a file where path or track_id matches the query
     /// todo: extend it with track metadata once metadata is stored in database
-    pub fn find_files(&mut self, query: &str) -> Result<Vec<(TrackId, String)>, StorageError> {
+    pub fn find_files(
+        &mut self,
+        query: &str,
+    ) -> Result<HashMap<TrackId, HashSet<String>>, StorageError> {
         let tx = self.db.transaction()?;
 
         let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID}, {PATH} FROM {FILES}"))?;
@@ -449,7 +492,7 @@ impl Storage {
                     .replace('.', "");
 
                 // If normalized path contains normalized query, keep it
-                if norm_path.contains(&norm_query) {
+                if norm_path.contains(&norm_query) || track_id_hex.contains(&norm_query) {
                     let track_id = TrackId::from_hex(&track_id_hex);
                     if let Ok(track_id) = track_id {
                         Ok(Some((track_id, path)))
@@ -464,9 +507,15 @@ impl Storage {
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
         drop(stmt);
-
         tx.commit()?;
-        Ok(results)
+
+        let mut map: HashMap<_, HashSet<_>> = HashMap::new();
+
+        for (key, value) in results {
+            map.entry(key).or_default().insert(value);
+        }
+
+        Ok(map)
     }
 
     /// removes all files inside specified directory from the database
@@ -1186,6 +1235,21 @@ mod tests {
         Ok(())
     }
 
+    fn assert_files<I>(results: &HashMap<TrackId, HashSet<String>>, expected: I)
+    where
+        I: IntoIterator<Item = (TrackId, Vec<&'static str>)>,
+    {
+        for (id, files) in expected {
+            let expected_set: HashSet<String> = files.into_iter().map(|s| s.to_string()).collect();
+            let actual_set = &results[&id];
+            assert_eq!(
+                actual_set, &expected_set,
+                "Files for track {:?} do not match exactly",
+                id
+            );
+        }
+    }
+
     #[test]
     fn test_find_files() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1208,26 +1272,31 @@ mod tests {
 
         // Search for a liberal match
         let results = storage.find_files("trackname").unwrap();
-
-        // Should match first two entries
-        assert_eq!(
-            results,
-            vec![
-                (mock_trackid(1), "Some Artist - Track Name.mp3".to_string()),
-                (mock_trackid(2), "AnotherArtist_TrackName.flac".to_string())
-            ]
+        assert_files(
+            &results,
+            [
+                (mock_trackid(1), vec!["Some Artist - Track Name.mp3"]),
+                (mock_trackid(2), vec!["AnotherArtist_TrackName.flac"]),
+            ],
         );
 
         // Search with different casing and spaces
         let results2 = storage.find_files("another artist track").unwrap();
-        assert_eq!(
-            results2,
-            vec![(mock_trackid(2), "AnotherArtist_TrackName.flac".to_string())]
+        assert_files(
+            &results2,
+            [(mock_trackid(2), vec!["AnotherArtist_TrackName.flac"])],
+        );
+
+        // Search for trackid
+        let results3 = storage.find_files(&mock_trackid_str(3)).unwrap();
+        assert_files(
+            &results3,
+            [(mock_trackid(3), vec!["completely-different-track.mp3"])],
         );
 
         // Search for non-existent track
-        let results3 = storage.find_files("nonexistent").unwrap();
-        assert!(results3.is_empty());
+        let results4 = storage.find_files("nonexistent").unwrap();
+        assert!(results4.is_empty());
     }
 
     fn insert_file(conn: &Connection, track_id: &str, path: &str) {

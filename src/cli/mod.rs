@@ -46,7 +46,7 @@ pub enum Commands {
     },
     /// Find a track
     Find {
-        /// Artist, Track Name, or part of the filename to search for
+        /// Artist, Track Name, Track Id or part of the filename to search for
         track: String,
     },
     /// Remove specified path from the database.
@@ -78,7 +78,7 @@ pub enum CheckAction {
 }
 
 #[derive(Subcommand)]
-enum MetaAction {
+pub enum MetaAction {
     /// Get track metadata
     Get {
         /// Track Id to fetch
@@ -116,6 +116,8 @@ enum MetaAction {
         #[arg(long)]
         overwrite: bool,
     },
+    /// retrieve all metadata
+    All,
 }
 
 impl Commands {
@@ -254,8 +256,11 @@ pub fn run() -> anyhow::Result<()> {
                 .expect("Failed to initialize storage");
             let tracks = storage.find_files(&name)?;
             if !tracks.is_empty() {
-                for (trackid, path) in tracks {
-                    println!("    - {trackid} at {path}");
+                for (trackid, paths) in tracks {
+                    println!("{trackid} at:");
+                    for path in paths {
+                        println!("    - {path}");
+                    }
                 }
             } else {
                 println!("No tracks found :(");
@@ -313,6 +318,14 @@ pub fn run() -> anyhow::Result<()> {
 
                     storage.update_track_metadata(track_id, update, overwrite)?;
                     println!("Metadata updated for {}", track_id);
+                }
+                MetaAction::All => {
+                    let meta = storage.scan_metadata()?;
+                    println!("Database contains metadata for {} tracks", meta.len());
+                    for track in meta {
+                        println!("- {}", track.id);
+                        println!("{}\n", pretty_metadata(track.metadata));
+                    }
                 }
             }
         }
