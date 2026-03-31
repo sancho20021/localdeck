@@ -48,6 +48,9 @@ pub enum Commands {
     Find {
         /// Artist, Track Name, Track Id or part of the filename to search for
         track: String,
+        /// Find tracks only without metadata
+        #[arg(long)]
+        no_meta: bool,
     },
     /// Remove specified path from the database.
     ///
@@ -251,10 +254,13 @@ pub fn run() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Find { track: name } => {
+        Commands::Find {
+            track: name,
+            no_meta,
+        } => {
             let mut storage = Storage::new(cfg.database, cfg.library_source)
                 .expect("Failed to initialize storage");
-            let tracks = storage.find_files(&name)?;
+            let tracks = storage.find_files(&name, no_meta)?;
             if !tracks.is_empty() {
                 for (trackid, paths) in tracks {
                     println!("{trackid} at:");

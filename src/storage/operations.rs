@@ -460,52 +460,81 @@ impl Storage {
         Ok(result)
     }
 
-    /// searches for a file where path or track_id matches the query
-    /// todo: extend it with track metadata once metadata is stored in database
+    /// searches for a file where path, track_id, artist or title matches the query
+    ///
+    /// conditionally selects only tracks without meta data
     pub fn find_files(
         &mut self,
         query: &str,
+        no_meta: bool,
     ) -> Result<HashMap<TrackId, HashSet<String>>, StorageError> {
         let tx = self.db.transaction()?;
 
-        let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID}, {PATH} FROM {FILES}"))?;
+        let cleaned_query = query.trim().to_lowercase();
+        let like_query = format!("%{}%", cleaned_query);
 
-        // Normalize the query string: lowercase, remove spaces and some punctuation
-        let norm_query = query
-            .to_lowercase()
-            .replace(' ', "")
-            .replace('-', "")
-            .replace('_', "")
-            .replace('.', "");
+        let mut sql = format!(
+            "
+        SELECT f.{TRACK_ID}, f.{PATH}
+        FROM {FILES} f
+        LEFT JOIN {TRACK_METADATA} tm
+            ON f.{TRACK_ID} = tm.{TRACK_ID}
+        WHERE 1=1
+        "
+        );
 
-        let results = stmt
-            .query_map([], |row| {
+        // Apply search filter (if query not empty)
+        if !cleaned_query.is_empty() {
+            sql.push_str(&format!(
+                "
+            AND (
+                LOWER(f.{PATH}) LIKE ?1 OR
+                LOWER(f.{TRACK_ID}) LIKE ?1 OR
+                LOWER(tm.{ARTIST}) LIKE ?1 OR
+                LOWER(tm.{TITLE}) LIKE ?1
+            )
+            "
+            ));
+        }
+
+        // Apply no_meta filter
+        if no_meta {
+            sql.push_str(" AND tm.track_id IS NULL ");
+        }
+
+        let mut stmt = tx.prepare(&sql)?;
+
+        let results = if !cleaned_query.is_empty() {
+            stmt.query_map([like_query], |row| {
                 let track_id_hex: String = row.get(0)?;
                 let path: String = row.get(1)?;
 
-                // Normalize path the same way
-                let norm_path = path
-                    .to_lowercase()
-                    .replace(' ', "")
-                    .replace('-', "")
-                    .replace('_', "")
-                    .replace('.', "");
-
-                // If normalized path contains normalized query, keep it
-                if norm_path.contains(&norm_query) || track_id_hex.contains(&norm_query) {
-                    let track_id = TrackId::from_hex(&track_id_hex);
-                    if let Ok(track_id) = track_id {
-                        Ok(Some((track_id, path)))
-                    } else {
-                        log::warn!("Database table {FILES} contain invalid trackid {track_id_hex}");
+                match TrackId::from_hex(&track_id_hex) {
+                    Ok(track_id) => Ok(Some((track_id, path))),
+                    Err(_) => {
+                        log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
                         Ok(None)
                     }
-                } else {
-                    Ok(None)
                 }
             })?
             .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| {
+                let track_id_hex: String = row.get(0)?;
+                let path: String = row.get(1)?;
+
+                match TrackId::from_hex(&track_id_hex) {
+                    Ok(track_id) => Ok(Some((track_id, path))),
+                    Err(_) => {
+                        log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
+                        Ok(None)
+                    }
+                }
+            })?
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>, _>>()?
+        };
         drop(stmt);
         tx.commit()?;
 
@@ -1258,7 +1287,7 @@ mod tests {
         // Insert some test rows
         let data = vec![
             (mock_trackid(1), "Some Artist - Track Name.mp3"),
-            (mock_trackid(2), "AnotherArtist_TrackName.flac"),
+            (mock_trackid(2), "AnotherArtist_Track Name.flac"),
             (mock_trackid(3), "completely-different-track.mp3"),
         ];
 
@@ -1271,32 +1300,89 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
         // Search for a liberal match
-        let results = storage.find_files("trackname").unwrap();
+        let results = storage.find_files("track name", false).unwrap();
         assert_files(
             &results,
             [
                 (mock_trackid(1), vec!["Some Artist - Track Name.mp3"]),
-                (mock_trackid(2), vec!["AnotherArtist_TrackName.flac"]),
+                (mock_trackid(2), vec!["AnotherArtist_Track Name.flac"]),
             ],
         );
 
         // Search with different casing and spaces
-        let results2 = storage.find_files("another artist track").unwrap();
+        let results2 = storage.find_files("another", false).unwrap();
         assert_files(
             &results2,
-            [(mock_trackid(2), vec!["AnotherArtist_TrackName.flac"])],
+            [(mock_trackid(2), vec!["AnotherArtist_Track Name.flac"])],
         );
 
         // Search for trackid
-        let results3 = storage.find_files(&mock_trackid_str(3)).unwrap();
+        let results3 = storage.find_files(&mock_trackid_str(3), false).unwrap();
         assert_files(
             &results3,
             [(mock_trackid(3), vec!["completely-different-track.mp3"])],
         );
 
         // Search for non-existent track
-        let results4 = storage.find_files("nonexistent").unwrap();
+        let results4 = storage.find_files("nonexistent", false).unwrap();
         assert!(results4.is_empty());
+    }
+
+    #[test]
+    fn test_find_files_metadata_and_no_meta() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        // --- Insert tracks ---
+        let tracks = [mock_trackid(1), mock_trackid(2), mock_trackid(3)];
+        insert_tracks(&mut conn, tracks);
+
+        // --- Insert files ---
+        insert_track_files(
+            &mut conn,
+            vec![
+                (mock_trackid(1), "foo.mp3"),
+                (mock_trackid(2), "bar.mp3"),
+                (mock_trackid(3), "baz.mp3"),
+            ],
+        );
+
+        // --- Insert metadata manually (ONLY for 1 and 2) ---
+        conn.execute(
+            "INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
+         VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+            rusqlite::params![mock_trackid_str(1), "Cool Track", "DJ Alpha"],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
+         VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
+            rusqlite::params![mock_trackid_str(2), "Another Banger", "Beta Artist"],
+        )
+        .unwrap();
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        // --- Search by artist ---
+        let results = storage.find_files("alpha", false).unwrap();
+        assert_files(&results, [(mock_trackid(1), vec!["foo.mp3"])]);
+
+        // --- Search by title ---
+        let results = storage.find_files("banger", false).unwrap();
+        assert_files(&results, [(mock_trackid(2), vec!["bar.mp3"])]);
+
+        // --- no_meta: should return ONLY track 3 ---
+        let results = storage.find_files("", true).unwrap();
+        assert_files(&results, [(mock_trackid(3), vec!["baz.mp3"])]);
+
+        // --- combined: query + no_meta (should be empty here) ---
+        let results = storage.find_files("cool", true).unwrap();
+        assert!(results.is_empty());
+
+        // metadata exists but doesn't match query
+        let results = storage.find_files("gamma", false).unwrap();
+        assert!(results.is_empty());
     }
 
     fn insert_file(conn: &Connection, track_id: &str, path: &str) {
