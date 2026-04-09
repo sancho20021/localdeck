@@ -14,7 +14,6 @@ from PIL.ImageDraw import ImageDraw as PILDraw
 from PIL.ImageFont import FreeTypeFont
 
 TEXT_CENTERING_BIAS_RATIO = 0.2
-
 FONT_SIZE = 37
 
 # =============================
@@ -22,20 +21,18 @@ FONT_SIZE = 37
 # =============================
 
 CARD_WIDTH_MM: int = 55
-CARD_HEIGHT_MM: int = 95
-QR_SIZE_MM: int = 20
+CARD_HEIGHT_MM: int = 90
+QR_SIZE_MM: int = 19
 DPI: int = 300
+BEZEL_MM: int = 1  # 🔴 NEW
 
 FONT_PATH: str = "/home/sancho20021/.local/share/fonts/Montserrat/montserrat.semibold.otf"
 OUTPUT_DIR: str = "./cards"
 
-# card width / card_height
 TOP_EMPTY_RATIO: float = CARD_WIDTH_MM / CARD_HEIGHT_MM
-MARGIN_RATIO: float = 0.1
-QR_MARGIN_RATIO: float = 0.5
-GRAPHIC_TEXT_GAP_RATIO: float = 0.6
+MARGIN_RATIO: float = 0.09
+GRAPHIC_TEXT_GAP_RATIO: float = 0.7
 LINE_SPACING: int = 8
-
 
 # =============================
 # TYPE DEFINITIONS
@@ -51,7 +48,6 @@ class TextLine(TypedDict):
 class Layout(TypedDict):
     qr_position: Tuple[int, int]
     text_lines: List[TextLine]
-
 
 # =============================
 # HELPERS
@@ -81,13 +77,7 @@ def generate_qr(url: str, output_path: str) -> None:
     )
 
 
-def wrap_text(
-    draw: PILDraw,
-    text: str,
-    font: FreeTypeFont,
-    max_width: int
-) -> List[str]:
-
+def wrap_text(draw: PILDraw, text: str, font: FreeTypeFont, max_width: int) -> List[str]:
     words: List[str] = text.split()
     lines: List[str] = []
     current: str = ""
@@ -109,26 +99,16 @@ def wrap_text(
 
     return lines
 
-
 # =============================
-# LAYOUT ENGINE (ALL MATH)
+# LAYOUT ENGINE (USES PAYLOAD SIZE)
 # =============================
 
-def build_layout(
-    width: int,
-    height: int,
-    artist: str,
-    title: str,
-    draw: PILDraw,
-) -> Layout:
+def build_layout(width: int, height: int, artist: str, title: str, draw: PILDraw) -> Layout:
 
     margin: int = int(width * MARGIN_RATIO)
     top_empty_height: int = int(height * TOP_EMPTY_RATIO)
     max_text_width: int = width - 2 * margin
 
-    # ----------------------------
-    # 1. Prepare fonts
-    # ----------------------------
     font_text: FreeTypeFont = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
     raw_lines: List[Tuple[str, FreeTypeFont]] = []
@@ -139,9 +119,6 @@ def build_layout(
         raw_lines.append((line, font_text))
     raw_lines.append(("", font_text))
 
-    # ----------------------------
-    # 2. Measure text height
-    # ----------------------------
     measured: List[Tuple[str, FreeTypeFont, int]] = []
     total_text_height: int = 0
 
@@ -151,27 +128,20 @@ def build_layout(
         total_text_height += h + LINE_SPACING
         measured.append((line, font, h))
 
-    # ----------------------------
-    # 3. Position text block (centered with slight bias upward)
-    # ----------------------------
     graphic_text_gap: int = int(margin * GRAPHIC_TEXT_GAP_RATIO)
 
-    # Position QR at bottom first
     qr_y: int = height - margin - qr_size_px()
 
-    # Vertical space available for text block
     text_space_top: int = top_empty_height + graphic_text_gap
     text_space_bottom: int = qr_y - graphic_text_gap
     available_space: int = text_space_bottom - text_space_top
 
-    # Center text block in available space
-    # Small tweak: bias 20% toward top
     bias_ratio: float = TEXT_CENTERING_BIAS_RATIO
     text_start_y: int = text_space_top + int((available_space - total_text_height) * (0.5 - bias_ratio))
 
     y: int = text_start_y
-
     text_lines: List[TextLine] = []
+
     for line, font, h in measured:
         bbox = draw.textbbox((0, 0), line, font=font)
         w: int = int(bbox[2] - bbox[0])
@@ -186,69 +156,53 @@ def build_layout(
 
         y += h + LINE_SPACING
 
-    # ----------------------------
-    # 4. Compute remaining space
-    # ----------------------------
-
-    # ----------------------------
-    # 5. Position QR at bottom
-    # ----------------------------
     qr_x: int = (width - qr_size_px()) // 2
-    qr_y: int = height - margin - qr_size_px()
 
     return {
         "qr_position": (qr_x, qr_y),
         "text_lines": text_lines,
     }
 
-
 # =============================
-# PURE RENDERER
+# RENDERER
 # =============================
 
-def render_card(
-    width: int,
-    height: int,
-    layout: Layout,
-    qr_img: PILImage,
-    output_path: str,
-) -> None:
+def render_card(width: int, height: int, layout: Layout, qr_img: PILImage, output_path: str) -> None:
 
-    img: PILImage = Image.new("RGB", (width, height), "white")
+    img: PILImage = Image.new("RGB", (width, height), "red")  # 🔴 full card
     draw: PILDraw = ImageDraw.Draw(img)
 
-    # ----------------------------
-    # DRAW RED GRAPHIC AREA
-    # ----------------------------
+    bezel = mm_to_px(BEZEL_MM)
+
+    # ⚪ payload
     draw.rectangle(
-        [
-            (0, 0),  # top-left
-            (width, width)  # bottom-right
-        ],
-        fill="red"  # filled color
+        [(bezel, bezel), (width - bezel, height - bezel)],
+        fill="white"
     )
 
-    # ----------------------------
-    # Draw text
-    # ----------------------------
+    payload_width = width - 2 * bezel
+
+    # 🟢 graphic square
+    draw.rectangle(
+        [(bezel, bezel), (bezel + payload_width, bezel + payload_width)],
+        fill="black"
+    )
+
+    # text
     for line in layout["text_lines"]:
         draw.text(
-            (line["x"], line["y"]),
+            (line["x"] + bezel, line["y"] + bezel),
             line["text"],
             fill="black",
             font=line["font"],
         )
 
-    # ----------------------------
-    # Draw QR
-    # ----------------------------
+    # QR
     qr_resized: PILImage = qr_img.resize((qr_size_px(), qr_size_px()), Image.LANCZOS)
-
     qr_x, qr_y = layout["qr_position"]
-    img.paste(qr_resized, (qr_x, qr_y))
+    img.paste(qr_resized, (qr_x + bezel, qr_y + bezel))
 
     img.save(output_path, dpi=(DPI, DPI))
-
 
 # =============================
 # MAIN
@@ -260,6 +214,10 @@ def generate_card(track_id: str, output_path: str) -> None:
 
     width: int = mm_to_px(CARD_WIDTH_MM)
     height: int = mm_to_px(CARD_HEIGHT_MM)
+    bezel: int = mm_to_px(BEZEL_MM)
+
+    payload_width = width - 2 * bezel
+    payload_height = height - 2 * bezel
 
     artist, title = get_metadata(track_id)
 
@@ -270,12 +228,12 @@ def generate_card(track_id: str, output_path: str) -> None:
 
     qr_img: PILImage = Image.open(qr_tmp).convert("RGB")
 
-    dummy_img: PILImage = Image.new("RGB", (width, height))
+    dummy_img: PILImage = Image.new("RGB", (payload_width, payload_height))
     dummy_draw: PILDraw = ImageDraw.Draw(dummy_img)
 
     layout: Layout = build_layout(
-        width,
-        height,
+        payload_width,
+        payload_height,
         artist,
         title,
         dummy_draw,
@@ -285,7 +243,6 @@ def generate_card(track_id: str, output_path: str) -> None:
 
     os.remove(qr_tmp)
     print(f"Card saved to {output_path}")
-
 
 # =============================
 # CLI

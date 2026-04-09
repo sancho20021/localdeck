@@ -6,8 +6,8 @@ import math
 # ----------------------------
 # CONFIG
 # ----------------------------
-INPUT_DIR = "../cards/batch3/ready"
-OUTPUT_DIR = "../cards/batch3/toprint"
+INPUT_DIR = "../cards/batch4/ready"
+OUTPUT_DIR = "../cards/batch4/to_print"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # A3 at 300 dpi: 297 x 420 mm → pixels
@@ -21,7 +21,7 @@ A3_HEIGHT_PX = int(A3_HEIGHT_MM / MM_TO_INCH * DPI)
 MARGIN_MM = 15
 MARGIN_PX = int(MARGIN_MM / MM_TO_INCH * DPI)
 
-GAP_MM = 3
+GAP_MM = 0
 GAP_PX = int(GAP_MM / MM_TO_INCH * DPI)
 
 # ----------------------------
@@ -60,7 +60,7 @@ print(f"Grid: {cols} x {rows} → {cards_per_page} per page")
 pages = []
 
 for page_idx in range(math.ceil(len(png_files) / cards_per_page)):
-    page_img = Image.new("RGB", (A3_WIDTH_PX, A3_HEIGHT_PX), color=(255, 0, 0))  # full red background
+    page_img = Image.new("RGB", (A3_WIDTH_PX, A3_HEIGHT_PX), color=(255, 255, 255))  # full red background
 
     page_cards = png_files[page_idx * cards_per_page:(page_idx + 1) * cards_per_page]
 
