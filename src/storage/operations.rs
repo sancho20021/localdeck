@@ -204,13 +204,28 @@ impl Storage {
                 params![&track_id_str],
             )?;
 
-            // todo: make sure the database stores paths in linux style to avoid mess
             let path_str = path_to_string(&path);
 
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO files (track_id, path) VALUES (?1, ?2)",
-                params![&track_id_str, &path_str],
-            )?;
+            // ---------- Insert file (must NOT already exist) ----------
+            let inserted = tx
+                .execute(
+                    "INSERT INTO files (path, track_id) VALUES (?1, ?2)",
+                    params![&path_str, &track_id_str],
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::SqliteFailure(ref err, _)
+                        if err.code == ErrorCode::ConstraintViolation =>
+                    {
+                        StorageError::DuplicatePath {
+                            path: path.clone(),
+                            hint: "Attempted to insert a path that already exists. \
+                           This usually means the file content changed without renaming. \
+                           Consider forgetting the old entry and running update again."
+                                .into(),
+                        }
+                    }
+                    e => StorageError::Database(e),
+                })?;
 
             // rusqlite returns 1 if row inserted, 0 if ignored
             files_inserted += inserted as usize;
@@ -1046,6 +1061,22 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_tracks_duplicate_path() -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+        let err = storage
+            .insert_tracks([
+                (mock_trackid(1), PathBuf::from("a.mp3")),
+                (mock_trackid(2), PathBuf::from("a.mp3")),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, StorageError::DuplicatePath { .. }));
+        Ok(())
+    }
+
+    #[test]
     fn test_get_track_success() -> anyhow::Result<()> {
         let mut conn = rusqlite::Connection::open_in_memory()?;
         schema::init(&conn)?;
@@ -1451,25 +1482,24 @@ mod tests {
         insert_tracks(&storage.db, tracks);
         insert_track_files(&storage.db, track_files);
 
-        // Forget top-level directory
-        let path_to_forget = Path::new("C:\\music");
+        let path_to_forget = Path::new("C:\\music\\subdir");
         let report = storage.forget_path(path_to_forget).unwrap();
 
-        assert_eq!(report.removed_files, 2);
+        assert_eq!(report.removed_files, 1);
         assert_eq!(report.affected_tracks, 1);
-        assert_eq!(report.removed_tracks, 1);
+        assert_eq!(report.removed_tracks, 0);
 
         // Remaining DB entries
         let remaining: Vec<String> = storage
             .db
-            .prepare("SELECT track_id FROM files")
+            .prepare("SELECT path FROM files")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, vec!["C:/music/track_a1.mp3"]);
     }
 
     #[test]

@@ -29,9 +29,8 @@ CREATE TABLE IF NOT EXISTS tracks (
 );
 
 CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
     track_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    PRIMARY KEY (track_id, path),
     FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
 );
 

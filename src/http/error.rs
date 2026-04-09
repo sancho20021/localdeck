@@ -34,6 +34,7 @@ impl From<StorageError> for ApiError {
             }
 
             StorageError::InvalidTrackId => ApiError::BadRequest("invalid track id".into()),
+            StorageError::DuplicatePath { .. } => ApiError::BadRequest(err.to_string()),
 
             StorageError::Database(_) | StorageError::Fs(_) | StorageError::Internal(_) => {
                 ApiError::Internal("internal server error".into())

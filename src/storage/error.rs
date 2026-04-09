@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use thiserror::Error;
 
 use crate::domain::hash::TrackId;
@@ -18,6 +20,9 @@ pub enum StorageError {
 
     #[error("invalid track id")]
     InvalidTrackId,
+
+    #[error("duplicate path error, path: {path}, hint: {hint}")]
+    DuplicatePath { path: PathBuf, hint: String },
 
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
