@@ -457,7 +457,15 @@ impl Storage {
         let mut result = Vec::new();
 
         for (track_id, db_paths) in db_map.into_iter() {
-            let available_paths = available_map.get(&track_id).cloned().unwrap_or_default();
+            // available paths must be subset of all db paths, so we ignore those that data base
+            // doesn't know about
+            let available_paths = available_map
+                .get(&track_id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| db_paths.contains(p))
+                .collect::<Vec<_>>();
 
             // Compute unavailable paths: DB paths that are not currently available
             let unavailable_paths = db_paths
@@ -1986,6 +1994,30 @@ mod tests {
             let diff = storage.check_missing()?;
 
             assert!(diff.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_missing_detects_renamed_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            let renamed = dir.path().join("renamed.mp3");
+
+            std::fs::write(&renamed, b"x")?;
+
+            let track_id = TrackId::from_file(&renamed)?;
+
+            insert_tracks(&mut storage.db, [track_id]);
+            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+
+            let diff = storage.check_missing()?;
+
+            assert_eq!(diff.len(), 1);
+            assert!(diff.contains_key(&track_id));
+            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
 
             Ok(())
         }
