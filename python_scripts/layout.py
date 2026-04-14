@@ -6,8 +6,8 @@ import math
 # ----------------------------
 # CONFIG
 # ----------------------------
-INPUT_DIR = "../cards/batch4/ready"
-OUTPUT_DIR = "../cards/batch4/to_print"
+INPUT_DIR = "../cards/batch5/ready"
+OUTPUT_DIR = "../cards/batch5"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # A3 at 300 dpi: 297 x 420 mm → pixels
