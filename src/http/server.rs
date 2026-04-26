@@ -1,6 +1,6 @@
 use anyhow::anyhow;
-use log::info;
-use rouille::{Request, Response};
+use log::{debug, info};
+use rouille::{Request, Response, ResponseBody};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -52,15 +52,23 @@ impl HttpServer {
             (GET) (/play) => {
                 self.handle_play(request)
             },
+            (GET) (/scan_qr) => {
+                Self::handle_scan_qr()
+            },
             _ => Response::empty_404()
         );
 
         info!("Response: {} {}", request.method(), response.status_code);
+        debug!("Response headers: {:?}", response.headers);
         response
     }
 
     fn log_request(request: &Request) {
         info!("{} {}", request.method(), request.url());
+    }
+
+    fn handle_scan_qr() -> Response {
+        Response::html(include_str!("../../html/scan_qr.html"))
     }
 
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
@@ -109,7 +117,7 @@ impl HttpServer {
             if let Some(meta) = meta {
                 resp = resp
                     .with_additional_header("X-Track-Artist", meta.artist)
-                    .with_additional_header("X-Track-Title", meta.title);
+                    .with_additional_header("X-Track-Title", meta.title)
             }
             resp
         };
@@ -242,7 +250,7 @@ impl HttpServer {
             return Response::text("Error: missing media hash").with_status_code(400);
         };
 
-        let youtube_id = request.get_param("y");
+        let youtube_id: Option<String> = request.get_param("y");
 
         match Self::get_track_stream(hash, request, &self.storage) {
             Ok(resp) => resp,

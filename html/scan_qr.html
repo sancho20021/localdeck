@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>QR Scanner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body style="font-family: monospace; text-align: center;">
+
+    <h2>QR Scanner</h2>
+
+    <video id="video" autoplay playsinline style="width: 100%; max-width: 420px;"></video>
+
+    <pre id="output" style="padding: 10px; border-radius: 8px; background: #111; color: white;">
+Waiting for QR...
+  </pre>
+
+    <audio id="audio" controls style="width: 100%; margin-top: 20px;"></audio>
+
+    <script src="https://unpkg.com/jsqr/dist/jsQR.js"></script>
+
+    <script>
+        const video = document.getElementById("video");
+        const output = document.getElementById("output");
+        const audio = document.getElementById("audio");
+
+        let lastQR = "";
+
+        function setStatus(text, type = "info") {
+            let color = "#333";
+            let textColor = "white";
+
+            if (type === "good") color = "#1f7a1f";
+            if (type === "bad") color = "#8b1a1a";
+            if (type === "info") color = "#222";
+
+            output.style.background = color;
+            output.style.color = textColor;
+            output.textContent = text;
+        }
+
+        function extractHash(text) {
+            try {
+                const url = new URL(text);
+
+                if (!url.pathname.includes("/play")) {
+                    return { error: "QR must point to /play endpoint" };
+                }
+
+                const hash = url.searchParams.get("h");
+
+                if (!hash) {
+                    return { error: "Missing ?h= track id" };
+                }
+
+                return { hash };
+            } catch {
+                return { error: "Invalid QR format (not a URL)" };
+            }
+        }
+
+        async function play(hash, raw) {
+            const url =
+                "https://main-deck.tail604db0.ts.net:8080/play?h=" + hash;
+
+            setStatus(
+                "VALID QR\n\nPlaying track:\n" + hash,
+                "good"
+            );
+
+            audio.pause();
+
+            // reset handlers (important)
+            audio.onerror = null;
+
+            audio.src = url;
+            audio.load();
+
+            // 🔥 handle real failure (network / 404 / server issues)
+            audio.onerror = () => {
+                setStatus(
+                    "PLAYBACK ERROR ❌\n\n" +
+                    "Could not load track\n\n" +
+                    "Read:\n" + raw + "\n\n" +
+                    "URL:\n" + url,
+                    "bad"
+                );
+            };
+
+            const p = audio.play();
+
+            if (p !== undefined) {
+                p.catch(() => {
+                    setStatus(
+                        "AUDIO BLOCKED\n\nTap screen once to enable playback",
+                        "bad"
+                    );
+                });
+            }
+        }
+
+        navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "environment" }
+        }).then(stream => {
+            video.srcObject = stream;
+            video.play();
+            requestAnimationFrame(scan);
+        }).catch(err => {
+            setStatus("Camera error: " + err, "bad");
+        });
+
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+        function scan() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                ctx.drawImage(video, 0, 0);
+
+                const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const code = jsQR(image.data, canvas.width, canvas.height);
+
+                if (code) {
+                    const raw = code.data;
+
+                    if (raw !== lastQR) {
+                        lastQR = raw;
+
+                        const result = extractHash(raw);
+
+                        if (result.error) {
+                            setStatus(
+                                "INVALID QR\n\n" +
+                                "Read:\n" + raw + "\n\n" +
+                                "Reason:\n" + result.error,
+                                "bad"
+                            );
+                        } else {
+                            play(result.hash, raw);
+                        }
+                    }
+                }
+            }
+
+            requestAnimationFrame(scan);
+        }
+    </script>
+
+</body>
+
+</html>
