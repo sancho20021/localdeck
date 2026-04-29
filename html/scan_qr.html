@@ -28,41 +28,43 @@ Waiting for QR...
         let lastQR = "";
 
         function setStatus(text, type = "info") {
-            let color = "#333";
-            let textColor = "white";
+            let color = "#222";
 
             if (type === "good") color = "#1f7a1f";
             if (type === "bad") color = "#8b1a1a";
-            if (type === "info") color = "#222";
 
             output.style.background = color;
-            output.style.color = textColor;
             output.textContent = text;
         }
 
+        // ✅ Flexible hash extraction:
+        // accepts:
+        //  - "h=abc123"
+        //  - "abc123"
+        //  - full URL with ?h=abc123
         function extractHash(text) {
             try {
+                // try full URL first
                 const url = new URL(text);
-
-                if (!url.pathname.includes("/play")) {
-                    return { error: "QR must point to /play endpoint" };
-                }
-
                 const hash = url.searchParams.get("h");
-
-                if (!hash) {
-                    return { error: "Missing ?h= track id" };
-                }
-
-                return { hash };
+                if (hash) return { hash };
             } catch {
-                return { error: "Invalid QR format (not a URL)" };
+                // not a URL, continue
             }
+
+            // try "h=abc123"
+            const matchParam = text.match(/h=([a-zA-Z0-9]+)/);
+            if (matchParam) return { hash: matchParam[1] };
+
+            // try raw hash
+            const matchRaw = text.match(/^[a-zA-Z0-9]+$/);
+            if (matchRaw) return { hash: text };
+
+            return { error: "Could not extract track hash" };
         }
 
         async function play(hash, raw) {
-            const url =
-                "https://main-deck.tail604db0.ts.net:8080/play?h=" + hash;
+            const url = window.location.origin + "/play?h=" + hash;
 
             setStatus(
                 "VALID QR\n\nPlaying track:\n" + hash,
@@ -70,14 +72,11 @@ Waiting for QR...
             );
 
             audio.pause();
-
-            // reset handlers (important)
             audio.onerror = null;
 
             audio.src = url;
             audio.load();
 
-            // 🔥 handle real failure (network / 404 / server issues)
             audio.onerror = () => {
                 setStatus(
                     "PLAYBACK ERROR ❌\n\n" +
