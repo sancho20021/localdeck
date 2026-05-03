@@ -72,30 +72,26 @@ Waiting for QR...
             );
 
             audio.pause();
-            audio.onerror = null;
 
             audio.src = url;
-            audio.load();
 
-            audio.onerror = () => {
+            // Single unified error handler
+            function fail(reason) {
                 setStatus(
                     "PLAYBACK ERROR ❌\n\n" +
-                    "Could not load track\n\n" +
+                    reason + "\n\n" +
                     "Read:\n" + raw + "\n\n" +
                     "URL:\n" + url,
                     "bad"
                 );
-            };
+            }
 
-            const p = audio.play();
+            audio.onerror = () => fail("Could not load or decode audio");
 
-            if (p !== undefined) {
-                p.catch(() => {
-                    setStatus(
-                        "AUDIO BLOCKED\n\nTap screen once to enable playback",
-                        "bad"
-                    );
-                });
+            try {
+                await audio.play();
+            } catch (e) {
+                fail("Playback failed (blocked, invalid, or unsupported)");
             }
         }
 

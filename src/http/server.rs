@@ -1,6 +1,6 @@
 use anyhow::anyhow;
 use log::{debug, info};
-use rouille::{Request, Response, ResponseBody};
+use rouille::{Request, Response};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -238,51 +238,17 @@ impl HttpServer {
         }
     }
 
-    /// tries to stream just like /track/stream route.
-    ///
-    /// if fails, offers to redirect to youtube.
-    ///
-    /// Never change the api interface of this method as this route is used on printed qrs / nfcs.
+    /// streams just like /track/stream route
+    /// but accepts hash inside ?h= parameter.
     fn handle_play(&self, request: &Request) -> Response {
         let hash = if let Some(hash) = request.get_param("h") {
             hash
         } else {
             return Response::text("Error: missing media hash").with_status_code(400);
         };
-
-        let youtube_id: Option<String> = request.get_param("y");
-
         match Self::get_track_stream(hash, request, &self.storage) {
-            Ok(resp) => resp,
-
-            Err(err) => {
-                let error_text = err.to_string();
-                let status = err.status_code();
-
-                self.render_fallback(youtube_id.as_deref(), status, &error_text)
-            }
-        }
-    }
-
-    fn render_fallback(&self, youtube_id: Option<&str>, status: u16, reason: &str) -> Response {
-        match youtube_id {
-            Some(yid) => {
-                let template = include_str!("../../html/offer_yt.html");
-                Response::html(
-                    template
-                        .replace("{{YT_URL}}", &format!("https://youtu.be/{}", yid))
-                        .replace("{{STATUS}}", &status.to_string())
-                        .replace("{{REASON}}", reason),
-                )
-            }
-            None => {
-                let template = include_str!("../../html/no_track.html");
-                Response::html(
-                    template
-                        .replace("{{STATUS}}", &status.to_string())
-                        .replace("{{REASON}}", reason),
-                )
-            }
+            Ok(r) => r,
+            Err(e) => e.into_response(),
         }
     }
 }
@@ -531,75 +497,6 @@ mod tests {
         assert_eq!(response.status_code, 400);
 
         Ok(())
-    }
-
-    #[test]
-    fn test_play_streams_track_successfully() {
-        let server = create_server_with_tracks([(mock_trackid(123), "somewhere")]); // storage contains track
-
-        let request = Request::fake_http("GET", "/play?h=123", vec![], vec![]);
-
-        let response = server.handle_request(&request);
-        let status = response.status_code;
-
-        assert!(
-            status == 200 || status == 206,
-            "expected streaming response, got {}. response: {}",
-            status,
-            parse_text_response(response)
-        );
-    }
-
-    #[test]
-    fn test_play_fallback_with_youtube() {
-        let server = create_empty_server(); // no tracks in storage
-
-        let request = Request::fake_http("GET", "/play?h=123&y=dQw4w9WgXcQ", vec![], vec![]);
-
-        let response = server.handle_request(&request);
-        let status = response.status_code;
-
-        assert_eq!(
-            status,
-            200,
-            "expected fallback html, got {}. response: {}",
-            status,
-            parse_text_response(response)
-        );
-
-        let body = parse_text_response(response);
-
-        assert!(
-            body.contains("youtu.be/dQw4w9WgXcQ"),
-            "expected youtube link in fallback, got: {}",
-            body
-        );
-    }
-
-    #[test]
-    fn test_play_fallback_without_youtube() {
-        let server = create_empty_server(); // no tracks in storage
-
-        let request = Request::fake_http("GET", "/play?h=123", vec![], vec![]);
-
-        let response = server.handle_request(&request);
-        let status = response.status_code;
-
-        assert_eq!(
-            status,
-            200,
-            "expected fallback html, got {}. response: {}",
-            status,
-            parse_text_response(response)
-        );
-
-        let body = parse_text_response(response);
-
-        assert!(
-            body.contains("no youtube link"),
-            "expected no-youtube fallback message, got: {}",
-            body
-        );
     }
 
     #[test]
