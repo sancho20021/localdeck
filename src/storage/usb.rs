@@ -1,4 +1,3 @@
-#[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 
 use std::{
@@ -14,9 +13,11 @@ pub enum ResolveError {
     UsbNotFound { label: String },
 
     #[error("failed to query system mounts")]
-    System(#[from] std::io::Error),
-    // #[error("failed to parse mounts")]
-    // Parse, // optional, if you want to distinguish further
+    SystemQueryFail(#[from] std::io::Error),
+
+    #[error("usb resolve failed, windows-specific error: {0}")]
+    WindowsError(String), // #[error("failed to parse mounts")]
+                          // Parse, // optional, if you want to distinguish further
 }
 
 #[derive(Debug)]
@@ -117,7 +118,7 @@ pub fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn find_mount_by_label(label: &str) -> anyhow::Result<PathBuf> {
+pub fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
     for_windows::find_mount_by_label(label)
 }
 
@@ -129,7 +130,6 @@ mod for_windows {
         path::PathBuf,
     };
 
-    use anyhow::bail;
     use windows::{
         Win32::{
             Foundation::MAX_PATH,
@@ -138,13 +138,17 @@ mod for_windows {
         core::PCWSTR,
     };
 
-    pub(super) fn find_mount_by_label(label: &str) -> anyhow::Result<PathBuf> {
+    use crate::storage::usb::ResolveError;
+
+    pub(super) fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
         for drive in get_all_drives_with_labels()? {
             if &drive.label == label {
                 return Ok(drive.path);
             }
         }
-        bail!("device '{label}' not mounted");
+        Err(ResolveError::UsbNotFound {
+            label: label.to_string(),
+        })
     }
 
     #[derive(Debug)]
@@ -154,11 +158,13 @@ mod for_windows {
     }
 
     /// windows-specific function to get drive paths and labels
-    fn get_all_drives_with_labels() -> Result<Vec<DriveInfo>, anyhow::Error> {
+    fn get_all_drives_with_labels() -> Result<Vec<DriveInfo>, ResolveError> {
         let mut buffer: [u16; 256] = [0; 256];
         let len = unsafe { GetLogicalDriveStringsW(Some(&mut buffer)) };
         if len == 0 {
-            bail!("Failed to get logical drives");
+            return Err(ResolveError::WindowsError(
+                "Failed to get logical drives".to_string(),
+            ));
         }
 
         let mut drives = Vec::new();
