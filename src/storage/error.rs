@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use crate::{location::Location, storage::usb::ResolveError};
 
 use thiserror::Error;
 
@@ -12,8 +12,8 @@ pub enum StorageError {
     #[error("track {0} not found")]
     TrackNotFound(TrackId),
 
-    #[error("track {track} has no valid music files")]
-    InvalidTrackFile { track: TrackId },
+    #[error("track {track} has no valid music files: {extra}")]
+    InvalidTrackFile { track: TrackId, extra: String },
 
     #[error("filesystem error: {0}")]
     Fs(#[from] std::io::Error),
@@ -21,8 +21,8 @@ pub enum StorageError {
     #[error("invalid track id")]
     InvalidTrackId,
 
-    #[error("duplicate path error, path: {path}, hint: {hint}")]
-    DuplicatePath { path: PathBuf, hint: String },
+    #[error("duplicate location error, location: {path}, hint: {hint}")]
+    DuplicateLocation { path: Location, hint: String },
 
     #[error("internal error: {0}")]
     Internal(anyhow::Error),

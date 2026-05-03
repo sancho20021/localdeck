@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub use crate::location::Location;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub version: u32,
@@ -49,13 +51,6 @@ pub struct HttpConfig {
 pub enum Database {
     InMemory,
     OnDisk { location: Location },
-}
-
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type")]
-pub enum Location {
-    File { path: PathBuf },
-    Usb { label: String, path: PathBuf },
 }
 
 #[derive(Debug, Deserialize, Default)]

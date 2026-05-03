@@ -1,10 +1,107 @@
 #[cfg(not(target_os = "windows"))]
-use anyhow::{self, bail};
-
 use std::path::PathBuf;
 
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use crate::config::Location;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("USB with label '{label}' not mounted")]
+    UsbNotFound { label: String },
+
+    #[error("failed to query system mounts")]
+    System(#[from] std::io::Error),
+    // #[error("failed to parse mounts")]
+    // Parse, // optional, if you want to distinguish further
+}
+
+#[derive(Debug)]
+struct UsbResolver {
+    /// maps USB_LABEL -> path where it is mounted
+    label_mounts: HashMap<String, PathBuf>,
+    last_refresh: Instant,
+    ttl: Duration,
+}
+
+impl UsbResolver {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            label_mounts: HashMap::new(),
+            last_refresh: Instant::now() - ttl,
+            ttl,
+        }
+    }
+
+    /// Cached function to resolve location of USB with given label
+    fn resolve_label(&mut self, label: &str) -> Result<PathBuf, ResolveError> {
+        if self.last_refresh.elapsed() > self.ttl {
+            self.reset();
+        }
+
+        if let Some(mount) = self.label_mounts.get(label) {
+            return Ok(mount.clone());
+        }
+
+        let mount = find_mount_by_label(label)?;
+        self.label_mounts.insert(label.to_string(), mount.clone());
+        Ok(mount)
+    }
+
+    fn reset(&mut self) {
+        self.label_mounts.clear();
+        self.last_refresh = Instant::now();
+    }
+}
+
+#[derive(Debug)]
+/// Struct to resolve paths of locations
+pub struct LocationResolver {
+    usb_resolver: UsbResolver,
+}
+
+impl LocationResolver {
+    pub fn new(ttl: Duration) -> Self {
+        LocationResolver {
+            usb_resolver: UsbResolver::new(ttl),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_resolver(locs: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+        LocationResolver {
+            usb_resolver: UsbResolver {
+                label_mounts: locs.into_iter().collect(),
+                last_refresh: Instant::now(),
+                ttl: Duration::from_secs(999),
+            },
+        }
+    }
+
+    /// Cached function to resolve path of given location
+    /// Cache is getting cleared every `ttl` (see Self::new) so it can work if drive mounts get changed (for example, usb drive re-inserted)
+    pub fn resolve(&mut self, loc: &Location) -> Result<PathBuf, ResolveError> {
+        match loc {
+            Location::File { path } => Ok(path.clone()),
+            Location::Usb { label, path } => {
+                let mount = self.usb_resolver.resolve_label(label)?;
+                Ok(mount.join(path))
+            }
+        }
+    }
+}
+
+impl Default for LocationResolver {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(1))
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
-pub fn find_mount_by_label(label: &str) -> anyhow::Result<PathBuf> {
+pub fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
     let mounts = std::fs::read_to_string("/proc/self/mounts")?;
 
     for line in mounts.lines() {
@@ -14,7 +111,9 @@ pub fn find_mount_by_label(label: &str) -> anyhow::Result<PathBuf> {
         }
     }
 
-    bail!("device '{label}' not mounted");
+    Err(ResolveError::UsbNotFound {
+        label: label.to_string(),
+    })
 }
 
 #[cfg(target_os = "windows")]

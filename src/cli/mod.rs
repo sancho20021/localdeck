@@ -3,8 +3,6 @@ use clap::{Parser, Subcommand};
 use log::info;
 use std::env;
 use std::path::PathBuf;
-use std::process::exit;
-use std::str::FromStr;
 
 use crate::domain::hash::TrackId;
 use crate::domain::track::{ArtworkRef, TrackMetadata};
@@ -13,7 +11,7 @@ use crate::storage::operations::{MetadataUpdate, Storage};
 use crate::{config, public_endpoint};
 
 #[derive(Parser)]
-#[command(name = "localdec")]
+#[command(name = "localdeck")]
 #[command(author = "Sasha Pak")]
 #[command(version = "0.1")]
 #[command(about = "Local music library manager")]
@@ -170,7 +168,7 @@ pub fn run() -> anyhow::Result<()> {
                             for (track, locs) in new {
                                 println!("  [NEW]  {}, found at:", track);
                                 for location in locs {
-                                    println!("    - {}", location.to_string_lossy());
+                                    println!("    - {}", location);
                                 }
                             }
                         } else {
@@ -186,7 +184,7 @@ pub fn run() -> anyhow::Result<()> {
                                 if !old_locs.is_empty() {
                                     println!("Unavailable locations:");
                                     for loc in old_locs {
-                                        println!("   - {}", loc.to_string_lossy());
+                                        println!("   - {}", loc);
                                     }
                                 }
                             }
@@ -209,7 +207,7 @@ pub fn run() -> anyhow::Result<()> {
             let files = storage.update_db_with_new_files()?;
             println!("Database updated, new files ({}):", files.len());
             for file in &files {
-                println!("    - {} at {}", file.track_id, file.path.to_string_lossy());
+                println!("    - {} at {}", file.track_id, file.loc);
             }
         }
 
@@ -240,7 +238,7 @@ pub fn run() -> anyhow::Result<()> {
                 if !track.available_files.is_empty() {
                     println!("  Available files:");
                     for path in &track.available_files {
-                        println!("    - {}", path.to_string_lossy());
+                        println!("    - {}", path);
                     }
                 } else {
                     println!("  No available files found :(");
@@ -249,7 +247,7 @@ pub fn run() -> anyhow::Result<()> {
                 if show_unavailable && !track.unavailable_files.is_empty() {
                     println!("  Unavailable files:");
                     for path in &track.unavailable_files {
-                        println!("    - {}", path.to_string_lossy());
+                        println!("    - {}", path);
                     }
                 }
             }

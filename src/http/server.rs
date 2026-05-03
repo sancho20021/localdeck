@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    config::HttpConfig,
+    config::{HttpConfig, Location},
     domain::{hash::TrackId, track::TrackMetadata},
     http::error::ApiError,
     storage::{error::StorageError, operations::Storage},
@@ -44,7 +44,7 @@ impl HttpServer {
             },
 
             (GET) (/tracks/{id: String}/stream) => {
-                Self::handle_get_track_stream(id, request, &self.storage)
+                self.handle_get_track_stream(id, request)
             },
             (GET) (/listen/{_id: String}) => {
                         Self::handle_listen_page()
@@ -83,8 +83,8 @@ impl HttpServer {
         };
 
         match data {
-            Ok((path, metadata)) => {
-                Response::json(&TrackResponse::from_domain(&track_id, path, metadata))
+            Ok((_, loc, metadata)) => {
+                Response::json(&TrackResponse::from_domain(&track_id, loc, metadata))
             }
 
             Err(e) => ApiError::from(e).into_response(),
@@ -93,19 +93,15 @@ impl HttpServer {
 
     /// streams music file, respecting byterange
     /// returns Response with ok status, or ApiError
-    fn get_track_stream(
-        id: String,
-        request: &Request,
-        storage: &Arc<Mutex<Storage>>,
-    ) -> Result<Response, ApiError> {
+    fn get_track_stream(&self, id: String, request: &Request) -> Result<Response, ApiError> {
         let track_id = TrackId::from_hex(&id).map_err(|_| StorageError::InvalidTrackId)?;
 
-        let mut storage = storage.lock().map_err(|e| {
+        let mut storage = self.storage.lock().map_err(|e| {
             StorageError::Internal(anyhow!(
                 "Could not access localdeck storage under lock: {e}"
             ))
         })?;
-        let (path, meta) = storage.find_track_file_with_meta(track_id)?;
+        let (path, _, meta) = storage.find_track_file_with_meta(track_id)?;
         let mime = Self::mime_for_track(&path);
 
         let mut file = File::open(&path).map_err(StorageError::Fs)?;
@@ -195,12 +191,8 @@ impl HttpServer {
         Ok(Some((start, end)))
     }
 
-    fn handle_get_track_stream(
-        id: String,
-        request: &Request,
-        storage: &Arc<Mutex<Storage>>,
-    ) -> Response {
-        match Self::get_track_stream(id, request, storage) {
+    fn handle_get_track_stream(&self, id: String, request: &Request) -> Response {
+        match self.get_track_stream(id, request) {
             Ok(r) => r,
             Err(e) => e.into_response(),
         }
@@ -246,7 +238,7 @@ impl HttpServer {
         } else {
             return Response::text("Error: missing media hash").with_status_code(400);
         };
-        match Self::get_track_stream(hash, request, &self.storage) {
+        match self.get_track_stream(hash, request) {
             Ok(r) => r,
             Err(e) => e.into_response(),
         }
@@ -256,7 +248,7 @@ impl HttpServer {
 #[derive(Serialize, Deserialize)]
 struct TrackResponse {
     track_id: String,
-    path: PathBuf,
+    location: Location,
     metadata: Option<TrackMetadataResponse>,
 }
 
@@ -270,10 +262,10 @@ struct TrackMetadataResponse {
 }
 
 impl TrackResponse {
-    fn from_domain(track: &TrackId, path: PathBuf, meta: Option<TrackMetadata>) -> Self {
+    fn from_domain(track: &TrackId, location: Location, meta: Option<TrackMetadata>) -> Self {
         Self {
             track_id: track.to_string(),
-            path,
+            location,
             metadata: meta.map(|metadata| TrackMetadataResponse {
                 artist: metadata.artist.clone(),
                 title: metadata.title.clone(),
@@ -342,15 +334,16 @@ mod tests {
         tracks: impl IntoIterator<Item = (TrackId, S)>,
     ) -> HttpServer {
         let storage = setup_storage().unwrap();
-
         {
             let mut locked = storage.lock().unwrap();
             locked
-                .insert_tracks(
-                    tracks
-                        .into_iter()
-                        .map(|(t, p)| (t, PathBuf::from_str(p.as_ref()).unwrap())),
-                )
+                .insert_tracks(tracks.into_iter().map(|(t, p)| {
+                    (t, {
+                        let s = p.as_ref();
+                        let p = PathBuf::from(s);
+                        Location::from_path(&p)
+                    })
+                }))
                 .unwrap();
         }
         create_server(&storage)
@@ -388,13 +381,12 @@ mod tests {
         );
 
         let response = server.handle_request(&request);
-
         assert_eq!(response.status_code, 200);
 
         let body: TrackResponse = parse_json_response(response)?;
 
         assert_eq!(body.track_id, mock_trackid_str(1));
-        assert_eq!(body.path, file_path);
+        assert_eq!(body.location, Location::from_path(file_path));
 
         Ok(())
     }
@@ -501,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_play_missing_hash() {
-        let server = create_empty_server();
+        let mut server = create_empty_server();
 
         let request = Request::fake_http("GET", "/play", vec![], vec![]);
 
@@ -532,13 +524,13 @@ mod tests {
         fs::write(&file_path, b"x").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         let request =
             Request::fake_http("GET", format!("/tracks/{track_id}/stream"), vec![], vec![]);
-        let response =
-            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage)
-                .expect("streaming should succeed");
+        let response = server
+            .get_track_stream(track_id.to_string(), &request)
+            .expect("streaming should succeed");
 
         // Check that Accept-Ranges header is present
         assert_eq!(
@@ -564,7 +556,7 @@ mod tests {
         fs::write(&file_path, b"asdfghjkas").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         // Request a partial range
         let request = Request::fake_http(
@@ -574,9 +566,9 @@ mod tests {
             vec![],
         );
 
-        let response =
-            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage)
-                .expect("partial streaming should succeed");
+        let response = server
+            .get_track_stream(track_id.to_string(), &request)
+            .expect("partial streaming should succeed");
 
         assert_eq!(response.status_code, 206);
 
@@ -598,7 +590,7 @@ mod tests {
         fs::write(&file_path, b"x").unwrap();
 
         let track_id = mock_trackid(12345);
-        let server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
 
         // Request a range beyond file size
         let request = Request::fake_http(
@@ -608,8 +600,7 @@ mod tests {
             vec![],
         );
 
-        let response =
-            HttpServer::get_track_stream(track_id.to_string(), &request, &server.storage);
+        let response = server.get_track_stream(track_id.to_string(), &request);
 
         assert!(matches!(response, Err(ApiError::InvalidRange)));
     }
@@ -629,7 +620,7 @@ mod tests {
 
         // ---------- Setup server with track and metadata ----------
         // `create_server_with_tracks` should accept metadata if we extend it
-        let server = create_server_with_tracks([(track_id, file_path.to_string_lossy())]);
+        let mut server = create_server_with_tracks([(track_id, file_path.to_string_lossy())]);
 
         // Insert metadata directly into the test DB
         server.storage.lock().unwrap().db.execute(
@@ -659,7 +650,7 @@ mod tests {
 
         // ---------- Assertions ----------
         assert_eq!(body.track_id, track_id_str);
-        assert_eq!(body.path, file_path);
+        assert_eq!(body.location, Location::from_path(file_path));
 
         // Metadata assertions
         let metadata = body.metadata.expect("Metadata should be present");

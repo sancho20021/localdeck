@@ -1,8 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{MAIN_SEPARATOR_STR, Path, PathBuf},
+    path::{Path, PathBuf},
     time::SystemTime,
 };
+
+use anyhow::anyhow;
 
 use crate::{
     config::{self, LibrarySource},
@@ -10,32 +12,33 @@ use crate::{
         hash::TrackId,
         track::{ArtworkRef, Track, TrackMetadata},
     },
+    location::Location,
     storage::{
         self,
-        db::{self, SecondsSinceUnix, system_time_to_i64},
+        db::{self, DBConfig, SecondsSinceUnix, system_time_to_i64},
         error::StorageError,
-        fs::{FsSnapshot, ObservedFile},
+        fs::{FileStorage, FsSnapshot, ObservedFile},
         schema::{columns, tables},
+        usb::ResolveError,
     },
 };
 
-use anyhow::anyhow;
 use columns::*;
 use rusqlite::{ErrorCode, Transaction, params};
 use tables::*;
 
 #[derive(Debug)]
 pub struct TrackChange {
-    pub db_locations: HashSet<PathBuf>,
-    pub fs_locations: HashSet<PathBuf>,
+    pub db_locations: HashSet<Location>,
+    pub fs_locations: HashSet<Location>,
 }
 
 impl TrackChange {
-    pub fn new_locations(&self) -> HashSet<PathBuf> {
+    pub fn new_locations(&self) -> HashSet<Location> {
         &self.fs_locations - &self.db_locations
     }
 
-    pub fn deleted_locations(&self) -> HashSet<PathBuf> {
+    pub fn deleted_locations(&self) -> HashSet<Location> {
         &self.db_locations - &self.fs_locations
     }
 
@@ -60,13 +63,14 @@ pub struct DBSnapshot {
 pub struct Storage {
     pub(crate) db: rusqlite::Connection,
     source: LibrarySource,
+    fs: FileStorage,
 }
 
 #[derive(Debug)]
 pub struct TrackListEntry {
     pub track_id: TrackId,
-    pub available_files: Vec<PathBuf>,
-    pub unavailable_files: Vec<PathBuf>,
+    pub available_files: Vec<Location>,
+    pub unavailable_files: Vec<Location>,
 }
 
 pub const DB_PATH_SEPARATOR: &str = "/";
@@ -88,14 +92,29 @@ impl Storage {
         db_config: config::Database,
         lib_config: LibrarySource,
     ) -> Result<Self, StorageError> {
-        let db: rusqlite::Connection = db::open(&db_config)?;
-        Ok(Self::from_existing_conn(db, lib_config))
+        let mut fs = FileStorage::new();
+        let db_config = match db_config {
+            config::Database::InMemory => DBConfig::InMemory,
+            config::Database::OnDisk { location } => DBConfig::OnDisk {
+                location: fs.loc_resolver.resolve(&location).map_err(|e| {
+                    StorageError::Internal(anyhow!("Failed to resolve DB location: {e}"))
+                })?,
+            },
+        };
+
+        let db: rusqlite::Connection = db::open(db_config)?;
+        Ok(Self {
+            db,
+            source: lib_config,
+            fs: FileStorage::new(),
+        })
     }
 
     fn from_existing_conn(db: rusqlite::Connection, lib_config: LibrarySource) -> Self {
         Self {
             db,
             source: lib_config,
+            fs: FileStorage::new(),
         }
     }
 
@@ -103,15 +122,18 @@ impl Storage {
         let tx = self.db.transaction()?;
 
         let (files, updated_at) = {
-            let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID}, {PATH} FROM {FILES}"))?;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {TRACK_ID}, {USB_LABEL}, {PATH} FROM {FILES}"
+            ))?;
             let files = stmt
                 .query_map([], |row| {
                     let track_id_hex: String = row.get(0)?;
-                    let path: String = row.get(1)?;
+                    let usb_label: String = row.get(1)?;
+                    let path: String = row.get(2)?;
 
                     Ok((
                         TrackId::from_hex(&track_id_hex).map_err(|e| StorageError::Internal(e)),
-                        path.into(),
+                        LocationRow { usb_label, path }.into(),
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -190,7 +212,7 @@ impl Storage {
     /// Returns the number of files actually inserted.
     pub fn insert_tracks(
         &mut self,
-        tracks_with_files: impl IntoIterator<Item = (TrackId, PathBuf)>,
+        tracks_with_files: impl IntoIterator<Item = (TrackId, Location)>,
     ) -> Result<usize, StorageError> {
         let tx = self.db.transaction()?; // start a transaction
         let mut files_inserted = 0;
@@ -204,21 +226,23 @@ impl Storage {
                 params![&track_id_str],
             )?;
 
-            let path_str = path_to_string(&path);
+            let loc: LocationRow = LocationRow::from_location(path.clone())?;
 
             // ---------- Insert file (must NOT already exist) ----------
             let inserted = tx
                 .execute(
-                    "INSERT INTO files (path, track_id) VALUES (?1, ?2)",
-                    params![&path_str, &track_id_str],
+                    &format!(
+                        "INSERT INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}) VALUES (?1, ?2, ?3)"
+                    ),
+                    params![&loc.usb_label, &loc.path, &track_id_str],
                 )
                 .map_err(|e| match e {
                     rusqlite::Error::SqliteFailure(ref err, _)
                         if err.code == ErrorCode::ConstraintViolation =>
                     {
-                        StorageError::DuplicatePath {
-                            path: path.clone(),
-                            hint: "Attempted to insert a path that already exists. \
+                        StorageError::DuplicateLocation {
+                            path,
+                            hint: "Attempted to insert a location that already exists. \
                            This usually means the file content changed without renaming. \
                            Consider forgetting the old entry and running update again."
                                 .into(),
@@ -252,7 +276,7 @@ impl Storage {
             .collect::<Vec<_>>();
 
         let inserted =
-            self.insert_tracks(new_files.iter().map(|of| (of.track_id, of.path.clone())))?;
+            self.insert_tracks(new_files.iter().map(|of| (of.track_id, of.loc.clone())))?;
         if inserted != new_files.len() {
             log::error!(
                 "number of inserted tracks not equal to expected diff, inserted = {inserted}, expected = {}",
@@ -268,9 +292,9 @@ impl Storage {
     }
 
     /// checks for new music files not present in database
-    pub fn check_new(&mut self) -> Result<HashMap<TrackId, HashSet<PathBuf>>, StorageError> {
+    pub fn check_new(&mut self) -> Result<HashMap<TrackId, HashSet<Location>>, StorageError> {
         println!("Scanning music on file system...");
-        let fs = FsSnapshot::scan(&self.source)?;
+        let fs = self.fs.scan(&self.source)?;
         println!("Scanning music on database...");
         let db = self.scan_db()?;
         let diff = Self::diff(&fs, &db);
@@ -284,7 +308,7 @@ impl Storage {
     /// checks for tracks without available files.
     ///
     /// ignores tracks that have at least one available file
-    pub fn check_missing(&mut self) -> Result<HashMap<TrackId, HashSet<PathBuf>>, StorageError> {
+    pub fn check_missing(&mut self) -> Result<HashMap<TrackId, HashSet<Location>>, StorageError> {
         let tracks = self.list_tracks()?;
         Ok(tracks
             .into_iter()
@@ -305,7 +329,7 @@ impl Storage {
     /// returns both, and difference between the database and the file system
     fn status(&mut self) -> Result<(FsSnapshot, DBSnapshot, Diff), StorageError> {
         println!("Scanning music on file system...");
-        let fs = FsSnapshot::scan(&self.source)?;
+        let fs = self.fs.scan(&self.source)?;
         println!("Scanning music on database...");
         let db = self.scan_db()?;
         let diff = Self::diff(&fs, &db);
@@ -339,21 +363,23 @@ impl Storage {
         }))
     }
 
-    /// retrieves location of the track, checking that it is present in the file system
+    /// retrieves file of the track, checking that it is a valid music file in the file system
     ///
-    /// If multiple locations point to the same track, chooses one of them.
+    /// If multiple paths point to the same track, chooses one of them.
     pub fn find_track_file(
         &mut self,
         track_id: TrackId,
-    ) -> Result<(TrackId, PathBuf), StorageError> {
+    ) -> Result<(TrackId, PathBuf, Location), StorageError> {
         let paths = (|| {
-            let mut stmt = self
-                .db
-                .prepare("SELECT path FROM files WHERE track_id = ?1")?;
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT {USB_LABEL}, {PATH} FROM files WHERE {TRACK_ID} = ?1"
+            ))?;
 
             Ok(stmt
                 .query_map(params![track_id.to_string()], |row| {
-                    Ok(PathBuf::from(row.get::<_, String>(0)?))
+                    let usb_label = row.get::<_, String>(0)?;
+                    let path = row.get::<_, String>(1)?;
+                    Ok(LocationRow { usb_label, path }.into())
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
         })()
@@ -363,24 +389,43 @@ impl Storage {
             return Err(StorageError::TrackNotFound(track_id));
         }
 
-        if let Some(path) = paths
-            .into_iter()
-            .filter(|p| storage::fs::is_valid_music_path(p))
-            .next()
-        {
-            Ok((track_id, path))
-        } else {
-            Err(StorageError::InvalidTrackFile { track: track_id })
+        let mut unmounted_locations = vec![];
+
+        for loc in paths {
+            let path = self.fs.loc_resolver.resolve(&loc);
+            match path {
+                Ok(p) => {
+                    if storage::fs::is_valid_music_path(&p) {
+                        return Ok((track_id, p, loc));
+                    }
+                }
+                Err(e) => match e {
+                    ResolveError::UsbNotFound { label } => unmounted_locations.push(label),
+                    ResolveError::System(error) => {
+                        return Err(StorageError::Internal(anyhow!(
+                            "Error while resolving location {loc}: {error}"
+                        )));
+                    }
+                },
+            }
         }
+        Err(StorageError::InvalidTrackFile {
+            track: track_id,
+            extra: if !unmounted_locations.is_empty() {
+                format!("following drive labels are unmounted: {unmounted_locations:?}")
+            } else {
+                "".to_string()
+            },
+        })
     }
 
     pub fn find_track_file_with_meta(
         &mut self,
         track: TrackId,
-    ) -> Result<(PathBuf, Option<TrackMetadata>), StorageError> {
-        let (_, path) = self.find_track_file(track)?;
+    ) -> Result<(PathBuf, Location, Option<TrackMetadata>), StorageError> {
+        let (_, path, loc) = self.find_track_file(track)?;
         let meta = self.get_track_metadata(track)?;
-        Ok((path, meta))
+        Ok((path, loc, meta))
     }
 
     fn diff(fs: &FsSnapshot, ds: &DBSnapshot) -> Diff {
@@ -391,12 +436,12 @@ impl Storage {
 
         for file in fs_files {
             if let Some(locs) = locs.get_mut(&file.track_id) {
-                locs.fs_locations.insert(file.path);
+                locs.fs_locations.insert(file.loc);
             } else {
                 locs.insert(
                     file.track_id,
                     TrackChange {
-                        fs_locations: HashSet::from([file.path]),
+                        fs_locations: HashSet::from([file.loc]),
                         db_locations: HashSet::new(),
                     },
                 );
@@ -405,12 +450,12 @@ impl Storage {
 
         for file in db_files {
             if let Some(locs) = locs.get_mut(&file.track_id) {
-                locs.db_locations.insert(file.path);
+                locs.db_locations.insert(file.loc);
             } else {
                 locs.insert(
                     file.track_id,
                     TrackChange {
-                        db_locations: HashSet::from([file.path]),
+                        db_locations: HashSet::from([file.loc]),
                         fs_locations: HashSet::new(),
                     },
                 );
@@ -440,18 +485,18 @@ impl Storage {
         let (fs_snapshot, db_snapshot, _) = self.status()?;
 
         // Map track_id -> available paths on disk
-        let mut available_map: HashMap<TrackId, Vec<PathBuf>> = HashMap::new();
+        let mut available_map: HashMap<TrackId, Vec<Location>> = HashMap::new();
         for file in fs_snapshot.files {
             available_map
                 .entry(file.track_id)
                 .or_default()
-                .push(file.path);
+                .push(file.loc);
         }
 
         // Map track_id -> all paths recorded in DB
-        let mut db_map: HashMap<TrackId, Vec<PathBuf>> = HashMap::new();
+        let mut db_map: HashMap<TrackId, Vec<Location>> = HashMap::new();
         for file in db_snapshot.files {
-            db_map.entry(file.track_id).or_default().push(file.path);
+            db_map.entry(file.track_id).or_default().push(file.loc);
         }
 
         let mut result = Vec::new();
@@ -490,7 +535,7 @@ impl Storage {
         &mut self,
         query: &str,
         no_meta: bool,
-    ) -> Result<HashMap<TrackId, HashSet<String>>, StorageError> {
+    ) -> Result<HashMap<TrackId, HashSet<Location>>, StorageError> {
         let tx = self.db.transaction()?;
 
         let cleaned_query = query.trim().to_lowercase();
@@ -498,25 +543,25 @@ impl Storage {
 
         let mut sql = format!(
             "
-        SELECT f.{TRACK_ID}, f.{PATH}
-        FROM {FILES} f
-        LEFT JOIN {TRACK_METADATA} tm
-            ON f.{TRACK_ID} = tm.{TRACK_ID}
-        WHERE 1=1
-        "
+    SELECT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
+    FROM {FILES} f
+    LEFT JOIN {TRACK_METADATA} tm
+        ON f.{TRACK_ID} = tm.{TRACK_ID}
+    WHERE 1=1
+    "
         );
 
-        // Apply search filter (if query not empty)
+        // Apply search filter
         if !cleaned_query.is_empty() {
             sql.push_str(&format!(
                 "
-            AND (
-                LOWER(f.{PATH}) LIKE ?1 OR
-                LOWER(f.{TRACK_ID}) LIKE ?1 OR
-                LOWER(tm.{ARTIST}) LIKE ?1 OR
-                LOWER(tm.{TITLE}) LIKE ?1
-            )
-            "
+        AND (
+            LOWER(f.{PATH}) LIKE ?1 OR
+            LOWER(f.{TRACK_ID}) LIKE ?1 OR
+            LOWER(tm.{ARTIST}) LIKE ?1 OR
+            LOWER(tm.{TITLE}) LIKE ?1
+        )
+        "
             ));
         }
 
@@ -530,10 +575,14 @@ impl Storage {
         let results = if !cleaned_query.is_empty() {
             stmt.query_map([like_query], |row| {
                 let track_id_hex: String = row.get(0)?;
-                let path: String = row.get(1)?;
+                let usb_label: String = row.get(1)?;
+                let path: String = row.get(2)?;
 
                 match TrackId::from_hex(&track_id_hex) {
-                    Ok(track_id) => Ok(Some((track_id, path))),
+                    Ok(track_id) => {
+                        let loc: Location = LocationRow { usb_label, path }.into();
+                        Ok(Some((track_id, loc)))
+                    }
                     Err(_) => {
                         log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
                         Ok(None)
@@ -545,10 +594,14 @@ impl Storage {
         } else {
             stmt.query_map([], |row| {
                 let track_id_hex: String = row.get(0)?;
-                let path: String = row.get(1)?;
+                let usb_label: String = row.get(1)?;
+                let path: String = row.get(2)?;
 
                 match TrackId::from_hex(&track_id_hex) {
-                    Ok(track_id) => Ok(Some((track_id, path))),
+                    Ok(track_id) => {
+                        let loc: Location = LocationRow { usb_label, path }.into();
+                        Ok(Some((track_id, loc)))
+                    }
                     Err(_) => {
                         log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
                         Ok(None)
@@ -558,10 +611,12 @@ impl Storage {
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()?
         };
+
         drop(stmt);
         tx.commit()?;
 
-        let mut map: HashMap<_, HashSet<_>> = HashMap::new();
+        // build map
+        let mut map: HashMap<TrackId, HashSet<Location>> = HashMap::new();
 
         for (key, value) in results {
             map.entry(key).or_default().insert(value);
@@ -575,9 +630,13 @@ impl Storage {
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
         let tx = self.db.transaction()?;
 
-        let prefix = path_to_string(path);
+        let path_prefix = replace_windows_slashes(path);
 
-        let dir_prefix = format!("{}{}%", prefix, DB_PATH_SEPARATOR);
+        let dir_prefix = if path_prefix.ends_with(DB_PATH_SEPARATOR) {
+            path_prefix.clone()
+        } else {
+            format!("{}{}%", path_prefix, DB_PATH_SEPARATOR)
+        };
         // --------------------------------------------------
         // Collect affected track ids BEFORE deletion
         // --------------------------------------------------
@@ -588,7 +647,9 @@ impl Storage {
         ))?;
 
         let affected_track_ids = stmt
-            .query_map(params![prefix, dir_prefix], |row| row.get::<_, String>(0))?
+            .query_map(params![path_prefix, dir_prefix], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
 
         drop(stmt);
@@ -604,7 +665,7 @@ impl Storage {
                 "DELETE FROM {FILES}
              WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
             ),
-            params![prefix, dir_prefix],
+            params![path_prefix, dir_prefix],
         )?;
 
         // --------------------------------------------------
@@ -772,12 +833,61 @@ impl Storage {
     }
 }
 
-/// converts a path to string with forward slashes.
-///
-/// Must be used on both windows and linux to keep path representation consistent
-/// within the database
-pub fn path_to_string(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', DB_PATH_SEPARATOR)
+/// DB format of storing file location
+#[derive(Debug)]
+struct LocationRow {
+    /// present if file is stored on usb, empty otherwise
+    usb_label: String,
+    /// relative path if stored on usb, absolute otherwise
+    path: String,
+}
+
+impl LocationRow {
+    pub fn is_usb(&self) -> bool {
+        !self.usb_label.is_empty()
+    }
+}
+
+fn replace_windows_slashes(s: &Path) -> String {
+    s.to_string_lossy().replace('\\', DB_PATH_SEPARATOR)
+}
+
+impl LocationRow {
+    pub fn from_location(value: Location) -> Result<LocationRow, StorageError> {
+        Ok(match value {
+            Location::File { path } => LocationRow {
+                usb_label: String::new(),
+                path: replace_windows_slashes(&path),
+            },
+            Location::Usb { label, path } => {
+                if label.is_empty() {
+                    return Err(StorageError::Internal(anyhow!(
+                        "location usb label can't be empty ({path:?})"
+                    )));
+                } else {
+                    LocationRow {
+                        usb_label: label,
+                        path: replace_windows_slashes(&path),
+                    }
+                }
+            }
+        })
+    }
+}
+
+impl Into<Location> for LocationRow {
+    fn into(self) -> Location {
+        let is_usb = self.is_usb();
+        let path = PathBuf::from(self.path);
+        if is_usb {
+            Location::Usb {
+                label: self.usb_label,
+                path,
+            }
+        } else {
+            Location::File { path }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -809,8 +919,11 @@ mod tests {
             self,
             error::StorageError,
             fs::{FsSnapshot, ObservedFile},
-            operations::{DBSnapshot, Diff, MetadataUpdate, Storage, TrackChange, path_to_string},
+            operations::{
+                DBSnapshot, Diff, MetadataUpdate, Storage, TrackChange, replace_windows_slashes,
+            },
             schema::{self, *},
+            usb::LocationResolver,
         },
     };
 
@@ -852,9 +965,10 @@ mod tests {
     fn insert_track_files<S: AsRef<str>>(
         conn: &Connection,
         tracks: impl IntoIterator<Item = (TrackId, S)>,
+        usb_label: Option<String>,
     ) {
         for (track, path) in tracks {
-            insert_file(&conn, &track.to_string(), path.as_ref());
+            insert_file(&conn, &track.to_string(), path.as_ref(), &usb_label);
         }
     }
 
@@ -865,7 +979,7 @@ mod tests {
         schema::init(&conn)?;
 
         insert_tracks(&mut conn, [mock_trackid(1)]);
-        insert_track_files(&mut conn, [(mock_trackid(1), "song.mp3")]);
+        insert_track_files(&mut conn, [(mock_trackid(1), "song.mp3")], None);
 
         conn.execute(
             &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
@@ -877,7 +991,7 @@ mod tests {
         let snapshot = storage.scan_db()?;
 
         assert_eq!(snapshot.files.len(), 1);
-        assert_eq!(snapshot.files[0].path, PathBuf::from("song.mp3"));
+        assert_eq!(snapshot.files[0].loc, Location::from_path("song.mp3"));
         assert_eq!(snapshot.updated_at, 200);
 
         Ok(())
@@ -887,8 +1001,8 @@ mod tests {
     fn test_diff_simple() -> anyhow::Result<()> {
         let fs_snapshot = FsSnapshot {
             files: vec![
-                ObservedFile::new(mock_trackid(1), "a.mp3".into()), // same as DB
-                ObservedFile::new(mock_trackid(3), "c.mp3".into()), // new
+                ObservedFile::new(mock_trackid(1), Location::from_path("a.mp3")), // same as DB
+                ObservedFile::new(mock_trackid(3), Location::from_path("c.mp3")), // new
             ],
             observed_at: SystemTime::now(),
         };
@@ -896,8 +1010,8 @@ mod tests {
         let db_snapshot = DBSnapshot {
             updated_at: 100,
             files: vec![
-                ObservedFile::new(mock_trackid(1), "a.mp3".into()), // same as FS
-                ObservedFile::new(mock_trackid(2), "b.mp3".into()), // deleted in FS
+                ObservedFile::new(mock_trackid(1), Location::from_path("a.mp3")), // same as FS
+                ObservedFile::new(mock_trackid(2), Location::from_path("b.mp3")), // deleted in FS
             ],
         };
 
@@ -911,12 +1025,12 @@ mod tests {
                 .get(&mock_trackid(2))
                 .unwrap()
                 .deleted_locations(),
-            HashSet::from([PathBuf::from("b.mp3")])
+            HashSet::from([Location::from_path("b.mp3")])
         );
 
         assert_eq!(
             diff_result.get(&mock_trackid(3)).unwrap().new_locations(),
-            HashSet::from([PathBuf::from("c.mp3")])
+            HashSet::from([Location::from_path("c.mp3")])
         );
 
         Ok(())
@@ -928,21 +1042,21 @@ mod tests {
         let db_snapshot = DBSnapshot {
             updated_at: 100,
             files: vec![
-                ObservedFile::new(mock_trackid(1), "a.mp3".into()), // will be moved
-                ObservedFile::new(mock_trackid(2), "b1.mp3".into()), // will stay
-                ObservedFile::new(mock_trackid(2), "b2.mp3".into()), // will be removed
-                ObservedFile::new(mock_trackid(3), "c1.mp3".into()), // will be copied
+                ObservedFile::new(mock_trackid(1), Location::from_path("a.mp3")), // will be moved
+                ObservedFile::new(mock_trackid(2), Location::from_path("b1.mp3")), // will stay
+                ObservedFile::new(mock_trackid(2), Location::from_path("b2.mp3")), // will be removed
+                ObservedFile::new(mock_trackid(3), Location::from_path("c1.mp3")), // will be copied
             ],
         };
 
         // FS snapshot (filesystem reality)
         let fs_snapshot = FsSnapshot {
             files: vec![
-                ObservedFile::new(mock_trackid(1), "a_new.mp3".into()), // moved
-                ObservedFile::new(mock_trackid(2), "b1.mp3".into()),    // stayed
-                ObservedFile::new(mock_trackid(3), "c1.mp3".into()),    // stayed
-                ObservedFile::new(mock_trackid(3), "c2.mp3".into()),    // copied
-                ObservedFile::new(mock_trackid(4), "d.mp3".into()),     // brand new
+                ObservedFile::new(mock_trackid(1), Location::from_path("a_new.mp3")), // moved
+                ObservedFile::new(mock_trackid(2), Location::from_path("b1.mp3")),    // stayed
+                ObservedFile::new(mock_trackid(3), Location::from_path("c1.mp3")),    // stayed
+                ObservedFile::new(mock_trackid(3), Location::from_path("c2.mp3")),    // copied
+                ObservedFile::new(mock_trackid(4), Location::from_path("d.mp3")),     // brand new
             ],
             observed_at: SystemTime::now(),
         };
@@ -952,14 +1066,14 @@ mod tests {
         // Track 1 moved → old path deleted, new path new
         assert_eq!(
             diff_result.get(&mock_trackid(1)).unwrap().new_locations(),
-            HashSet::from([PathBuf::from("a_new.mp3")])
+            HashSet::from([Location::from_path("a_new.mp3")])
         );
         assert_eq!(
             diff_result
                 .get(&mock_trackid(1))
                 .unwrap()
                 .deleted_locations(),
-            HashSet::from([PathBuf::from("a.mp3")])
+            HashSet::from([Location::from_path("a.mp3")])
         );
 
         // Track 2 → b2.mp3 deleted
@@ -968,19 +1082,19 @@ mod tests {
                 .get(&mock_trackid(2))
                 .unwrap()
                 .deleted_locations(),
-            HashSet::from([PathBuf::from("b2.mp3")])
+            HashSet::from([Location::from_path("b2.mp3")])
         );
 
         // Track 3 → copy c2.mp3 added
         assert_eq!(
             diff_result.get(&mock_trackid(3)).unwrap().new_locations(),
-            HashSet::from([PathBuf::from("c2.mp3")])
+            HashSet::from([Location::from_path("c2.mp3")])
         );
 
         // Track 4 → new file
         assert_eq!(
             diff_result.get(&mock_trackid(4)).unwrap().new_locations(),
-            HashSet::from([PathBuf::from("d.mp3")])
+            HashSet::from([Location::from_path("d.mp3")])
         );
 
         Ok(())
@@ -996,6 +1110,7 @@ mod tests {
         insert_track_files(
             &mut conn,
             [(mock_trackid(1), "a.mp3"), (mock_trackid(2), "b1.mp3")],
+            None,
         );
 
         // Prepare a diff
@@ -1005,8 +1120,11 @@ mod tests {
         diff_result.insert(
             mock_trackid(1),
             TrackChange {
-                fs_locations: HashSet::from([PathBuf::from("a_new.mp3"), PathBuf::from("a.mp3")]),
-                db_locations: HashSet::from([PathBuf::from("a.mp3")]),
+                fs_locations: HashSet::from([
+                    Location::from_path("a_new.mp3"),
+                    Location::from_path("a.mp3"),
+                ]),
+                db_locations: HashSet::from([Location::from_path("a.mp3")]),
             },
         );
 
@@ -1014,8 +1132,11 @@ mod tests {
         diff_result.insert(
             mock_trackid(2),
             TrackChange {
-                fs_locations: HashSet::from([PathBuf::from("b1.mp3"), PathBuf::from("b2.mp3")]),
-                db_locations: HashSet::from([PathBuf::from("b1.mp3")]),
+                fs_locations: HashSet::from([
+                    Location::from_path("b1.mp3"),
+                    Location::from_path("b2.mp3"),
+                ]),
+                db_locations: HashSet::from([Location::from_path("b1.mp3")]),
             },
         );
 
@@ -1024,7 +1145,7 @@ mod tests {
             mock_trackid(3),
             TrackChange {
                 db_locations: HashSet::new(),
-                fs_locations: HashSet::from([PathBuf::from("c.mp3")]),
+                fs_locations: HashSet::from([Location::from_path("c.mp3")]),
             },
         );
 
@@ -1041,29 +1162,29 @@ mod tests {
             .files
             .iter()
             .filter(|f| f.track_id == mock_trackid(1))
-            .map(|f| f.path.clone())
+            .map(|f| f.loc.clone())
             .collect();
-        assert!(t1_files.contains(&PathBuf::from("a.mp3")));
-        assert!(t1_files.contains(&PathBuf::from("a_new.mp3")));
+        assert!(t1_files.contains(&Location::from_path("a.mp3")));
+        assert!(t1_files.contains(&Location::from_path("a_new.mp3")));
 
         // Track 2 has both copies
         let t2_files: Vec<_> = db_snapshot
             .files
             .iter()
             .filter(|f| f.track_id == mock_trackid(2))
-            .map(|f| f.path.clone())
+            .map(|f| f.loc.clone())
             .collect();
-        assert!(t2_files.contains(&PathBuf::from("b1.mp3")));
-        assert!(t2_files.contains(&PathBuf::from("b2.mp3")));
+        assert!(t2_files.contains(&Location::from_path("b1.mp3")));
+        assert!(t2_files.contains(&Location::from_path("b2.mp3")));
 
         // Track 3 has the new file
         let t3_files: Vec<_> = db_snapshot
             .files
             .iter()
             .filter(|f| f.track_id == mock_trackid(3))
-            .map(|f| f.path.clone())
+            .map(|f| f.loc.clone())
             .collect();
-        assert_eq!(t3_files, vec![PathBuf::from("c.mp3")]);
+        assert_eq!(t3_files, vec![Location::from_path("c.mp3")]);
 
         Ok(())
     }
@@ -1076,11 +1197,11 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, Default::default());
         let err = storage
             .insert_tracks([
-                (mock_trackid(1), PathBuf::from("a.mp3")),
-                (mock_trackid(2), PathBuf::from("a.mp3")),
+                (mock_trackid(1), Location::from_path("a.mp3")),
+                (mock_trackid(2), Location::from_path("a.mp3")),
             ])
             .unwrap_err();
-        assert!(matches!(err, StorageError::DuplicatePath { .. }));
+        assert!(matches!(err, StorageError::DuplicateLocation { .. }));
         Ok(())
     }
 
@@ -1098,14 +1219,67 @@ mod tests {
         let track_id = mock_trackid(1);
 
         insert_tracks(&mut conn, [track_id]);
-        insert_track_files(&mut conn, [(track_id, &path_to_string(&file_path))]);
+        insert_track_files(
+            &mut conn,
+            [(track_id, &replace_windows_slashes(&file_path))],
+            None,
+        );
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let (track, path) = storage.find_track_file(track_id)?;
+        let (track, path, _) = storage.find_track_file(track_id)?;
 
         assert_eq!(track, track_id);
         assert_eq!(path, file_path);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_track_success_usb() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        let temp = tempdir()?;
+
+        // simulate USB mount root
+        let usb_mount = temp.path().join("usb");
+        std::fs::create_dir_all(&usb_mount)?;
+
+        // actual file inside USB
+        let file_path = usb_mount.join("song.mp3");
+        std::fs::write(&file_path, b"x")?;
+
+        let track_id = mock_trackid(1);
+
+        // insert USB location into DB
+        let usb_label = "DJ_USB";
+
+        insert_tracks(&mut conn, [track_id]);
+        insert_track_files(
+            &mut conn,
+            [(track_id, "song.mp3")],
+            Some(usb_label.to_string()),
+        );
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        // mock resolver
+        storage.fs.loc_resolver =
+            LocationResolver::test_resolver([(usb_label.to_string(), usb_mount.clone())]);
+
+        let (track, path, loc) = storage.find_track_file(track_id)?;
+
+        assert_eq!(track, track_id);
+        assert_eq!(path, file_path);
+
+        match loc {
+            Location::Usb { label, path } => {
+                assert_eq!(label, usb_label);
+                assert_eq!(path, PathBuf::from("song.mp3"));
+            }
+            _ => panic!("expected USB location"),
+        }
 
         Ok(())
     }
@@ -1123,7 +1297,11 @@ mod tests {
         let track_id = mock_trackid(3);
 
         insert_tracks(&mut conn, [track_id]);
-        insert_track_files(&mut conn, [(track_id, path_to_string(&bad_path))]);
+        insert_track_files(
+            &mut conn,
+            [(track_id, &replace_windows_slashes(&bad_path))],
+            None,
+        );
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
@@ -1153,14 +1331,15 @@ mod tests {
         insert_track_files(
             &mut conn,
             [
-                (track_id, path_to_string(&bad)),
-                (track_id, path_to_string(&good)),
+                (track_id, replace_windows_slashes(&bad)),
+                (track_id, replace_windows_slashes(&good)),
             ],
+            None,
         );
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let (_, path) = storage.find_track_file(track_id)?;
+        let (_, path, _) = storage.find_track_file(track_id)?;
 
         assert_eq!(path, good);
 
@@ -1235,14 +1414,18 @@ mod tests {
         let track_id = TrackId::from_file(&path)?;
 
         insert_tracks(&mut storage.db, [track_id]);
-        insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+        insert_track_files(
+            &mut storage.db,
+            [(track_id, replace_windows_slashes(&path))],
+            None,
+        );
 
         let tracks = storage.list_tracks()?;
         assert_eq!(tracks.len(), 1);
 
         let entry = &tracks[0];
         assert_eq!(entry.track_id, track_id);
-        assert_eq!(entry.available_files, vec![path.clone()]);
+        assert_eq!(entry.available_files, vec![Location::from_path(path)]);
         assert!(entry.unavailable_files.is_empty());
 
         Ok(())
@@ -1264,9 +1447,10 @@ mod tests {
         insert_track_files(
             &mut storage.db,
             [
-                (track_id, path_to_string(&available_path)),
-                (track_id, path_to_string(&unavailable_path)),
+                (track_id, replace_windows_slashes(&available_path)),
+                (track_id, replace_windows_slashes(&unavailable_path)),
             ],
+            None,
         );
 
         let tracks = storage.list_tracks()?;
@@ -1274,8 +1458,14 @@ mod tests {
 
         let entry = &tracks[0];
         assert_eq!(entry.track_id, track_id);
-        assert_eq!(entry.available_files, vec![available_path.clone()]);
-        assert_eq!(entry.unavailable_files, vec![unavailable_path.clone()]);
+        assert_eq!(
+            entry.available_files,
+            vec![Location::from_path(available_path)]
+        );
+        assert_eq!(
+            entry.unavailable_files,
+            vec![Location::from_path(unavailable_path)]
+        );
 
         Ok(())
     }
@@ -1290,7 +1480,11 @@ mod tests {
         let track_id = TrackId::from_bytes(&[0, 1, 2]);
 
         insert_tracks(&mut storage.db, [track_id]);
-        insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+        insert_track_files(
+            &mut storage.db,
+            [(track_id, replace_windows_slashes(&path))],
+            None,
+        );
 
         let tracks = storage.list_tracks()?;
         assert_eq!(tracks.len(), 1);
@@ -1298,20 +1492,20 @@ mod tests {
         let entry = &tracks[0];
         assert_eq!(entry.track_id, track_id);
         assert!(entry.available_files.is_empty());
-        assert_eq!(entry.unavailable_files, vec![path.clone()]);
+        assert_eq!(entry.unavailable_files, vec![Location::from_path(path)]);
 
         Ok(())
     }
 
-    fn assert_files<I>(results: &HashMap<TrackId, HashSet<String>>, expected: I)
+    fn assert_files<I>(results: &HashMap<TrackId, HashSet<Location>>, expected: I)
     where
         I: IntoIterator<Item = (TrackId, Vec<&'static str>)>,
     {
         for (id, files) in expected {
             let expected_set: HashSet<String> = files.into_iter().map(|s| s.to_string()).collect();
-            let actual_set = &results[&id];
+            let actual_set: HashSet<String> = results[&id].iter().map(|l| l.to_string()).collect();
             assert_eq!(
-                actual_set, &expected_set,
+                actual_set, expected_set,
                 "Files for track {:?} do not match exactly",
                 id
             );
@@ -1334,7 +1528,7 @@ mod tests {
             &mut conn,
             [mock_trackid(1), mock_trackid(2), mock_trackid(3)],
         );
-        insert_track_files(&mut conn, data);
+        insert_track_files(&mut conn, data, None);
 
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
@@ -1384,6 +1578,7 @@ mod tests {
                 (mock_trackid(2), "bar.mp3"),
                 (mock_trackid(3), "baz.mp3"),
             ],
+            None,
         );
 
         // --- Insert metadata manually (ONLY for 1 and 2) ---
@@ -1424,10 +1619,10 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    fn insert_file(conn: &Connection, track_id: &str, path: &str) {
+    fn insert_file(conn: &Connection, track_id: &str, path: &str, usb_label: &Option<String>) {
         conn.execute(
-            &format!("INSERT INTO {FILES} (track_id, path) VALUES (?1, ?2)"),
-            params![track_id, path],
+            &format!("INSERT INTO {FILES} (track_id, usb_label, path) VALUES (?1, ?2, ?3)"),
+            params![track_id, usb_label.clone().unwrap_or(String::new()), path],
         )
         .unwrap();
     }
@@ -1450,7 +1645,7 @@ mod tests {
         ];
 
         insert_tracks(&storage.db, tracks);
-        insert_track_files(&storage.db, track_files);
+        insert_track_files(&storage.db, track_files, None);
 
         // Forget top-level directory
         let path_to_forget = Path::new("/music");
@@ -1488,7 +1683,7 @@ mod tests {
         ];
 
         insert_tracks(&storage.db, tracks);
-        insert_track_files(&storage.db, track_files);
+        insert_track_files(&storage.db, track_files, None);
 
         let path_to_forget = Path::new("C:\\music\\subdir");
         let report = storage.forget_path(path_to_forget).unwrap();
@@ -1839,9 +2034,10 @@ mod tests {
         use tempfile::tempdir;
 
         use crate::{
+            config::Location,
             domain::hash::TrackId,
             storage::operations::{
-                path_to_string,
+                replace_windows_slashes,
                 tests::{insert_track_files, insert_tracks, mock_trackid, setup_storage},
             },
         };
@@ -1857,7 +2053,11 @@ mod tests {
             let track_id = TrackId::from_file(&path)?;
 
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
 
             let diff = storage.check_new()?;
             assert!(diff.is_empty());
@@ -1881,7 +2081,7 @@ mod tests {
 
             assert_eq!(diff.len(), 1);
             assert!(diff.contains_key(&track_id));
-            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
+            assert_eq!(diff[&track_id], HashSet::from([Location::from_path(path)]));
 
             Ok(())
         }
@@ -1901,12 +2101,16 @@ mod tests {
 
             // DB only knows about first path
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path1))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path1))],
+                None,
+            );
 
             let diff = storage.check_new()?;
 
             assert_eq!(diff.len(), 1);
-            assert_eq!(diff[&track_id], HashSet::from([path2.clone()]));
+            assert_eq!(diff[&track_id], HashSet::from([Location::from_path(path2)]));
 
             Ok(())
         }
@@ -1920,7 +2124,11 @@ mod tests {
             let track_id = mock_trackid(123); // file not created
 
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
 
             let diff = storage.check_new()?;
 
@@ -1940,7 +2148,11 @@ mod tests {
             let track_id = TrackId::from_file(&path)?;
 
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
 
             let diff = storage.check_missing()?;
             assert!(diff.is_empty());
@@ -1959,13 +2171,17 @@ mod tests {
             let track_id = mock_trackid(123);
 
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
 
             let diff = storage.check_missing()?;
 
             assert_eq!(diff.len(), 1);
             assert!(diff.contains_key(&track_id));
-            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
+            assert_eq!(diff[&track_id], HashSet::from([Location::from_path(path)]));
 
             Ok(())
         }
@@ -1986,9 +2202,10 @@ mod tests {
             insert_track_files(
                 &mut storage.db,
                 [
-                    (track_id, path_to_string(&available)),
-                    (track_id, path_to_string(&missing)),
+                    (track_id, replace_windows_slashes(&available)),
+                    (track_id, replace_windows_slashes(&missing)),
                 ],
+                None,
             );
 
             let diff = storage.check_missing()?;
@@ -2011,15 +2228,77 @@ mod tests {
             let track_id = TrackId::from_file(&renamed)?;
 
             insert_tracks(&mut storage.db, [track_id]);
-            insert_track_files(&mut storage.db, [(track_id, path_to_string(&path))]);
+            insert_track_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
 
             let diff = storage.check_missing()?;
 
             assert_eq!(diff.len(), 1);
             assert!(diff.contains_key(&track_id));
-            assert_eq!(diff[&track_id], HashSet::from([path.clone()]));
+            assert_eq!(diff[&track_id], HashSet::from([Location::from_path(path)]));
 
             Ok(())
+        }
+    }
+
+    mod usb_conversion {
+        use std::path::PathBuf;
+
+        use crate::{
+            config::Location,
+            storage::{error::StorageError, operations::LocationRow},
+        };
+
+        #[test]
+        fn empty_usb_label_error() {
+            let location = Location::Usb {
+                label: "".to_string(),
+                path: PathBuf::from("hello"),
+            };
+
+            assert!(matches!(
+                LocationRow::from_location(location).unwrap_err(),
+                StorageError::Internal(..)
+            ));
+        }
+
+        #[test]
+        fn test_location_file_roundtrip() {
+            let original = Location::File {
+                path: PathBuf::from("/home/user/music/song.mp3"),
+            };
+
+            let row: LocationRow = LocationRow::from_location(original.clone()).unwrap();
+            let restored: Location = row.into();
+
+            match restored {
+                Location::File { path } => {
+                    assert_eq!(path, PathBuf::from("/home/user/music/song.mp3"));
+                }
+                Location::Usb { .. } => panic!("expected File variant, got Usb"),
+            }
+        }
+
+        #[test]
+        fn test_location_usb_roundtrip() {
+            let original = Location::Usb {
+                label: "DJ_USB".to_string(),
+                path: PathBuf::from("music/song.mp3"),
+            };
+
+            let row: LocationRow = LocationRow::from_location(original.clone()).unwrap();
+            let restored: Location = row.into();
+
+            match restored {
+                Location::Usb { label, path } => {
+                    assert_eq!(label, "DJ_USB");
+                    assert_eq!(path, PathBuf::from("music/song.mp3"));
+                }
+                Location::File { .. } => panic!("expected Usb variant, got File"),
+            }
         }
     }
 }

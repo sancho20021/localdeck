@@ -29,12 +29,12 @@ impl From<StorageError> for ApiError {
                 ApiError::NotFound(format!("track {} not found", id))
             }
 
-            StorageError::InvalidTrackFile { track } => {
-                ApiError::BadRequest(format!("track {} has no valid files", track))
+            StorageError::InvalidTrackFile { track, extra } => {
+                ApiError::BadRequest(format!("track {track} has no valid files: {extra}"))
             }
 
             StorageError::InvalidTrackId => ApiError::BadRequest("invalid track id".into()),
-            StorageError::DuplicatePath { .. } => ApiError::BadRequest(err.to_string()),
+            StorageError::DuplicateLocation { .. } => ApiError::BadRequest(err.to_string()),
 
             StorageError::Database(_) | StorageError::Fs(_) | StorageError::Internal(_) => {
                 ApiError::Internal("internal server error".into())

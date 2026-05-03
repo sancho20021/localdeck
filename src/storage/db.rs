@@ -1,5 +1,5 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -7,10 +7,12 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Local};
 use rusqlite::Connection;
 
-use crate::{
-    config::Database,
-    storage::{error::StorageError, resolve_location, schema},
-};
+use crate::storage::{error::StorageError, schema};
+
+pub enum DBConfig {
+    InMemory,
+    OnDisk { location: PathBuf },
+}
 
 pub type SecondsSinceUnix = i64;
 
@@ -22,13 +24,10 @@ fn open_from_file(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> 
     Connection::open(path)
 }
 
-pub fn open(config: &Database) -> Result<rusqlite::Connection, StorageError> {
+pub fn open(config: DBConfig) -> Result<rusqlite::Connection, StorageError> {
     let db = match config {
-        Database::InMemory => open_in_memory()?,
-        Database::OnDisk { location } => {
-            let path = resolve_location(location).map_err(StorageError::Internal)?;
-            open_from_file(&path)?
-        }
+        DBConfig::InMemory => open_in_memory()?,
+        DBConfig::OnDisk { location } => open_from_file(&location)?,
     };
     db.pragma_update(None, "foreign_keys", true)?;
     schema::init(&db)?;
@@ -56,14 +55,14 @@ pub fn i64_seconds_to_local_time(since_unix: i64) -> anyhow::Result<DateTime<Loc
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        config::Database,
-        storage::{db::open, schema},
+    use crate::storage::{
+        db::{DBConfig, open},
+        schema,
     };
 
     #[test]
     fn open_in_memory_db_initializes_schema() {
-        let db = open(&Database::InMemory).unwrap();
+        let db = open(DBConfig::InMemory).unwrap();
 
         let mut stmt = db
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
