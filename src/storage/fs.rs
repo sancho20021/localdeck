@@ -6,10 +6,15 @@ use walkdir::WalkDir;
 
 use std::{
     collections::HashSet,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
+
+#[cfg(not(target_os = "windows"))]
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
 
 use crate::{
     config::{self, Location},
@@ -106,7 +111,12 @@ impl FileStorage {
                         ))
                     })?
                     .as_secs() as i64;
+
+                #[cfg(not(target_os = "windows"))]
                 let file_size = metadata.size() as i64;
+
+                #[cfg(target_os = "windows")]
+                let file_size = metadata.file_size() as i64;
 
                 let rel = p.strip_prefix(&root_path).map_err(|_| {
                     StorageError::Internal(anyhow!(

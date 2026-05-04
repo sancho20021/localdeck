@@ -422,12 +422,12 @@ impl Storage {
 
         let mut sql = format!(
             "
-    SELECT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
-    FROM {FILES} f
-    LEFT JOIN {TRACK_METADATA} tm
-        ON f.{TRACK_ID} = tm.{TRACK_ID}
-    WHERE 1=1
-    "
+            SELECT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
+            FROM {FILES} f
+            LEFT JOIN {TRACK_METADATA} tm
+                ON f.{TRACK_ID} = tm.{TRACK_ID}
+            WHERE 1=1
+            "
         );
 
         // Apply search filter
