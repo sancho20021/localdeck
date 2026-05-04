@@ -161,9 +161,8 @@ pub fn run() -> anyhow::Result<()> {
                         if !new.is_empty() {
                             for file in new {
                                 println!(
-                                    "{}\n   modified: {}\n   size: {:.2} MB\n",
+                                    "{}\n   size: {:.2} MB\n",
                                     file.loc,
-                                    file.modified_at_date().unwrap(),
                                     file.size_mb()
                                 );
                             }
@@ -181,9 +180,8 @@ pub fn run() -> anyhow::Result<()> {
                                     println!("Unavailable locations:");
                                     for file in old_locs {
                                         println!(
-                                            "  - {}\n      modified: {}\n      size: {:.2} MB",
+                                            "  - {}\n      size: {:.2} MB",
                                             file.loc,
-                                            file.modified_at_date().unwrap(),
                                             file.size_mb()
                                         );
                                     }

@@ -12,7 +12,7 @@ use crate::{
         hash::TrackId,
         track::{ArtworkRef, Track, TrackMetadata},
     },
-    location::Location,
+    location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
     storage::{
         self,
         db::{self, DBConfig, SecondsSinceUnix, system_time_to_i64},
@@ -46,8 +46,6 @@ pub struct TrackListEntry {
     pub available_files: Vec<Location>,
     pub unavailable_files: Vec<Location>,
 }
-
-pub const DB_PATH_SEPARATOR: &str = "/";
 
 #[derive(Debug)]
 pub struct ForgetReport {
@@ -98,21 +96,19 @@ impl Storage {
 
         let (files, updated_at) = {
             let mut stmt = tx.prepare(&format!(
-                "SELECT {TRACK_ID}, {USB_LABEL}, {PATH}, {MODIFIED_AT}, {FILE_SIZE} FROM {FILES}"
+                "SELECT {TRACK_ID}, {USB_LABEL}, {PATH}, {FILE_SIZE} FROM {FILES}"
             ))?;
             let files = stmt
                 .query_map([], |row| {
                     let track_id_hex: String = row.get(0)?;
                     let usb_label: String = row.get(1)?;
                     let path: String = row.get(2)?;
-                    let modified_at: i64 = row.get(3)?;
-                    let file_size: i64 = row.get(4)?;
+                    let file_size: i64 = row.get(3)?;
 
                     Ok((
                         TrackId::from_hex(&track_id_hex).map_err(|e| StorageError::Internal(e)),
                         FileWithMeta {
                             loc: LocationRow { usb_label, path }.into(),
-                            modified_at,
                             file_size,
                         },
                     ))
@@ -206,34 +202,27 @@ impl Storage {
             let loc: LocationRow = LocationRow::from_location(file.loc.clone())?;
 
             // ---------- Insert file (must NOT already exist) ----------
-            let inserted = tx
-                .execute(
-                    &format!(
-                            "INSERT INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}, {FILE_SIZE}, {MODIFIED_AT})
-                            VALUES (?1, ?2, ?3, ?4, ?5)"
-                        ),
-                    params![
-                        &loc.usb_label,
-                        &loc.path,
-                        &track_id_str,
-                        file.file_size,
-                        file.modified_at,
-                    ],
-                )
-                .map_err(|e| match e {
-                    rusqlite::Error::SqliteFailure(ref err, _)
-                        if err.code == ErrorCode::ConstraintViolation =>
-                    {
-                        StorageError::DuplicateLocation {
-                            path: file.loc,
-                            hint: "Attempted to insert a location that already exists. \
+            tx.execute(
+                &format!(
+                    "INSERT INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}, {FILE_SIZE})
+                            VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![&loc.usb_label, &loc.path, &track_id_str, file.file_size,],
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(ref err, _)
+                    if err.code == ErrorCode::ConstraintViolation =>
+                {
+                    StorageError::DuplicateLocation {
+                        path: file.loc,
+                        hint: "Attempted to insert a location that already exists. \
                            This usually means the file content changed without renaming. \
                            Consider forgetting the old entry and running update again."
-                                .into(),
-                        }
+                            .into(),
                     }
-                    e => StorageError::Database(e),
-                })?;
+                }
+                e => StorageError::Database(e),
+            })?;
         }
         Self::insert_update_time(&tx)?;
 
@@ -511,10 +500,10 @@ impl Storage {
 
         let path_prefix = replace_windows_slashes(path);
 
-        let dir_prefix = if path_prefix.ends_with(DB_PATH_SEPARATOR) {
+        let dir_prefix = if path_prefix.ends_with(LOCATION_PATH_SEP) {
             path_prefix.clone()
         } else {
-            format!("{}{}%", path_prefix, DB_PATH_SEPARATOR)
+            format!("{}{}%", path_prefix, LOCATION_PATH_SEP)
         };
         // --------------------------------------------------
         // Collect affected track ids BEFORE deletion
@@ -727,10 +716,6 @@ impl LocationRow {
     }
 }
 
-fn replace_windows_slashes(s: &Path) -> String {
-    s.to_string_lossy().replace('\\', DB_PATH_SEPARATOR)
-}
-
 impl LocationRow {
     pub fn from_location(value: Location) -> Result<LocationRow, StorageError> {
         Ok(match value {
@@ -804,17 +789,10 @@ mod tests {
         },
     };
 
-    /// returns modified at and file size
-    fn file_meta(path: &Path) -> (i64, i64) {
+    fn file_size(path: &Path) -> i64 {
         let meta = std::fs::metadata(path).unwrap();
         let size = meta.len() as i64;
-        let mtime = meta
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        (mtime, size)
+        size
     }
 
     fn mock_trackid(x: i32) -> TrackId {
@@ -854,18 +832,11 @@ mod tests {
 
     fn insert_fake_files<S: AsRef<str>>(
         conn: &Connection,
-        tracks: impl IntoIterator<Item = (TrackId, S, i64, i64)>,
+        tracks: impl IntoIterator<Item = (TrackId, S, i64)>,
         usb_label: Option<String>,
     ) {
-        for (track, path, mat, fs) in tracks {
-            insert_file(
-                &conn,
-                &track.to_string(),
-                path.as_ref(),
-                &usb_label,
-                mat,
-                fs,
-            );
+        for (track, path, fs) in tracks {
+            insert_file(&conn, &track.to_string(), path.as_ref(), &usb_label, fs);
         }
     }
 
@@ -876,15 +847,8 @@ mod tests {
     ) {
         for (track, path) in tracks {
             let p: &str = path.as_ref();
-            let (mat, fs) = file_meta(p.as_ref());
-            insert_file(
-                &conn,
-                &track.to_string(),
-                path.as_ref(),
-                &usb_label,
-                mat,
-                fs,
-            );
+            let fs = file_size(p.as_ref());
+            insert_file(&conn, &track.to_string(), path.as_ref(), &usb_label, fs);
         }
     }
 
@@ -897,12 +861,7 @@ mod tests {
         insert_tracks(&mut conn, [mock_trackid(1)]);
         insert_fake_files(
             &mut conn,
-            [(
-                mock_trackid(1),
-                "song.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            )],
+            [(mock_trackid(1), "song.mp3", MOCKED_FILE_SIZE)],
             None,
         );
 
@@ -985,13 +944,11 @@ mod tests {
         let file1 = FileWithMeta {
             loc: Location::from_path("a.mp3"),
             file_size: 100,
-            modified_at: 12345,
         };
 
         let file2 = FileWithMeta {
             loc: Location::from_path("b.mp3"),
             file_size: 200,
-            modified_at: 54321,
         };
 
         let mut track1 = mock_trackid(1);
@@ -1005,9 +962,9 @@ mod tests {
         storage.insert_tracks([(track1, file1.clone()), (track2, file2.clone())])?;
 
         // --- verify DB state directly ---
-        let mut stmt = storage.db.prepare(
-            "SELECT track_id, path, file_size, modified_at FROM files ORDER BY track_id",
-        )?;
+        let mut stmt = storage
+            .db
+            .prepare("SELECT track_id, path, file_size FROM files ORDER BY track_id")?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -1015,7 +972,6 @@ mod tests {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1026,13 +982,11 @@ mod tests {
         assert_eq!(rows[0].0, track1.to_string());
         assert_eq!(rows[0].1, "a.mp3");
         assert_eq!(rows[0].2, 100);
-        assert_eq!(rows[0].3, 12345);
 
         // track 2
         assert_eq!(rows[1].0, track2.to_string());
         assert_eq!(rows[1].1, "b.mp3");
         assert_eq!(rows[1].2, 200);
-        assert_eq!(rows[1].3, 54321);
 
         Ok(())
     }
@@ -1046,7 +1000,6 @@ mod tests {
         let file = FileWithMeta {
             loc: Location::from_path("a.mp3"),
             file_size: 39,
-            modified_at: 39,
         };
         let err = storage
             .insert_tracks([(mock_trackid(1), file.clone()), (mock_trackid(2), file)])
@@ -1074,7 +1027,6 @@ mod tests {
             [(
                 track_id,
                 &replace_windows_slashes(&file_path),
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             )],
             None,
@@ -1113,7 +1065,7 @@ mod tests {
         insert_tracks(&mut conn, [track_id]);
         insert_fake_files(
             &mut conn,
-            [(track_id, "song.mp3", MOCKED_MODIFIED_AT, MOCKED_FILE_SIZE)],
+            [(track_id, "song.mp3", MOCKED_FILE_SIZE)],
             Some(usb_label.to_string()),
         );
 
@@ -1157,7 +1109,6 @@ mod tests {
             [(
                 track_id,
                 &replace_windows_slashes(&bad_path),
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             )],
             None,
@@ -1191,18 +1142,8 @@ mod tests {
         insert_fake_files(
             &mut conn,
             [
-                (
-                    track_id,
-                    replace_windows_slashes(&bad),
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                ),
-                (
-                    track_id,
-                    replace_windows_slashes(&good),
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                ),
+                (track_id, replace_windows_slashes(&bad), MOCKED_FILE_SIZE),
+                (track_id, replace_windows_slashes(&good), MOCKED_FILE_SIZE),
             ],
             None,
         );
@@ -1299,19 +1240,16 @@ mod tests {
             (
                 mock_trackid(1),
                 "Some Artist - Track Name.mp3",
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             ),
             (
                 mock_trackid(2),
                 "AnotherArtist_Track Name.flac",
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             ),
             (
                 mock_trackid(3),
                 "completely-different-track.mp3",
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             ),
         ];
@@ -1366,24 +1304,9 @@ mod tests {
         insert_fake_files(
             &mut conn,
             vec![
-                (
-                    mock_trackid(1),
-                    "foo.mp3",
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                ),
-                (
-                    mock_trackid(2),
-                    "bar.mp3",
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                ),
-                (
-                    mock_trackid(3),
-                    "baz.mp3",
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                ),
+                (mock_trackid(1), "foo.mp3", MOCKED_FILE_SIZE),
+                (mock_trackid(2), "bar.mp3", MOCKED_FILE_SIZE),
+                (mock_trackid(3), "baz.mp3", MOCKED_FILE_SIZE),
             ],
             None,
         );
@@ -1427,19 +1350,24 @@ mod tests {
     }
 
     static MOCKED_FILE_SIZE: i64 = 228;
-    static MOCKED_MODIFIED_AT: i64 = 228;
 
     fn insert_file(
         conn: &Connection,
         track_id: &str,
         path: &str,
         usb_label: &Option<String>,
-        modified_at: i64,
         file_size: i64,
     ) {
         conn.execute(
-            &format!("INSERT INTO {FILES} (track_id, usb_label, path, modified_at, file_size) VALUES (?1, ?2, ?3, ?4, ?5)"),
-            params![track_id, usb_label.clone().unwrap_or(String::new()), path, modified_at, file_size],
+            &format!(
+                "INSERT INTO {FILES} (track_id, usb_label, path, file_size) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            params![
+                track_id,
+                usb_label.clone().unwrap_or(String::new()),
+                path,
+                file_size
+            ],
         )
         .unwrap();
     }
@@ -1454,36 +1382,15 @@ mod tests {
 
         let tracks = [mock_trackid(1), mock_trackid(2), mock_trackid(3)];
         let track_files = [
-            (
-                mock_trackid(1),
-                "/music/track_a1.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            ),
+            (mock_trackid(1), "/music/track_a1.mp3", MOCKED_FILE_SIZE),
             (
                 mock_trackid(1),
                 "/music/subdir/track_a2.mp3",
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             ),
-            (
-                mock_trackid(2),
-                "/music/track_b.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            ),
-            (
-                mock_trackid(3),
-                "/hello/track_c.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            ), // outside deleted path
-            (
-                mock_trackid(1),
-                "/hello/track_a3.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            ), // outside deleted path
+            (mock_trackid(2), "/music/track_b.mp3", MOCKED_FILE_SIZE),
+            (mock_trackid(3), "/hello/track_c.mp3", MOCKED_FILE_SIZE), // outside deleted path
+            (mock_trackid(1), "/hello/track_a3.mp3", MOCKED_FILE_SIZE), // outside deleted path
         ];
 
         insert_tracks(&storage.db, tracks);
@@ -1520,16 +1427,10 @@ mod tests {
 
         let tracks = [mock_trackid(1)];
         let track_files = [
-            (
-                mock_trackid(1),
-                "C:/music/track_a1.mp3",
-                MOCKED_MODIFIED_AT,
-                MOCKED_FILE_SIZE,
-            ),
+            (mock_trackid(1), "C:/music/track_a1.mp3", MOCKED_FILE_SIZE),
             (
                 mock_trackid(1),
                 "C:/music/subdir/track_a2.mp3",
-                MOCKED_MODIFIED_AT,
                 MOCKED_FILE_SIZE,
             ),
         ];
@@ -1886,12 +1787,10 @@ mod tests {
         use crate::{
             config::Location,
             domain::hash::TrackId,
-            storage::operations::{
-                replace_windows_slashes,
-                tests::{
-                    MOCKED_FILE_SIZE, MOCKED_MODIFIED_AT, insert_fake_files, insert_real_files,
-                    insert_tracks, mock_trackid, setup_storage,
-                },
+            location::replace_windows_slashes,
+            storage::operations::tests::{
+                MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks,
+                mock_trackid, setup_storage,
             },
         };
 
@@ -1976,12 +1875,7 @@ mod tests {
             insert_tracks(&mut storage.db, [track_id]);
             insert_fake_files(
                 &mut storage.db,
-                [(
-                    track_id,
-                    replace_windows_slashes(&path),
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                )],
+                [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
                 None,
             );
 
@@ -2028,12 +1922,7 @@ mod tests {
             insert_tracks(&mut storage.db, [track_id]);
             insert_fake_files(
                 &mut storage.db,
-                [(
-                    track_id,
-                    replace_windows_slashes(&path),
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                )],
+                [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
                 None,
             );
 
@@ -2071,7 +1960,6 @@ mod tests {
                 [(
                     track_id,
                     replace_windows_slashes(&missing),
-                    MOCKED_MODIFIED_AT,
                     MOCKED_FILE_SIZE,
                 )],
                 None,
@@ -2099,12 +1987,7 @@ mod tests {
             insert_tracks(&mut storage.db, [track_id]);
             insert_fake_files(
                 &mut storage.db,
-                [(
-                    track_id,
-                    replace_windows_slashes(&path),
-                    MOCKED_MODIFIED_AT,
-                    MOCKED_FILE_SIZE,
-                )],
+                [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
                 None,
             );
 

@@ -334,8 +334,6 @@ mod tests {
         mock_trackid(x).to_hex()
     }
 
-    static MOCK_MODIFIED_AT: i64 = 39;
-
     fn create_server_with_tracks<S: AsRef<Path>>(lib_root: S) -> HttpServer {
         let storage = setup_storage(Some(Location::from_path(lib_root))).unwrap();
         {

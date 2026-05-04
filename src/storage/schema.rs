@@ -20,7 +20,6 @@ pub mod columns {
     pub const ARTWORK_URL: &str = "artwork_url";
     pub const USB_LABEL: &str = "usb_label";
     pub const FILE_SIZE: &str = "file_size";
-    pub const MODIFIED_AT: &str = "modified_at";
 }
 
 pub use columns::*;
@@ -36,7 +35,6 @@ CREATE TABLE IF NOT EXISTS files (
     path TEXT NOT NULL,
     track_id TEXT NOT NULL,
     file_size INTEGER NOT NULL,
-    modified_at INTEGER NOT NULL,
     PRIMARY KEY (usb_label, path),
     FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
 );
@@ -58,7 +56,7 @@ CREATE TABLE IF NOT EXISTS track_metadata (
 CREATE INDEX IF NOT EXISTS idx_files_track_id ON files(track_id);
 
 CREATE INDEX IF NOT EXISTS idx_files_fast_lookup
-    ON files(usb_label, path, file_size, modified_at);
+    ON files(usb_label, path, file_size);
 
 CREATE INDEX IF NOT EXISTS idx_track_metadata_artist
     ON track_metadata(artist);

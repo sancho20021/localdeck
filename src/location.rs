@@ -41,11 +41,19 @@ impl Location {
     }
 }
 
+pub const LOCATION_PATH_SEP: &str = "/";
+
+pub fn replace_windows_slashes(s: &Path) -> String {
+    s.to_string_lossy().replace('\\', LOCATION_PATH_SEP)
+}
+
 impl Display for Location {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Location::File { path } => write!(f, "{}", path.to_string_lossy()),
-            Location::Usb { label, path } => write!(f, "USB({})/{}", label, path.to_string_lossy()),
+            Location::File { path } => write!(f, "{}", replace_windows_slashes(path)),
+            Location::Usb { label, path } => {
+                write!(f, "USB({})/{}", label, replace_windows_slashes(path))
+            }
         }
     }
 }

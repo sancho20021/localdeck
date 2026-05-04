@@ -1,25 +1,17 @@
 //! Module to scan music directories in the file system
 
 use anyhow::anyhow;
-use chrono::{DateTime, Local};
 use walkdir::WalkDir;
 
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
-
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::fs::MetadataExt;
-
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::MetadataExt;
 
 use crate::{
     config::{self, Location},
     domain::hash::TrackId,
-    storage::{db::i64_seconds_to_local_time, error::StorageError, usb::LocationResolver},
+    storage::{error::StorageError, usb::LocationResolver},
 };
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
@@ -102,21 +94,8 @@ impl FileStorage {
                         e
                     ))
                 })?;
-                let modified_at = metadata
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| {
-                        StorageError::Internal(anyhow!(
-                            "Modified time of file before UNIX EPOCH: {e}"
-                        ))
-                    })?
-                    .as_secs() as i64;
 
-                #[cfg(not(target_os = "windows"))]
-                let file_size = metadata.size() as i64;
-
-                #[cfg(target_os = "windows")]
-                let file_size = metadata.file_size() as i64;
+                let file_size = metadata.len() as i64;
 
                 let rel = p.strip_prefix(&root_path).map_err(|_| {
                     StorageError::Internal(anyhow!(
@@ -124,11 +103,7 @@ impl FileStorage {
                     ))
                 })?;
                 let loc = root.join(rel);
-                Ok(FileWithMeta {
-                    loc,
-                    file_size,
-                    modified_at,
-                })
+                Ok(FileWithMeta { loc, file_size })
             })
             .collect::<Result<Vec<_>, _>>()
     }
@@ -145,17 +120,11 @@ pub struct FileWithMeta {
     pub loc: Location,
     /// Files size in bytes
     pub file_size: i64,
-    /// Last modification time in seconds since Unix Epoch
-    pub modified_at: i64,
 }
 
 impl FileWithMeta {
     pub fn size_mb(&self) -> f32 {
         ((self.file_size / 1024) as f32) / 1024.
-    }
-
-    pub fn modified_at_date(&self) -> anyhow::Result<DateTime<Local>> {
-        i64_seconds_to_local_time(self.modified_at)
     }
 }
 
