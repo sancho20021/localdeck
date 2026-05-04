@@ -36,12 +36,6 @@ pub enum Commands {
     Update,
     /// Run http server hosting library
     Serve,
-    /// List tracks on the computer
-    List {
-        /// Include unavailable tracks (tracks in database but files missing)
-        #[arg(short, long)]
-        show_unavailable: bool,
-    },
     /// Find a track
     Find {
         /// Artist, Track Name, Track Id or part of the filename to search for
@@ -165,11 +159,13 @@ pub fn run() -> anyhow::Result<()> {
                     CheckAction::New => {
                         let new = storage.check_new()?;
                         if !new.is_empty() {
-                            for (track, locs) in new {
-                                println!("  [NEW]  {}, found at:", track);
-                                for location in locs {
-                                    println!("    - {}", location);
-                                }
+                            for file in new {
+                                println!(
+                                    "{}\n   modified: {}\n   size: {:.2} MB\n",
+                                    file.loc,
+                                    file.modified_at_date().unwrap(),
+                                    file.size_mb()
+                                );
                             }
                         } else {
                             println!("No new files discovered :)");
@@ -183,8 +179,13 @@ pub fn run() -> anyhow::Result<()> {
                                 println!("{track}");
                                 if !old_locs.is_empty() {
                                     println!("Unavailable locations:");
-                                    for loc in old_locs {
-                                        println!("   - {}", loc);
+                                    for file in old_locs {
+                                        println!(
+                                            "  - {}\n      modified: {}\n      size: {:.2} MB",
+                                            file.loc,
+                                            file.modified_at_date().unwrap(),
+                                            file.size_mb()
+                                        );
                                     }
                                 }
                             }
@@ -207,7 +208,7 @@ pub fn run() -> anyhow::Result<()> {
             let files = storage.update_db_with_new_files()?;
             println!("Database updated, new files ({}):", files.len());
             for file in &files {
-                println!("    - {} at {}", file.track_id, file.loc);
+                println!("    - {} at {}", file.track_id, file.file.loc);
             }
         }
 
@@ -226,32 +227,6 @@ pub fn run() -> anyhow::Result<()> {
             http_server.run();
         }
 
-        Commands::List { show_unavailable } => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
-
-            let tracks = storage.list_tracks()?;
-
-            for track in tracks {
-                println!("Track: {}", track.track_id.to_hex());
-
-                if !track.available_files.is_empty() {
-                    println!("  Available files:");
-                    for path in &track.available_files {
-                        println!("    - {}", path);
-                    }
-                } else {
-                    println!("  No available files found :(");
-                }
-
-                if show_unavailable && !track.unavailable_files.is_empty() {
-                    println!("  Unavailable files:");
-                    for path in &track.unavailable_files {
-                        println!("    - {}", path);
-                    }
-                }
-            }
-        }
         Commands::Find {
             track: name,
             no_meta,

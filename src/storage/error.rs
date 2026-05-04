@@ -1,4 +1,4 @@
-use crate::{location::Location, storage::usb::ResolveError};
+use crate::location::Location;
 
 use thiserror::Error;
 

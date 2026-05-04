@@ -290,15 +290,19 @@ pub fn parse_json_response<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::{
+        config::LibrarySource,
         domain::hash::TrackId,
-        storage::operations::Storage,
-        storage::schema::{FILES, PATH, TRACK_ID},
+        storage::{
+            operations::Storage,
+            schema::{FILES, PATH, TRACK_ID},
+        },
     };
 
     use rouille::Request;
     use rusqlite::params;
     use std::{
         fs,
+        path::Path,
         str::FromStr,
         sync::{Arc, Mutex},
     };
@@ -330,34 +334,31 @@ mod tests {
         mock_trackid(x).to_hex()
     }
 
-    fn create_server_with_tracks<S: AsRef<str>>(
-        tracks: impl IntoIterator<Item = (TrackId, S)>,
-    ) -> HttpServer {
-        let storage = setup_storage().unwrap();
+    static MOCK_MODIFIED_AT: i64 = 39;
+
+    fn create_server_with_tracks<S: AsRef<Path>>(lib_root: S) -> HttpServer {
+        let storage = setup_storage(Some(Location::from_path(lib_root))).unwrap();
         {
             let mut locked = storage.lock().unwrap();
-            locked
-                .insert_tracks(tracks.into_iter().map(|(t, p)| {
-                    (t, {
-                        let s = p.as_ref();
-                        let p = PathBuf::from(s);
-                        Location::from_path(&p)
-                    })
-                }))
-                .unwrap();
+            locked.update_db_with_new_files().unwrap();
         }
         create_server(&storage)
     }
 
     fn create_empty_server() -> HttpServer {
-        let storage = setup_storage().unwrap();
+        let storage = setup_storage(None).unwrap();
         create_server(&storage)
     }
 
-    fn setup_storage() -> anyhow::Result<Arc<Mutex<Storage>>> {
+    fn setup_storage(root: Option<Location>) -> anyhow::Result<Arc<Mutex<Storage>>> {
         Ok(Arc::new(Mutex::new(Storage::new(
             crate::config::Database::InMemory,
-            Default::default(),
+            root.map(|root| LibrarySource {
+                roots: vec![root],
+                follow_symlinks: false,
+                ignored_dirs: vec![],
+            })
+            .unwrap_or_default(),
         )?)))
     }
 
@@ -370,22 +371,18 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
+        let id = TrackId::from_file(&file_path)?;
 
-        let server = create_server_with_tracks([(mock_trackid(1), file_path.to_string_lossy())]);
+        let server = create_server_with_tracks(dir.path());
 
-        let request = Request::fake_http(
-            "GET",
-            format!("/tracks/{}", mock_trackid_str(1)),
-            vec![],
-            vec![],
-        );
+        let request = Request::fake_http("GET", format!("/tracks/{}", id), vec![], vec![]);
 
         let response = server.handle_request(&request);
         assert_eq!(response.status_code, 200);
 
         let body: TrackResponse = parse_json_response(response)?;
 
-        assert_eq!(body.track_id, mock_trackid_str(1));
+        assert_eq!(body.track_id, id.to_string());
         assert_eq!(body.location, Location::from_path(file_path));
 
         Ok(())
@@ -397,7 +394,7 @@ mod tests {
 
     #[test]
     fn test_http_get_track_invalid_id() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
+        let storage = setup_storage(None)?;
 
         let request = Request::fake_http("GET", "/tracks/not-a-valid-id", vec![], vec![]);
 
@@ -414,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_http_get_track_not_found() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
+        let storage = setup_storage(None)?;
 
         let track_id = TrackId::from_bytes(&[0, 1, 3]).to_hex();
 
@@ -432,15 +429,11 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
+        let id = TrackId::from_file(&file_path)?;
 
-        let server = create_server_with_tracks([(mock_trackid(1), file_path.to_string_lossy())]);
+        let server = create_server_with_tracks(dir.path());
 
-        let request = Request::fake_http(
-            "GET",
-            format!("/tracks/{}/stream", mock_trackid_str(1)),
-            vec![],
-            vec![],
-        );
+        let request = Request::fake_http("GET", format!("/tracks/{}/stream", id), vec![], vec![]);
 
         let response = server.handle_request(&request);
 
@@ -461,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_http_get_track_stream_not_found() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
+        let storage = setup_storage(None)?;
         let track_id = TrackId::from_bytes(&[0, 1, 3]);
 
         let request = Request::fake_http(
@@ -480,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_http_get_track_stream_invalid_id() -> anyhow::Result<()> {
-        let storage = setup_storage()?;
+        let storage = setup_storage(None)?;
 
         let request = Request::fake_http("GET", "/tracks/not-a-valid-id/stream", vec![], vec![]);
 
@@ -493,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_play_missing_hash() {
-        let mut server = create_empty_server();
+        let server = create_empty_server();
 
         let request = Request::fake_http("GET", "/play", vec![], vec![]);
 
@@ -522,9 +515,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x").unwrap();
-
-        let track_id = mock_trackid(12345);
-        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        let track_id = TrackId::from_file(&file_path).unwrap();
+        let server = create_server_with_tracks(dir.path());
 
         let request =
             Request::fake_http("GET", format!("/tracks/{track_id}/stream"), vec![], vec![]);
@@ -555,8 +547,8 @@ mod tests {
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"asdfghjkas").unwrap();
 
-        let track_id = mock_trackid(12345);
-        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        let track_id = TrackId::from_file(&file_path).unwrap();
+        let server = create_server_with_tracks(dir.path());
 
         // Request a partial range
         let request = Request::fake_http(
@@ -587,10 +579,11 @@ mod tests {
     fn test_stream_invalid_range_returns_416() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("song.mp3");
-        fs::write(&file_path, b"x").unwrap();
 
-        let track_id = mock_trackid(12345);
-        let mut server = create_server_with_tracks([(track_id, &file_path.to_string_lossy())]);
+        fs::write(&file_path, b"x").unwrap();
+        let track_id = TrackId::from_file(&file_path).unwrap();
+
+        let server = create_server_with_tracks(dir.path());
 
         // Request a range beyond file size
         let request = Request::fake_http(
@@ -614,13 +607,11 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
-
-        let track_id = mock_trackid(42);
-        let track_id_str = mock_trackid_str(42);
+        let id = TrackId::from_file(&file_path)?;
 
         // ---------- Setup server with track and metadata ----------
         // `create_server_with_tracks` should accept metadata if we extend it
-        let mut server = create_server_with_tracks([(track_id, file_path.to_string_lossy())]);
+        let server = create_server_with_tracks(dir.path());
 
         // Insert metadata directly into the test DB
         server.storage.lock().unwrap().db.execute(
@@ -629,7 +620,7 @@ mod tests {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
             [
-                &track_id.to_string(),
+                &id.to_string(),
                 "Test Song",
                 "Test Artist",
                 "2026",
@@ -639,8 +630,7 @@ mod tests {
         )?;
 
         // ---------- Make the HTTP request ----------
-        let request =
-            Request::fake_http("GET", format!("/tracks/{}", track_id_str), vec![], vec![]);
+        let request = Request::fake_http("GET", format!("/tracks/{}", id), vec![], vec![]);
         let response = server.handle_request(&request);
 
         assert_eq!(response.status_code, 200);
@@ -649,7 +639,7 @@ mod tests {
         let body: TrackResponse = parse_json_response(response)?;
 
         // ---------- Assertions ----------
-        assert_eq!(body.track_id, track_id_str);
+        assert_eq!(body.track_id, id.to_string());
         assert_eq!(body.location, Location::from_path(file_path));
 
         // Metadata assertions

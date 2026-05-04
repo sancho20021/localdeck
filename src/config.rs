@@ -1,9 +1,6 @@
 use anyhow::Context;
 use serde::Deserialize;
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub use crate::location::Location;
 

@@ -1,17 +1,20 @@
 //! Module to scan music directories in the file system
 
 use anyhow::anyhow;
+use chrono::{DateTime, Local};
 use walkdir::WalkDir;
 
 use std::{
+    collections::HashSet,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::UNIX_EPOCH,
 };
 
 use crate::{
     config::{self, Location},
     domain::hash::TrackId,
-    storage::{error::StorageError, usb::LocationResolver},
+    storage::{db::i64_seconds_to_local_time, error::StorageError, usb::LocationResolver},
 };
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
@@ -35,19 +38,11 @@ impl FileStorage {
         }
     }
 
+    /// Recursively scans all music files in given directories. Retrieves their paths and metadata
     pub fn scan(&mut self, config: &config::LibrarySource) -> Result<FsSnapshot, StorageError> {
-        let observed_at = SystemTime::now();
-        let files = self.scan_dirs(config.follow_symlinks, &config.roots, &config.ignored_dirs)?;
-        Ok(FsSnapshot { observed_at, files })
-    }
-
-    /// Recursively scans all music files in given directories. Retrieves their paths and track ids
-    pub fn scan_dirs(
-        &mut self,
-        follow_symlinks: bool,
-        roots: &Vec<Location>,
-        ignored_dirs: &[PathBuf],
-    ) -> Result<Vec<ObservedFile>, StorageError> {
+        let follow_symlinks = config.follow_symlinks;
+        let roots: &Vec<Location> = &config.roots;
+        let ignored_dirs: &[PathBuf] = &config.ignored_dirs;
         let scanned_dirs = roots
             .iter()
             .map(|root| {
@@ -58,13 +53,13 @@ impl FileStorage {
         Ok(scanned_dirs.into_iter().flatten().collect())
     }
 
-    /// Recursively scans all music files in the given directory. Retrieves their paths and track ids
+    /// Recursively scans all music files in the given directory. Retrieves their paths and metadata
     pub fn scan_dir(
         &mut self,
         follow_symlinks: bool,
         root: &Location,
         ignored_dirs: &[PathBuf],
-    ) -> Result<Vec<ObservedFile>, StorageError> {
+    ) -> Result<Vec<FileWithMeta>, StorageError> {
         let root_path = self.loc_resolver.resolve(root).map_err(|e| {
             StorageError::Internal(anyhow!("failed to resolve library source root: {e}"))
         })?;
@@ -72,7 +67,7 @@ impl FileStorage {
 
         let walker = WalkDir::new(&root_path).follow_links(follow_symlinks);
 
-        let paths = walker
+        walker
             // filter out ignored directories
             .into_iter()
             .filter_entry(|entry| {
@@ -89,46 +84,76 @@ impl FileStorage {
                     None
                 }
             })
-            .map(|e| e.path().to_path_buf())
-            .filter(|e| is_music_file(e))
-            .map(|p| -> Result<_, StorageError> {
+            .map(|e| {
+                let pathbuf = e.path().to_path_buf();
+                (e, pathbuf)
+            })
+            .filter(|(_, p)| is_music_file(p))
+            .map(|(e, p)| -> Result<_, StorageError> {
+                let metadata = e.metadata().map_err(|e| {
+                    StorageError::Internal(anyhow!(
+                        "Failed to get metadata of file {}: {}",
+                        p.to_string_lossy(),
+                        e
+                    ))
+                })?;
+                let modified_at = metadata
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| {
+                        StorageError::Internal(anyhow!(
+                            "Modified time of file before UNIX EPOCH: {e}"
+                        ))
+                    })?
+                    .as_secs() as i64;
+                let file_size = metadata.size() as i64;
+
                 let rel = p.strip_prefix(&root_path).map_err(|_| {
                     StorageError::Internal(anyhow!(
                         "Bug: Failed to strip root prefix when scanning dir"
                     ))
                 })?;
                 let loc = root.join(rel);
-                Ok((p, loc))
+                Ok(FileWithMeta {
+                    loc,
+                    file_size,
+                    modified_at,
+                })
             })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let ids = paths.iter().map(|(path, _)| TrackId::from_file(path));
-
-        paths
-            .iter()
-            .zip(ids)
-            .map(|((_, path), id)| Ok(ObservedFile::new(id?, path.clone())))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
-#[derive(Debug)]
-pub struct FsSnapshot {
-    pub observed_at: SystemTime,
-    pub files: Vec<ObservedFile>,
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct HashedFile {
+    pub track_id: TrackId,
+    pub file: FileWithMeta,
 }
-
-impl FsSnapshot {}
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct ObservedFile {
-    pub track_id: TrackId,
+pub struct FileWithMeta {
     pub loc: Location,
+    /// Files size in bytes
+    pub file_size: i64,
+    /// Last modification time in seconds since Unix Epoch
+    pub modified_at: i64,
 }
 
-impl ObservedFile {
-    pub fn new(id: TrackId, loc: Location) -> Self {
-        Self { track_id: id, loc }
+impl FileWithMeta {
+    pub fn size_mb(&self) -> f32 {
+        ((self.file_size / 1024) as f32) / 1024.
+    }
+
+    pub fn modified_at_date(&self) -> anyhow::Result<DateTime<Local>> {
+        i64_seconds_to_local_time(self.modified_at)
+    }
+}
+
+pub type FsSnapshot = HashSet<FileWithMeta>;
+
+impl HashedFile {
+    pub fn new(id: TrackId, file: FileWithMeta) -> Self {
+        Self { track_id: id, file }
     }
 }
 
@@ -175,7 +200,7 @@ mod tests {
     };
 
     #[test]
-    fn scan_finds_music_files_and_hashes_them() {
+    fn scan_finds_music_files() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -231,10 +256,9 @@ mod tests {
 
         let snapshot = FileStorage::new().scan(&config).unwrap();
 
-        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.len(), 2);
 
         let paths: Vec<_> = snapshot
-            .files
             .iter()
             .map(|f| f.loc.as_path())
             .collect::<Result<_, _>>()?;
