@@ -60,6 +60,9 @@ pub enum Commands {
         #[command(subcommand)]
         action: MetaAction,
     },
+
+    /// Clean dangling tracks (no files + no metadata)
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -70,6 +73,8 @@ pub enum CheckAction {
     ///
     /// Ignores tracks that have at least one available file.
     Missing,
+    /// Check for tracks without any files recorded in database
+    Stale,
 }
 
 #[derive(Subcommand)]
@@ -160,11 +165,7 @@ pub fn run() -> anyhow::Result<()> {
                         let new = storage.check_new()?;
                         if !new.is_empty() {
                             for file in new {
-                                println!(
-                                    "{}\n   size: {:.2} MB\n",
-                                    file.loc,
-                                    file.size_mb()
-                                );
+                                println!("{}\n   size: {:.2} MB\n", file.loc, file.size_mb());
                             }
                         } else {
                             println!("No new files discovered :)");
@@ -189,6 +190,39 @@ pub fn run() -> anyhow::Result<()> {
                             }
                         } else {
                             println!("No missing files!");
+                        }
+                    }
+                    CheckAction::Stale => {
+                        let stale = storage.check_stale()?;
+
+                        let has_metadata_only = !stale.metadata_only.is_empty();
+                        let has_dangling = !stale.dangling.is_empty();
+
+                        if has_metadata_only || has_dangling {
+                            if has_metadata_only {
+                                println!("Tracks with metadata but no associated files:");
+
+                                for track in stale.metadata_only {
+                                    println!("  - {track}");
+                                }
+
+                                println!();
+                            }
+
+                            if has_dangling {
+                                println!("Dangling tracks (no files and no metadata):");
+
+                                for track in stale.dangling {
+                                    println!("  - {track}");
+                                }
+
+                                println!();
+
+                                println!("You can remove dangling tracks with:");
+                                println!("localdeck clean");
+                            }
+                        } else {
+                            println!("No stale tracks!");
                         }
                     }
                 }
@@ -304,6 +338,17 @@ pub fn run() -> anyhow::Result<()> {
                         println!("{}\n", pretty_metadata(track.metadata));
                     }
                 }
+            }
+        }
+        Commands::Clean => {
+            let mut storage = Storage::new(cfg.database, cfg.library_source)
+                .expect("Failed to initialize storage");
+            let report = storage.clean_dangling()?;
+
+            if report.removed_tracks > 0 {
+                println!("Removed {} dangling track(s)", report.removed_tracks);
+            } else {
+                println!("Nothing to clean :)");
             }
         }
     }

@@ -57,6 +57,21 @@ pub struct ForgetReport {
     pub removed_tracks: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CleanDanglingReport {
+    /// Number of dangling track ids removed from TRACKS.
+    pub removed_tracks: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct StaleTracks {
+    /// Track exists in TRACKS and METADATA but has no files.
+    pub metadata_only: Vec<TrackId>,
+
+    /// Track exists in TRACKS but has neither files nor metadata.
+    pub dangling: Vec<TrackId>,
+}
+
 impl Storage {
     /// when called, opens a data base connection
     /// and applies migrations
@@ -247,6 +262,59 @@ impl Storage {
             .map(|fm| fm.file)
             .collect();
         Ok(fs.difference(&db).cloned().collect())
+    }
+
+    /// Returns tracks that have no associated files.
+    ///
+    /// Splits results into:
+    /// - `metadata_only`: tracks that still have metadata
+    /// - `dangling`: tracks that have neither files nor metadata
+    pub fn check_stale(&mut self) -> Result<StaleTracks, StorageError> {
+        let tx = self.db.transaction()?;
+
+        let stale_rows = {
+            let mut stmt = tx.prepare(&format!(
+                "
+            SELECT
+                t.{TRACK_ID},
+                m.{TRACK_ID} IS NOT NULL as has_metadata
+            FROM {TRACKS} t
+            LEFT JOIN {FILES} f
+                ON t.{TRACK_ID} = f.{TRACK_ID}
+            LEFT JOIN {TRACK_METADATA} m
+                ON t.{TRACK_ID} = m.{TRACK_ID}
+            WHERE f.{TRACK_ID} IS NULL
+            "
+            ))?;
+
+            stmt.query_map([], |row| {
+                let track_id_hex: String = row.get(0)?;
+                let has_metadata: bool = row.get(1)?;
+
+                Ok((track_id_hex, has_metadata))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        tx.commit()?;
+
+        let mut result = StaleTracks::default();
+
+        for (track_id_hex, has_metadata) in stale_rows {
+            let track_id = TrackId::from_hex(&track_id_hex).map_err(|e| {
+                StorageError::Internal(
+                    e.context("Database contains invalid track id in stale track query"),
+                )
+            })?;
+
+            if has_metadata {
+                result.metadata_only.push(track_id);
+            } else {
+                result.dangling.push(track_id);
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn update_db_with_new_files(&mut self) -> Result<Vec<HashedFile>, StorageError> {
@@ -491,6 +559,68 @@ impl Storage {
         }
 
         Ok(map)
+    }
+
+    /// Removes dangling track entries from the database.
+    ///
+    /// A dangling track is a track id that:
+    /// - exists in `{TRACKS}`
+    /// - has no rows in `{FILES}`
+    /// - has no rows in `{TRACK_METADATA}`
+    pub fn clean_dangling(&mut self) -> Result<CleanDanglingReport, StorageError> {
+        let tx = self.db.transaction()?;
+
+        // --------------------------------------------------
+        // Collect dangling track ids
+        // --------------------------------------------------
+
+        let dangling_track_ids = {
+            let mut stmt = tx.prepare(&format!(
+                "
+            SELECT t.{TRACK_ID}
+            FROM {TRACKS} t
+            LEFT JOIN {FILES} f
+                ON t.{TRACK_ID} = f.{TRACK_ID}
+            LEFT JOIN {TRACK_METADATA} m
+                ON t.{TRACK_ID} = m.{TRACK_ID}
+            WHERE f.{TRACK_ID} IS NULL
+              AND m.{TRACK_ID} IS NULL
+            "
+            ))?;
+
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // --------------------------------------------------
+        // Delete dangling tracks
+        // --------------------------------------------------
+
+        let mut removed_tracks = 0;
+
+        for track_id in &dangling_track_ids {
+            removed_tracks += tx.execute(
+                &format!(
+                    "
+                DELETE FROM {TRACKS}
+                WHERE {TRACK_ID} = ?1
+                "
+                ),
+                params![track_id],
+            )?;
+        }
+
+        // --------------------------------------------------
+        // Record update timestamp
+        // --------------------------------------------------
+
+        if removed_tracks > 0 {
+            Self::insert_update_time(&tx)?;
+        }
+
+        tx.commit()?;
+
+        Ok(CleanDanglingReport { removed_tracks })
     }
 
     /// removes all files inside specified directory from the database
@@ -2001,6 +2131,206 @@ mod tests {
 
             Ok(())
         }
+
+        #[test]
+        fn test_check_stale_no_stale_tracks() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let path = dir.path().join("song.mp3");
+            std::fs::write(&path, b"x")?;
+
+            let track_id = TrackId::from_file(&path)?;
+
+            insert_tracks(&mut storage.db, [track_id]);
+
+            insert_real_files(
+                &mut storage.db,
+                [(track_id, replace_windows_slashes(&path))],
+                None,
+            );
+
+            let stale = storage.check_stale()?;
+
+            assert!(stale.metadata_only.is_empty());
+            assert!(stale.dangling.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_stale_detects_dangling_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let track_id = mock_trackid(123);
+
+            insert_tracks(&mut storage.db, [track_id]);
+
+            let stale = storage.check_stale()?;
+
+            assert!(stale.metadata_only.is_empty());
+
+            assert_eq!(stale.dangling.len(), 1);
+            assert_eq!(stale.dangling[0], track_id);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_stale_detects_metadata_only_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let track_id = mock_trackid(555);
+
+            insert_tracks(&mut storage.db, [track_id]);
+
+            storage
+                .db
+                .execute(
+                    r#"
+            INSERT INTO track_metadata (track_id, title, artist)
+            VALUES (?1, ?2, ?3)
+            "#,
+                    [&track_id.to_string(), "Test Song", "Test Artist"],
+                )
+                .unwrap();
+
+            let stale = storage.check_stale()?;
+
+            assert!(stale.dangling.is_empty());
+
+            assert_eq!(stale.metadata_only.len(), 1);
+            assert_eq!(stale.metadata_only[0], track_id);
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_check_stale_detects_only_truly_stale_tracks() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let existing = dir.path().join("existing.mp3");
+            std::fs::write(&existing, b"x")?;
+
+            let good_track = TrackId::from_file(&existing)?;
+            let dangling_track = mock_trackid(999);
+            let metadata_only_track = mock_trackid(555);
+
+            insert_tracks(
+                &mut storage.db,
+                [good_track, dangling_track, metadata_only_track],
+            );
+
+            insert_real_files(
+                &mut storage.db,
+                [(good_track, replace_windows_slashes(&existing))],
+                None,
+            );
+
+            storage
+                .db
+                .execute(
+                    r#"
+            INSERT INTO track_metadata (track_id, title, artist)
+            VALUES (?1, ?2, ?3)
+            "#,
+                    [&metadata_only_track.to_string(), "Test Song", "Test Artist"],
+                )
+                .unwrap();
+
+            let stale = storage.check_stale()?;
+
+            assert_eq!(stale.metadata_only.len(), 1);
+            assert_eq!(stale.metadata_only[0], metadata_only_track);
+
+            assert_eq!(stale.dangling.len(), 1);
+            assert_eq!(stale.dangling[0], dangling_track);
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_clean_dangling_does_not_delete_file_only_or_metadata_only_tracks() -> anyhow::Result<()>
+    {
+        let dir = tempdir()?;
+        let mut storage = setup_storage(dir.path())?;
+
+        let existing = dir.path().join("existing.mp3");
+        std::fs::write(&existing, b"x")?;
+
+        let good_track = TrackId::from_file(&existing)?;
+        let dangling_track = mock_trackid(999);
+        let metadata_only_track = mock_trackid(555);
+        let file_only_track = mock_trackid(777);
+
+        // Insert all tracks
+        insert_tracks(
+            &mut storage.db,
+            [
+                good_track,
+                dangling_track,
+                metadata_only_track,
+                file_only_track,
+            ],
+        );
+
+        // Good track: file exists
+        insert_real_files(
+            &mut storage.db,
+            [(good_track, replace_windows_slashes(&existing))],
+            None,
+        );
+
+        // File-only track: file exists but NO metadata
+        let file_only_path = dir.path().join("file_only.mp3");
+        std::fs::write(&file_only_path, b"y")?;
+
+        insert_real_files(
+            &mut storage.db,
+            [(file_only_track, replace_windows_slashes(&file_only_path))],
+            None,
+        );
+
+        // Metadata-only track
+        storage.db.execute(
+            r#"
+        INSERT INTO track_metadata (track_id, title, artist)
+        VALUES (?1, ?2, ?3)
+        "#,
+            [&metadata_only_track.to_string(), "Test Song", "Test Artist"],
+        )?;
+
+        // --------------------------------------------------
+        // Act
+        // --------------------------------------------------
+
+        let report = storage.clean_dangling()?;
+
+        // Only truly dangling track should be removed
+        assert_eq!(report.removed_tracks, 1);
+
+        let stale = storage.check_stale()?;
+
+        // metadata-only MUST survive
+        assert_eq!(stale.metadata_only.len(), 1);
+        assert_eq!(stale.metadata_only[0], metadata_only_track);
+
+        // file-only MUST NOT be touched (not dangling)
+        assert!(!stale.metadata_only.contains(&file_only_track));
+        assert!(!stale.dangling.contains(&file_only_track));
+
+        // good track must remain valid
+        assert!(!stale.metadata_only.contains(&good_track));
+        assert!(!stale.dangling.contains(&good_track));
+
+        // dangling must be gone
+        assert!(!stale.dangling.contains(&dangling_track));
+
+        Ok(())
     }
 
     mod usb_conversion {
