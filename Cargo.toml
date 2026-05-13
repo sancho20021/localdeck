@@ -18,6 +18,8 @@ mime_guess = "2.0"
 thiserror = "2.0"
 env_logger = "0.11"
 log = "0.4"
+serialport = "4.9"
+crossbeam = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }

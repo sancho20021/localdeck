@@ -8,7 +8,7 @@ use crate::domain::hash::TrackId;
 use crate::domain::track::{ArtworkRef, TrackMetadata};
 use crate::storage::db::i64_seconds_to_local_time;
 use crate::storage::operations::{MetadataUpdate, Storage};
-use crate::{config, public_endpoint};
+use crate::{config, public_endpoint, qr_scanner};
 
 #[derive(Parser)]
 #[command(name = "localdeck")]
@@ -63,6 +63,9 @@ pub enum Commands {
 
     /// Clean dangling tracks (no files + no metadata)
     Clean,
+
+    /// Start scanning qr codes through the qr scanner (needs qr scanner connected via USB)
+    Scan,
 }
 
 #[derive(Subcommand)]
@@ -350,6 +353,9 @@ pub fn run() -> anyhow::Result<()> {
             } else {
                 println!("Nothing to clean :)");
             }
+        }
+        Commands::Scan => {
+            qr_scanner::print_qrs();
         }
     }
     Ok(())
