@@ -33,7 +33,7 @@ impl From<StorageError> for ApiError {
                 ApiError::BadRequest(format!("track {track} has no valid files: {extra}"))
             }
 
-            StorageError::InvalidTrackId => ApiError::BadRequest("invalid track id".into()),
+            StorageError::InvalidTrackId(..) => ApiError::BadRequest(err.to_string()),
             StorageError::DuplicateLocation { .. } => ApiError::BadRequest(err.to_string()),
 
             StorageError::Database(_) | StorageError::Fs(_) | StorageError::Internal(_) => {

@@ -18,8 +18,8 @@ pub enum StorageError {
     #[error("filesystem error: {0}")]
     Fs(#[from] std::io::Error),
 
-    #[error("invalid track id")]
-    InvalidTrackId,
+    #[error("invalid track id: {0}")]
+    InvalidTrackId(String),
 
     #[error("duplicate location error, location: {path}, hint: {hint}")]
     DuplicateLocation { path: Location, hint: String },

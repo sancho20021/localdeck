@@ -8,6 +8,9 @@ pub mod http;
 pub mod storage;
 mod public_endpoint;
 mod qr_scanner;
+mod music_player;
+mod card_trackid;
+mod card_player;
 
 fn main() {
     run().unwrap();

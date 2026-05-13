@@ -74,7 +74,7 @@ impl HttpServer {
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
         let track_id = match TrackId::from_hex(&id) {
             Ok(id) => id,
-            Err(_) => return ApiError::from(StorageError::InvalidTrackId).into_response(),
+            Err(e) => return ApiError::from(StorageError::InvalidTrackId(e)).into_response(),
         };
 
         let data = {
@@ -94,7 +94,7 @@ impl HttpServer {
     /// streams music file, respecting byterange
     /// returns Response with ok status, or ApiError
     fn get_track_stream(&self, id: String, request: &Request) -> Result<Response, ApiError> {
-        let track_id = TrackId::from_hex(&id).map_err(|_| StorageError::InvalidTrackId)?;
+        let track_id = TrackId::from_hex(&id).map_err(|e| StorageError::InvalidTrackId(e))?;
 
         let mut storage = self.storage.lock().map_err(|e| {
             StorageError::Internal(anyhow!(

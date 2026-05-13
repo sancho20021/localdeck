@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use std::env;
@@ -8,7 +8,7 @@ use crate::domain::hash::TrackId;
 use crate::domain::track::{ArtworkRef, TrackMetadata};
 use crate::storage::db::i64_seconds_to_local_time;
 use crate::storage::operations::{MetadataUpdate, Storage};
-use crate::{config, public_endpoint, qr_scanner};
+use crate::{card_player, config, public_endpoint, qr_scanner};
 
 #[derive(Parser)]
 #[command(name = "localdeck")]
@@ -64,7 +64,7 @@ pub enum Commands {
     /// Clean dangling tracks (no files + no metadata)
     Clean,
 
-    /// Start scanning qr codes through the qr scanner (needs qr scanner connected via USB)
+    /// Start QR music player (needs qr scanner connected via USB)
     Scan,
 }
 
@@ -294,7 +294,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Url { track_id } => {
-            let track_id = TrackId::from_hex(track_id)?;
+            let track_id = TrackId::from_hex(track_id).map_err(|e| anyhow!("{e}"))?;
             let url = public_endpoint::get_play_url(&cfg.public_endpoint, track_id, None);
             println!("{url}");
         }
@@ -304,7 +304,7 @@ pub fn run() -> anyhow::Result<()> {
                 .expect("Failed to initialize storage");
             match action {
                 MetaAction::Get { track_id, json } => {
-                    let track_id = TrackId::from_hex(&track_id)?;
+                    let track_id = TrackId::from_hex(&track_id).map_err(|e| anyhow!("{e}"))?;
                     let meta = storage.get_track_metadata(track_id)?;
                     if let Some(meta) = meta {
                         let str = if json {
@@ -327,7 +327,7 @@ pub fn run() -> anyhow::Result<()> {
                     artwork,
                     overwrite,
                 } => {
-                    let track_id = TrackId::from_hex(&track_id)?;
+                    let track_id = TrackId::from_hex(&track_id).map_err(|e| anyhow!("{e}"))?;
                     let update = Commands::to_metadata_update(title, artist, year, label, artwork);
 
                     storage.update_track_metadata(track_id, update, overwrite)?;
@@ -355,7 +355,9 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Scan => {
-            qr_scanner::print_qrs();
+            let mut storage = Storage::new(cfg.database, cfg.library_source)
+                .expect("Failed to initialize storage");
+            card_player::run_card_player(&mut storage);
         }
     }
     Ok(())

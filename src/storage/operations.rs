@@ -121,7 +121,7 @@ impl Storage {
                     let file_size: i64 = row.get(3)?;
 
                     Ok((
-                        TrackId::from_hex(&track_id_hex).map_err(|e| StorageError::Internal(e)),
+                        TrackId::from_hex(&track_id_hex).map_err(StorageError::InvalidTrackId),
                         FileWithMeta {
                             loc: LocationRow { usb_label, path }.into(),
                             file_size,
@@ -161,7 +161,7 @@ impl Storage {
             // explicitly handle TrackId conversion
             let track_id = match TrackId::from_hex(&track_id_hex) {
                 Ok(id) => id,
-                Err(e) => return Ok(Err(StorageError::Internal(e))), // store error explicitly
+                Err(e) => return Ok(Err(StorageError::InvalidTrackId(e))), // store error explicitly
             };
 
             Ok(Ok(Track {
@@ -302,9 +302,9 @@ impl Storage {
 
         for (track_id_hex, has_metadata) in stale_rows {
             let track_id = TrackId::from_hex(&track_id_hex).map_err(|e| {
-                StorageError::Internal(
-                    e.context("Database contains invalid track id in stale track query"),
-                )
+                StorageError::InvalidTrackId(format!(
+                    "Database contains invalid track id in stale track query: {e}"
+                ))
             })?;
 
             if has_metadata {

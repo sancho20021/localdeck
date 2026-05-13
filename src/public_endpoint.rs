@@ -1,5 +1,7 @@
 use crate::{config::PublicEndpoint, domain::hash::TrackId};
 
+/// TODO: merge this module with card_trackid, and move away from being Web-related
+
 /// returns url to be printed on QRs and NFCs
 pub fn get_play_url(conf: &PublicEndpoint, track: TrackId, yt_part: Option<String>) -> String {
     let url = &conf.base_url.trim_end_matches('/');
