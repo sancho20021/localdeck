@@ -1,6 +1,6 @@
 use rouille::Response;
 
-use crate::storage::error::StorageError;
+use localdeck_storage::error::StorageError;
 
 #[derive(Debug)]
 pub enum ApiError {

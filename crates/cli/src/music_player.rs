@@ -2,7 +2,6 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 use std::{
     fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
     thread::{self, JoinHandle},
 };

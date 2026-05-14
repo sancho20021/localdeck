@@ -1,8 +1,6 @@
-use crate::location::Location;
-
 use thiserror::Error;
 
-use crate::domain::hash::TrackId;
+use crate::{location::Location, track_id::TrackId};
 
 #[derive(Debug, Error)]
 pub enum StorageError {

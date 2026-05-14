@@ -4,11 +4,10 @@ use log::info;
 use std::env;
 use std::path::PathBuf;
 
-use crate::domain::hash::TrackId;
-use crate::domain::track::{ArtworkRef, TrackMetadata};
-use crate::storage::db::i64_seconds_to_local_time;
-use crate::storage::operations::{MetadataUpdate, Storage};
-use crate::{card_player, config, public_endpoint, qr_scanner};
+use crate::{card_player, config};
+use localdeck_storage::TrackId;
+use localdeck_storage::operations::{MetadataUpdate, Storage};
+use localdeck_storage::track::{ArtworkRef, TrackMetadata};
 
 #[derive(Parser)]
 #[command(name = "localdeck")]
@@ -161,7 +160,7 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Check { action } => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)?;
+            let mut storage = Storage::new(cfg.storage)?;
             if let Some(action) = action {
                 match action {
                     CheckAction::New => {
@@ -231,15 +230,12 @@ pub fn run() -> anyhow::Result<()> {
                 }
             } else {
                 let ds = storage.scan_db()?;
-                println!(
-                    "Data base was updated {}",
-                    i64_seconds_to_local_time(ds.updated_at)?
-                );
+                println!("Data base was updated {}", ds.updated_at);
             }
         }
 
         Commands::Update {} => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)?;
+            let mut storage = Storage::new(cfg.storage)?;
             let files = storage.update_db_with_new_files()?;
             println!("Database updated, new files ({}):", files.len());
             for file in &files {
@@ -250,10 +246,9 @@ pub fn run() -> anyhow::Result<()> {
         Commands::Serve {} => {
             println!("Starting HTTP server...");
 
-            let storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
 
-            let http_server = crate::http::server::HttpServer::new(storage, cfg.http);
+            let http_server = localdeck_http::server::HttpServer::new(storage, cfg.http);
 
             println!(
                 "HTTP server running at http://{}:{}",
@@ -266,8 +261,7 @@ pub fn run() -> anyhow::Result<()> {
             track: name,
             no_meta,
         } => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let tracks = storage.find_files(&name, no_meta)?;
             if !tracks.is_empty() {
                 for (trackid, paths) in tracks {
@@ -281,8 +275,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Forget { path } => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let report = storage.forget_path(&path)?;
             if report.affected_tracks == 0 {
                 println!("No tracks located under {} found", path.to_string_lossy());
@@ -295,13 +288,13 @@ pub fn run() -> anyhow::Result<()> {
         }
         Commands::Url { track_id } => {
             let track_id = TrackId::from_hex(track_id).map_err(|e| anyhow!("{e}"))?;
-            let url = public_endpoint::get_play_url(&cfg.public_endpoint, track_id, None);
-            println!("{url}");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
+            let _ = storage.get_track_metadata(track_id).unwrap();
+            println!("{track_id}");
         }
 
         Commands::Meta { action } => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             match action {
                 MetaAction::Get { track_id, json } => {
                     let track_id = TrackId::from_hex(&track_id).map_err(|e| anyhow!("{e}"))?;
@@ -344,8 +337,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Clean => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let report = storage.clean_dangling()?;
 
             if report.removed_tracks > 0 {
@@ -355,8 +347,7 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Scan => {
-            let mut storage = Storage::new(cfg.database, cfg.library_source)
-                .expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             card_player::run_card_player(&mut storage);
         }
     }

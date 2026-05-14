@@ -1,46 +1,12 @@
-use anyhow::Context;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub use crate::location::Location;
+use crate::location::Location;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub version: u32,
     pub database: Database,
     pub library_source: LibrarySource,
-    pub http: HttpConfig,
-    pub public_endpoint: PublicEndpoint,
-    pub data: Data,
-}
-
-/// LocalDeck data dir: used for storing artwork, database, etc
-#[derive(Debug, Deserialize)]
-pub struct Data {
-    root_dir: Location,
-    /// must be relative to root_dir
-    artwork_dir: PathBuf,
-}
-
-/// "public" endpoint that will be used on QR codes and NFCs
-#[derive(Debug, Deserialize)]
-pub struct PublicEndpoint {
-    /// example: http://main-deck:8080
-    pub base_url: String,
-}
-
-impl Config {
-    /// load the config file. first tries the env var LOCALDECK_CONFIG, then the provided path
-    pub fn load(path: &Path) -> anyhow::Result<Config> {
-        let contents = std::fs::read_to_string(path).expect("Failed to read user config");
-        toml::from_str(&contents).with_context(|| "Failed to parse config TOML")
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct HttpConfig {
-    pub bind_addr: String,
-    pub port: u16,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -67,8 +33,6 @@ mod tests {
     #[test]
     fn test_parse_config_toml() -> anyhow::Result<()> {
         let toml_str = r#"
-version = 1
-
 [database]
 type = "InMemory"
 
@@ -76,24 +40,10 @@ type = "InMemory"
 roots = [{type = "File", path = "/home/sancho20021/Music"}]
 follow_symlinks = true
 ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
-
-[data]
-root_dir = { type = "File", path = "/home/sancho20021/hello" }
-artwork_dir = "artwork"
-
-[http]
-bind_addr = "127.0.0.1"
-port = 8080
-
-[public_endpoint]
-base_url = "hello"
 "#;
 
         // Deserialize TOML into Config
         let cfg: Config = toml::from_str(toml_str)?;
-
-        // Check version
-        assert_eq!(cfg.version, 1);
 
         // Check database variant
         assert!(cfg.database == Database::InMemory);

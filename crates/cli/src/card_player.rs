@@ -1,7 +1,7 @@
-use crate::{
-    card_trackid::extract_trackid, music_player::start_music_player, qr_scanner::start_qr_scanner,
-    storage::operations::Storage,
-};
+use url::Url;
+
+use crate::{music_player::start_music_player, qr_scanner::start_qr_scanner};
+use localdeck_storage::{TrackId, operations::Storage};
 
 /// Starts:
 /// - QR scanner thread
@@ -71,7 +71,7 @@ pub fn run_card_player(storage: &mut Storage) {
                         label
                     );
                 } else {
-                    log::info!("playing unknown track: {:?}", path);
+                    log::info!("playing unknown track: {:?}", &path);
                 }
 
                 player.play(&path);
@@ -93,4 +93,38 @@ pub fn run_card_player(storage: &mut Storage) {
     }
 
     log::info!("card player stopped");
+}
+
+/// Extracts track id from QR/card text.
+///
+/// Accepts:
+/// - raw hash:
+///     abc123
+///
+/// - full URL:
+///     https://example.com/play?h=abc123
+fn extract_trackid(text: &str) -> Result<TrackId, String> {
+    let text = text.trim();
+
+    // -----------------------------------------
+    // Full URL:
+    // https://example.com/play?h=abc123
+    // -----------------------------------------
+    if let Ok(url) = Url::parse(text) {
+        if let Some(hash) = url
+            .query_pairs()
+            .find(|(k, _)| k == "h")
+            .map(|(_, v)| v.to_string())
+        {
+            if let Ok(hash) = TrackId::from_hex(hash) {
+                return Ok(hash);
+            }
+        }
+    }
+
+    // -----------------------------------------
+    // raw hash:
+    // abc123
+    // -----------------------------------------
+    TrackId::from_hex(text)
 }

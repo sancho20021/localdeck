@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::Location;
+use crate::location::Location;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {

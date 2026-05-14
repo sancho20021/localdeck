@@ -5,22 +5,18 @@ use std::{
 };
 
 use anyhow::anyhow;
+use chrono::{DateTime, Local};
 
 use crate::{
-    config::{self, LibrarySource},
-    domain::{
-        hash::TrackId,
-        track::{ArtworkRef, Track, TrackMetadata},
-    },
+    TrackId,
+    config::{Config, Database, LibrarySource},
+    db::{self, DBConfig, SecondsSinceUnix, i64_seconds_to_local_time, system_time_to_i64},
+    error::StorageError,
+    fs::{FileStorage, FileWithMeta, FsSnapshot, HashedFile, is_valid_music_path},
     location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
-    storage::{
-        self,
-        db::{self, DBConfig, SecondsSinceUnix, system_time_to_i64},
-        error::StorageError,
-        fs::{FileStorage, FileWithMeta, FsSnapshot, HashedFile},
-        schema::{columns, tables},
-        usb::ResolveError,
-    },
+    schema::{columns, tables},
+    track::{ArtworkRef, Track, TrackMetadata},
+    usb::ResolveError,
 };
 
 use columns::*;
@@ -29,7 +25,7 @@ use tables::*;
 
 #[derive(Debug)]
 pub struct DBSnapshot {
-    pub updated_at: SecondsSinceUnix,
+    pub updated_at: DateTime<Local>,
     pub files: Vec<HashedFile>,
 }
 
@@ -75,14 +71,11 @@ pub struct StaleTracks {
 impl Storage {
     /// when called, opens a data base connection
     /// and applies migrations
-    pub fn new(
-        db_config: config::Database,
-        lib_config: LibrarySource,
-    ) -> Result<Self, StorageError> {
+    pub fn new(config: Config) -> Result<Self, StorageError> {
         let mut fs = FileStorage::new();
-        let db_config = match db_config {
-            config::Database::InMemory => DBConfig::InMemory,
-            config::Database::OnDisk { location } => DBConfig::OnDisk {
+        let db_config = match config.database {
+            Database::InMemory => DBConfig::InMemory,
+            Database::OnDisk { location } => DBConfig::OnDisk {
                 location: fs.loc_resolver.resolve(&location).map_err(|e| {
                     StorageError::Internal(anyhow!("Failed to resolve DB location: {e}"))
                 })?,
@@ -92,11 +85,12 @@ impl Storage {
         let db: rusqlite::Connection = db::open(db_config)?;
         Ok(Self {
             db,
-            source: lib_config,
+            source: config.library_source,
             fs: FileStorage::new(),
         })
     }
 
+    #[cfg(test)]
     fn from_existing_conn(db: rusqlite::Connection, lib_config: LibrarySource) -> Self {
         Self {
             db,
@@ -143,6 +137,10 @@ impl Storage {
             .into_iter()
             .map(|(track, file)| Ok(HashedFile::new(track?, file)))
             .collect::<Result<Vec<_>, StorageError>>()?;
+
+        let updated_at = i64_seconds_to_local_time(updated_at).map_err(|e| {
+            StorageError::Internal(e.context("database update times contains invalid time"))
+        })?;
 
         Ok(DBSnapshot { updated_at, files })
     }
@@ -426,7 +424,7 @@ impl Storage {
             let path = self.fs.loc_resolver.resolve(&loc);
             match path {
                 Ok(p) => {
-                    if storage::fs::is_valid_music_path(&p) {
+                    if is_valid_music_path(&p) {
                         return Ok((track_id, p, loc));
                     }
                 }
@@ -897,26 +895,23 @@ pub struct MetadataUpdate {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        fs::{self, File},
+        fs::{self},
         path::{Path, PathBuf},
-        sync::Mutex,
-        time::SystemTime,
     };
 
     use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
     use crate::{
-        config::{LibrarySource, Location},
-        domain::hash::TrackId,
-        storage::{
-            self,
-            error::StorageError,
-            fs::FileWithMeta,
-            operations::{MetadataUpdate, Storage, replace_windows_slashes},
-            schema::{self, *},
-            usb::LocationResolver,
-        },
+        TrackId,
+        config::LibrarySource,
+        db::i64_seconds_to_local_time,
+        error::StorageError,
+        fs::FileWithMeta,
+        location::Location,
+        operations::{MetadataUpdate, Storage, replace_windows_slashes},
+        schema::{self, *},
+        usb::LocationResolver,
     };
 
     fn file_size(path: &Path) -> i64 {
@@ -1006,7 +1001,7 @@ mod tests {
 
         assert_eq!(snapshot.files.len(), 1);
         assert_eq!(snapshot.files[0].file.loc, Location::from_path("song.mp3"));
-        assert_eq!(snapshot.updated_at, 200);
+        assert_eq!(snapshot.updated_at, i64_seconds_to_local_time(200).unwrap());
 
         Ok(())
     }
@@ -1607,8 +1602,8 @@ mod tests {
 
     mod update_meta_tests {
         use crate::{
-            domain::track::{ArtworkRef, TrackMetadata},
-            storage::operations::MetadataUpdate,
+            operations::MetadataUpdate,
+            track::{ArtworkRef, TrackMetadata},
         };
 
         use super::*;
@@ -1915,10 +1910,9 @@ mod tests {
         use tempfile::tempdir;
 
         use crate::{
-            config::Location,
-            domain::hash::TrackId,
-            location::replace_windows_slashes,
-            storage::operations::tests::{
+            TrackId,
+            location::{Location, replace_windows_slashes},
+            operations::tests::{
                 MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks,
                 mock_trackid, setup_storage,
             },
@@ -2336,10 +2330,7 @@ mod tests {
     mod usb_conversion {
         use std::path::PathBuf;
 
-        use crate::{
-            config::Location,
-            storage::{error::StorageError, operations::LocationRow},
-        };
+        use crate::{error::StorageError, location::Location, operations::LocationRow};
 
         #[test]
         fn empty_usb_label_error() {

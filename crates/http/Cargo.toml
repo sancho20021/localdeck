@@ -1,0 +1,19 @@
+[package]
+name = "localdeck-http"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+mime_guess = { workspace = true }
+localdeck-storage = { workspace = true }
+
+# Unique to this crate
+rouille = "3"
+
+[dev-dependencies]
+tempfile = "3"

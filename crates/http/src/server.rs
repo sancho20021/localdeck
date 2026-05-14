@@ -9,11 +9,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{
-    config::{HttpConfig, Location},
-    domain::{hash::TrackId, track::TrackMetadata},
-    http::error::ApiError,
-    storage::{error::StorageError, operations::Storage},
+use crate::{HttpConfig, error::ApiError};
+use localdeck_storage::{
+    TrackId, error::StorageError, location::Location, operations::Storage, track::TrackMetadata,
 };
 
 pub struct HttpServer {
@@ -68,7 +66,7 @@ impl HttpServer {
     }
 
     fn handle_scan_qr() -> Response {
-        Response::html(include_str!("../../html/scan_qr.html"))
+        Response::html(include_str!("../html/scan_qr.html"))
     }
 
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
@@ -199,7 +197,7 @@ impl HttpServer {
     }
 
     fn handle_listen_page() -> Response {
-        Response::html(include_str!("../../html/stream.html"))
+        Response::html(include_str!("../html/stream.html"))
     }
 
     fn mime_for_track(path: &PathBuf) -> String {
@@ -289,21 +287,16 @@ pub fn parse_json_response<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::LibrarySource,
-        domain::hash::TrackId,
-        storage::{
-            operations::Storage,
-            schema::{FILES, PATH, TRACK_ID},
-        },
+    use localdeck_storage::{
+        config::{Config, Database, LibrarySource},
+        operations::{MetadataUpdate, Storage},
+        track::ArtworkRef,
     };
 
     use rouille::Request;
-    use rusqlite::params;
     use std::{
         fs,
         path::Path,
-        str::FromStr,
         sync::{Arc, Mutex},
     };
     use tempfile::tempdir;
@@ -325,15 +318,6 @@ mod tests {
         }
     }
 
-    fn mock_trackid(x: i32) -> TrackId {
-        let bytes = x.to_be_bytes();
-        TrackId::from_bytes(&bytes)
-    }
-
-    fn mock_trackid_str(x: i32) -> String {
-        mock_trackid(x).to_hex()
-    }
-
     fn create_server_with_tracks<S: AsRef<Path>>(lib_root: S) -> HttpServer {
         let storage = setup_storage(Some(Location::from_path(lib_root))).unwrap();
         {
@@ -349,15 +333,16 @@ mod tests {
     }
 
     fn setup_storage(root: Option<Location>) -> anyhow::Result<Arc<Mutex<Storage>>> {
-        Ok(Arc::new(Mutex::new(Storage::new(
-            crate::config::Database::InMemory,
-            root.map(|root| LibrarySource {
-                roots: vec![root],
-                follow_symlinks: false,
-                ignored_dirs: vec![],
-            })
-            .unwrap_or_default(),
-        )?)))
+        Ok(Arc::new(Mutex::new(Storage::new(Config {
+            database: Database::InMemory,
+            library_source: root
+                .map(|root| LibrarySource {
+                    roots: vec![root],
+                    follow_symlinks: false,
+                    ignored_dirs: vec![],
+                })
+                .unwrap_or_default(),
+        })?)))
     }
 
     // --------------------------------------------------
@@ -611,20 +596,16 @@ mod tests {
         // `create_server_with_tracks` should accept metadata if we extend it
         let server = create_server_with_tracks(dir.path());
 
-        // Insert metadata directly into the test DB
-        server.storage.lock().unwrap().db.execute(
-            r#"
-            INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            "#,
-            [
-                &id.to_string(),
-                "Test Song",
-                "Test Artist",
-                "2026",
-                "Test Label",
-                "cover.jpg",
-            ],
+        server.storage.lock().unwrap().update_track_metadata(
+            id,
+            MetadataUpdate {
+                title: Some("Test Song".to_string()),
+                artist: Some("Test Artist".to_string()),
+                year: Some(2026),
+                label: Some("Test Label".to_string()),
+                artwork: Some(ArtworkRef("cover.jpg".to_string())),
+            },
+            false,
         )?;
 
         // ---------- Make the HTTP request ----------

@@ -9,9 +9,7 @@ use std::{
 };
 
 use crate::{
-    config::{self, Location},
-    domain::hash::TrackId,
-    storage::{error::StorageError, usb::LocationResolver},
+    config, error::StorageError, location::Location, track_id::TrackId, usb::LocationResolver,
 };
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
@@ -173,10 +171,7 @@ pub fn is_valid_music_path(path: &Path) -> bool {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::{
-        config::{self, Location},
-        storage::fs::FileStorage,
-    };
+    use crate::{config::LibrarySource, fs::FileStorage, location::Location};
 
     #[test]
     fn scan_finds_music_files() {
@@ -224,7 +219,7 @@ mod tests {
         fs::write(&song2, b"song two").unwrap();
         fs::write(&not_music, b"ignore me").unwrap();
 
-        let config = config::LibrarySource {
+        let config = LibrarySource {
             follow_symlinks: false,
             roots: vec![
                 Location::from_path(dir1.path()),

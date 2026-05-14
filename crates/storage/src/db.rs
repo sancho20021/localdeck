@@ -7,7 +7,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Local};
 use rusqlite::Connection;
 
-use crate::storage::{error::StorageError, schema};
+use crate::{error::StorageError, schema};
 
 pub enum DBConfig {
     InMemory,
@@ -55,7 +55,7 @@ pub fn i64_seconds_to_local_time(since_unix: i64) -> anyhow::Result<DateTime<Loc
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{
+    use crate::{
         db::{DBConfig, open},
         schema,
     };

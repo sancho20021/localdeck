@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use super::hash::TrackId;
+use super::track_id::TrackId;
 
 /// Represent a music track
 #[derive(Debug)]

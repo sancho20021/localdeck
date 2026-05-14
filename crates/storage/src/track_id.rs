@@ -41,7 +41,7 @@ impl TrackId {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::domain::hash::TrackId;
+    use crate::TrackId;
 
     #[test]
     fn same_contents_same_hash() {
