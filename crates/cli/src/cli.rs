@@ -4,6 +4,7 @@ use log::info;
 use std::env;
 use std::path::PathBuf;
 
+use crate::music_player::Output;
 use crate::{card_player, config};
 use localdeck_storage::TrackId;
 use localdeck_storage::operations::{MetadataUpdate, Storage};
@@ -64,7 +65,11 @@ pub enum Commands {
     Clean,
 
     /// Start QR music player (needs qr scanner connected via USB)
-    Scan,
+    Scan {
+        /// Device name to play audio from
+        #[arg(short, long)]
+        device: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -346,9 +351,13 @@ pub fn run() -> anyhow::Result<()> {
                 println!("Nothing to clean :)");
             }
         }
-        Commands::Scan => {
+        Commands::Scan { device } => {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
-            card_player::run_card_player(&mut storage);
+            let output = match device {
+                Some(d) => Output::Device(d),
+                None => Output::Default,
+            };
+            card_player::run_card_player(&mut storage, output);
         }
     }
     Ok(())

@@ -348,10 +348,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
-name = "core"
-version = "0.1.0"
-
-[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1074,16 +1070,13 @@ name = "localdeck"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
- "chrono",
  "clap",
  "crossbeam",
  "env_logger",
+ "localdeck-http",
+ "localdeck-storage",
  "log",
- "mime_guess",
  "rodio",
- "rouille",
- "rusqlite",
  "serde",
  "serde_json",
  "serialport",
@@ -1091,6 +1084,37 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "url",
+]
+
+[[package]]
+name = "localdeck-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "localdeck-storage",
+ "log",
+ "mime_guess",
+ "rouille",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "localdeck-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "log",
+ "mime_guess",
+ "rusqlite",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
  "walkdir",
  "windows",
 ]
