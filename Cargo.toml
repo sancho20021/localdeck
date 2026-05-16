@@ -23,3 +23,7 @@ thiserror = "2.0"
 log = "0.4"
 mime_guess = "2.0"
 tempfile = "3"
+
+[patch.crates-io]
+alsa = { git = "https://github.com/roderickvd/alsa-rs", branch = "fix/htstamp-time64-overflow" }
+# cpal = { git = "https://github.com/RustAudio/cpal" }

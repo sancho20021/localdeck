@@ -158,7 +158,7 @@ pub fn run() -> anyhow::Result<()> {
         path
     } else {
         let path = env::var("LOCALDECK_CONFIG")
-            .context("Failed to get path to config. Provide it via flag or environment variable")?;
+            .context("Failed to get path to config. Provide it via flag or environment variable LOCALDECK_CONFIG")?;
         PathBuf::from(path)
     };
     let cfg = config::Config::load(&cfg_path)?;

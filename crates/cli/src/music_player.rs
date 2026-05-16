@@ -1,6 +1,6 @@
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use rodio::{
-    Decoder, DeviceSinkBuilder, DeviceSinkError, DeviceTrait, DevicesError, MixerDeviceSink,
+    Decoder, DeviceSinkBuilder, DeviceSinkError, DeviceTrait, MixerDeviceSink,
     cpal::traits::HostTrait,
 };
 use std::{
@@ -22,7 +22,7 @@ pub enum Output {
 #[derive(Debug, Error)]
 pub enum AudioPlayerError {
     #[error(transparent)]
-    DevicesError(#[from] DevicesError),
+    DevicesError(#[from] DeviceSinkError),
 
     #[error("No available output devices with name {0} found")]
     NoDevices(String),
@@ -31,7 +31,7 @@ pub enum AudioPlayerError {
     NoDefaultDevice,
 
     #[error("Audio device is not suitable for playback: {0}. Probably can't play any sound")]
-    UnsupportedDevice(#[from] DeviceSinkError),
+    UnsupportedDevice(#[from] rodio::CpalError),
 
     #[error("failed to open audio file: {0}")]
     FileOpen(String),
