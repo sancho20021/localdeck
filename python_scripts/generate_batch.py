@@ -3,10 +3,10 @@
 import sys
 import os
 import argparse
-from generate_card import generate_card
+from generate_card import generate_card, parse_color
 
 
-def main(tracks_file: str, output_dir: str, add_picture: bool) -> None:
+def main(tracks_file: str, output_dir: str, add_picture: bool, color: tuple | str) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     with open(tracks_file, "r") as f:
@@ -26,6 +26,7 @@ def main(tracks_file: str, output_dir: str, add_picture: bool) -> None:
                 track_id,
                 output_path,
                 add_picture=add_picture,
+                color=color
             )
 
             if add_picture and not picture_applied:
@@ -49,7 +50,9 @@ if __name__ == "__main__":
     parser.add_argument("tracks_file")
     parser.add_argument("output_dir")
     parser.add_argument("--add-picture", action="store_true")
+    parser.add_argument("--color", default="red",type=str)
 
     args = parser.parse_args()
+    color = parse_color(args.color)
 
-    main(args.tracks_file, args.output_dir, args.add_picture)
+    main(args.tracks_file, args.output_dir, args.add_picture, color)

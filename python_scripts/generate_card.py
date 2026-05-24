@@ -15,7 +15,7 @@ from PIL.Image import Image as PILImage
 from PIL.ImageDraw import ImageDraw as PILDraw
 from PIL.ImageFont import FreeTypeFont
 
-TEXT_CENTERING_BIAS_RATIO = 0.2
+TEXT_CENTERING_BIAS_RATIO = 0.1
 FONT_SIZE = 37
 
 # =============================
@@ -25,7 +25,7 @@ FONT_SIZE = 37
 SQUARE_TOLERANCE = 0.02  # if artwork is not square-ish, don't apply it
 CARD_WIDTH_MM: int = 55
 CARD_HEIGHT_MM: int = 90
-QR_SIZE_MM: int = 19
+QR_SIZE_MM: int = 17
 DPI: int = 300
 BEZEL_MM: int = 1
 
@@ -33,7 +33,7 @@ FONT_PATH: str = "/home/sancho20021/.local/share/fonts/Montserrat/montserrat.sem
 OUTPUT_DIR: str = "./cards"
 
 TOP_EMPTY_RATIO: float = CARD_WIDTH_MM / CARD_HEIGHT_MM
-MARGIN_RATIO: float = 0.09
+MARGIN_RATIO: float = 0.08
 GRAPHIC_TEXT_GAP_RATIO: float = 0.7
 LINE_SPACING: int = 8
 
@@ -72,6 +72,25 @@ def get_metadata(track_id: str) -> Tuple[str, str, str]:
     data: dict = json.loads(result.stdout)
     return data["artist"], data["title"], data["artwork"]
 
+def get_qr_string(track_id: str) -> str:
+    """Gets the QR string for a given track_id."""
+    try:
+        result = subprocess.run(
+            ["localdeck", "url", track_id],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        # .strip() removes the newline character at the end of the output
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        # Handle cases where the track_id doesn't exist or command fails
+        print(f"Error fetching URL for {track_id}: {e.stderr}")
+        return ""
+
+# Usage:
+# play_url = get_play_url(track_id)
+
 
 def generate_qr(url: str, output_path: str) -> None:
     subprocess.run(
@@ -80,12 +99,27 @@ def generate_qr(url: str, output_path: str) -> None:
     )
 
 
-def fetch_image(url: str) -> PILImage:
+def fetch_image(url: str) -> Image.Image:
+    # 1. Check if 'url' is actually a local file path
+    if os.path.exists(url):
+        return Image.open(url).convert("RGB")
+
+    # 2. Otherwise, treat it as a network URL
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://google.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "Referer": "https://www.google.com/",
         },
     )
 
@@ -285,10 +319,10 @@ def render_card(
     layout: Layout,
     qr_img: PILImage,
     output_path: str,
+    color: str | tuple,
     artwork_img: PILImage | None = None,
 ) -> None:
-
-    img: PILImage = Image.new("RGB", (width, height), "red")
+    img: PILImage = Image.new("RGB", (width, height), color)
     draw: PILDraw = ImageDraw.Draw(img)
 
     bezel = mm_to_px(BEZEL_MM)
@@ -362,6 +396,7 @@ def render_card(
 def generate_card(
     track_id: str,
     output_path: str,
+    color: str | tuple,
     add_picture: bool = False,
 ) -> bool:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -375,7 +410,7 @@ def generate_card(
 
     artist, title, artwork_url = get_metadata(track_id)
 
-    play_url: str = f"http://main-deck:8080/play?h={track_id}"
+    play_url: str = get_qr_string(track_id)
 
     qr_tmp: str = "temp_qr.png"
     generate_qr(play_url, qr_tmp)
@@ -408,12 +443,24 @@ def generate_card(
             print(f"image size not square: {w}x{h}")
             used_square_artwork = False
 
-    render_card(width, height, layout, qr_img, output_path, artwork_img)
+    render_card(width, height, layout, qr_img, output_path, color, artwork_img)
 
     os.remove(qr_tmp)
     print(f"Card saved to {output_path}")
 
     return used_square_artwork
+
+def parse_color(color_input: str):
+    """
+    Tries to parse "R,G,B" into (int, int, int).
+    Falls back to the raw string if parsing fails.
+    """
+    try:
+        # Split by comma, strip whitespace, and convert to int
+        return tuple(int(c.strip()) for c in color_input.split(","))
+    except (ValueError, AttributeError):
+        # If no commas, not integers, or not a string: return original
+        return color_input
 
 # =============================
 # CLI
@@ -425,16 +472,21 @@ if __name__ == "__main__":
     parser.add_argument("track_id")
     parser.add_argument("output", nargs="?")
     parser.add_argument("--add-picture", action="store_true")
+    parser.add_argument("--color", default="red",type=str)
 
     args = parser.parse_args()
 
     track_id = args.track_id
     output = args.output or os.path.join(OUTPUT_DIR, f"{track_id}.png")
 
+    color = parse_color(args.color)
+
+
     picture_applied = generate_card(
         track_id,
         output,
-        add_picture=args.add_picture,
+        color=color,
+        add_picture=args.add_picture
     )
 
     if args.add_picture and not picture_applied:
