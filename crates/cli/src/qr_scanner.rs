@@ -58,7 +58,7 @@ pub fn start_qr_scanner() -> (Receiver<Result<String, QrScannerError>>, QrScanne
 
     let handle = thread::spawn(move || {
         let port = match serialport::new(LINUX_PORT_NAME, BAUD_RATE)
-            .timeout(Duration::from_millis(300))
+            .timeout(Duration::from_millis(1000))
             .open()
         {
             Ok(p) => p,

@@ -1,10 +1,19 @@
 use url::Url;
 
 use crate::{
-    music_player::{AudioPlayerError, Output, start_music_player},
-    qr_scanner::start_qr_scanner,
+    music_player::{AudioPlayerError, MusicPlayer, Output, start_music_player},
+    qr_scanner::{QrScanner, start_qr_scanner},
 };
 use localdeck_storage::{TrackId, operations::Storage};
+
+const STOP_LOCALDECK: &'static str = "FINISH";
+const STOP_MUSIC: &'static str = "STOP_MUSIC";
+
+fn shutdown(player: MusicPlayer, scanner: QrScanner) {
+    println!("Turning off the card player");
+    scanner.shutdown();
+    player.shutdown();
+}
 
 /// Starts:
 /// - QR scanner thread
@@ -67,7 +76,17 @@ pub fn run_card_player(storage: &mut Storage, output: Output) {
                 match event {
                     // QR successfully scanned
                     Ok(raw) => {
+                        let raw = raw.trim();
                         log::info!("scanned qr: {raw}");
+
+                        if raw == STOP_LOCALDECK {
+                            shutdown(player, scanner);
+                            return;
+                        }
+                        if raw == STOP_MUSIC {
+                            player.stop();
+                            println!("Music stopped");
+                        }
 
                         let track_id = match extract_trackid(&raw) {
                             Ok(id) => id,
@@ -107,9 +126,7 @@ pub fn run_card_player(storage: &mut Storage, output: Output) {
                     // Scanner failed mid-operation
                     Err(e) => {
                         eprintln!("qr scanner error: {e}");
-
-                        scanner.shutdown();
-                        player.shutdown();
+                        shutdown(player, scanner);
                         return;
                     }
                 }
