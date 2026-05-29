@@ -357,7 +357,7 @@ pub fn run() -> anyhow::Result<()> {
                 Some(d) => Output::Device(d),
                 None => Output::Default,
             };
-            card_player::run_card_player(&mut storage, output);
+            card_player::run_card_player(&mut storage, output).unwrap();
         }
     }
     Ok(())
