@@ -1,0 +1,21 @@
+# useful commands to remember:
+# reloading the systemctl if config changed:
+# systemctl --user daemon-reload
+
+# starting the service manually:
+# systemctl --user start localdeck-test.service
+# stopping is similar
+# enabling so it starts on login automatically:
+# systemctl --user enable localdeck-test.service
+
+
+[Unit]
+Description=LOCALDECK Music Card Scanner and Player Test
+
+[Service]
+Type=simple
+Environment=RUST_LOG=warn
+ExecStart=/home/sancho20021/spw/localdeck/localdeck/target/release/localdeck -c /home/sancho20021/spw/localdeck/config.toml scan
+
+[Install]
+WantedBy=default.target
