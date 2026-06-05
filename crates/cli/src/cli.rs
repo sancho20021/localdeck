@@ -100,19 +100,19 @@ pub enum MetaAction {
         track_id: String,
 
         /// Track title
-        #[arg(long)]
+        #[arg(short, long)]
         title: Option<String>,
 
         /// Artist name
-        #[arg(long)]
+        #[arg(short, long)]
         artist: Option<String>,
 
         /// Release year
-        #[arg(long)]
+        #[arg(short, long)]
         year: Option<u32>,
 
         /// Label / publisher
-        #[arg(long)]
+        #[arg(short, long)]
         label: Option<String>,
 
         /// Artwork URL
