@@ -33,9 +33,6 @@ impl From<StorageError> for ApiError {
                 ApiError::BadRequest(format!("track {track} has no valid files: {extra}"))
             }
 
-            StorageError::InvalidTrackId(..) => ApiError::BadRequest(err.to_string()),
-            StorageError::DuplicateLocation { .. } => ApiError::BadRequest(err.to_string()),
-
             StorageError::Database(_) | StorageError::Fs(_) | StorageError::Internal(_) => {
                 ApiError::Internal("internal server error".into())
             }
@@ -43,6 +40,8 @@ impl From<StorageError> for ApiError {
                 ApiError::BadRequest(format!("cannot overwrite metadata. track id: {id}").into())
             }
             StorageError::RequiredMetaMissing(_) => ApiError::BadRequest(err.to_string()),
+            StorageError::SlaveTrackHasMetadata(_) => ApiError::BadRequest(err.to_string()),
+            StorageError::PathOutsideLibrary(_) => ApiError::BadRequest(err.to_string()),
         }
     }
 }

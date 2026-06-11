@@ -9,7 +9,11 @@ use std::{
 };
 
 use crate::{
-    config, error::StorageError, location::Location, track_id::TrackId, usb::LocationResolver,
+    config::{self, LibrarySource},
+    error::StorageError,
+    file_hash::FileHash,
+    location::Location,
+    usb::LocationResolver,
 };
 
 const MUSIC_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "aac"];
@@ -24,43 +28,38 @@ pub fn is_music_file(path: &Path) -> bool {
 #[derive(Debug)]
 pub struct FileStorage {
     pub loc_resolver: LocationResolver,
+    config: LibrarySource,
 }
 
 impl FileStorage {
-    pub fn new() -> Self {
+    pub fn new(config: LibrarySource) -> Self {
         Self {
             loc_resolver: LocationResolver::default(),
+            config,
         }
     }
 
     /// Recursively scans all music files in given directories. Retrieves their paths and metadata
-    pub fn scan(&mut self, config: &config::LibrarySource) -> Result<FsSnapshot, StorageError> {
-        let follow_symlinks = config.follow_symlinks;
-        let roots: &Vec<Location> = &config.roots;
-        let ignored_dirs: &[PathBuf] = &config.ignored_dirs;
+    pub fn scan(&mut self) -> Result<FsSnapshot, StorageError> {
+        let roots: Vec<Location> = self.config.roots.clone();
         let scanned_dirs = roots
             .iter()
             .map(|root| {
                 println!("Scanning {root}");
-                self.scan_dir(follow_symlinks, root, ignored_dirs)
+                self.scan_dir(root)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(scanned_dirs.into_iter().flatten().collect())
     }
 
     /// Recursively scans all music files in the given directory. Retrieves their paths and metadata
-    pub fn scan_dir(
-        &mut self,
-        follow_symlinks: bool,
-        root: &Location,
-        ignored_dirs: &[PathBuf],
-    ) -> Result<Vec<FileWithMeta>, StorageError> {
+    pub fn scan_dir(&mut self, root: &Location) -> Result<Vec<FileWithMeta>, StorageError> {
         let root_path = self.loc_resolver.resolve(root).map_err(|e| {
             StorageError::Internal(anyhow!("failed to resolve library source root: {e}"))
         })?;
         let root_str = root_path.to_string_lossy();
 
-        let walker = WalkDir::new(&root_path).follow_links(follow_symlinks);
+        let walker = WalkDir::new(&root_path).follow_links(self.config.follow_symlinks);
 
         walker
             // filter out ignored directories
@@ -68,7 +67,9 @@ impl FileStorage {
             .filter_entry(|entry| {
                 let entry_path = entry.path();
                 // keep the entry if it's not inside any ignored directory
-                !ignored_dirs
+                !self
+                    .config
+                    .ignored_dirs
                     .iter()
                     .any(|ignored| entry_path.starts_with(ignored))
             })
@@ -105,11 +106,31 @@ impl FileStorage {
             })
             .collect::<Result<Vec<_>, _>>()
     }
+
+    /// Takes a physical system path and maps it back to a logical library Location
+    /// based on the currently configured roots.
+    pub fn reverse_resolve(&mut self, physical_path: &Path) -> Result<Location, StorageError> {
+        let target = physical_path.canonicalize()?;
+
+        // Iterate through all roots defined in your config
+        for root in &self.config.roots {
+            // Resolve the physical base path of this specific root configuration
+            if let Ok(base_path) = self.loc_resolver.resolve(root) {
+                if let Ok(canonical_base) = base_path.canonicalize() {
+                    // If our target physical path starts with this base path, we found our home
+                    if let Ok(relative_path) = target.strip_prefix(&canonical_base) {
+                        return Ok(root.join(relative_path));
+                    }
+                }
+            }
+        }
+        Err(StorageError::PathOutsideLibrary(target))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct HashedFile {
-    pub track_id: TrackId,
+    pub hash: FileHash,
     pub file: FileWithMeta,
 }
 
@@ -129,8 +150,8 @@ impl FileWithMeta {
 pub type FsSnapshot = HashSet<FileWithMeta>;
 
 impl HashedFile {
-    pub fn new(id: TrackId, file: FileWithMeta) -> Self {
-        Self { track_id: id, file }
+    pub fn new(id: FileHash, file: FileWithMeta) -> Self {
+        Self { hash: id, file }
     }
 }
 
@@ -171,7 +192,7 @@ pub fn is_valid_music_path(path: &Path) -> bool {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::{config::LibrarySource, fs::FileStorage, location::Location};
+    use crate::{config::LibrarySource, error::StorageError, fs::FileStorage, location::Location};
 
     #[test]
     fn scan_finds_music_files() {
@@ -190,7 +211,13 @@ mod tests {
         std::fs::write(&song2, b"bbb").unwrap();
         std::fs::write(&not_music, b"ccc").unwrap();
 
-        let files = FileStorage::new().scan_dir(false, &root, &[]).unwrap();
+        let files = FileStorage::new(LibrarySource {
+            roots: vec![root.clone()],
+            follow_symlinks: false,
+            ignored_dirs: vec![],
+        })
+        .scan_dir(&root)
+        .unwrap();
 
         assert_eq!(files.len(), 2);
 
@@ -228,7 +255,7 @@ mod tests {
             ignored_dirs: vec![],
         };
 
-        let snapshot = FileStorage::new().scan(&config).unwrap();
+        let snapshot = FileStorage::new(config).scan().unwrap();
 
         assert_eq!(snapshot.len(), 2);
 
@@ -259,9 +286,13 @@ mod tests {
         std::fs::write(&song2, b"bbb").unwrap();
         std::fs::write(&ignored_song, b"ccc").unwrap();
 
-        let files = FileStorage::new()
-            .scan_dir(false, &Location::from_path(root), &[ignored_dir.clone()])
-            .unwrap();
+        let files = FileStorage::new(LibrarySource {
+            roots: vec![Location::from_path(root)],
+            follow_symlinks: false,
+            ignored_dirs: vec![ignored_dir.clone()],
+        })
+        .scan_dir(&Location::from_path(root))
+        .unwrap();
 
         // Should find only the two non-ignored music files
         assert_eq!(files.len(), 2);
@@ -274,5 +305,69 @@ mod tests {
         assert!(paths.contains(&song2));
         assert!(!paths.contains(&ignored_song));
         Ok(())
+    }
+
+    #[test]
+    fn test_reverse_resolve_success() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root_path = tmp.path().to_path_buf();
+        let root = Location::from_path(&root_path);
+
+        // Create a physical file down inside the directory structure
+        let song = root_path.join("album").join("song.mp3");
+        std::fs::create_dir_all(song.parent().unwrap()).unwrap();
+        std::fs::write(&song, b"aaa").unwrap();
+
+        let mut fs_storage = FileStorage::new(LibrarySource {
+            roots: vec![root.clone()],
+            follow_symlinks: false,
+            ignored_dirs: vec![],
+        });
+
+        // Act: Map the absolute physical path back to a structured Location
+        let resolved_loc = fs_storage.reverse_resolve(&song).unwrap();
+
+        // Assert: It should match our original root plus the relative sub-path
+        assert_eq!(
+            resolved_loc,
+            Location::File {
+                path: root_path.join("album").join("song.mp3")
+            }
+        );
+    }
+
+    #[test]
+    fn test_reverse_resolve_fails_outside_library() {
+        use tempfile::TempDir;
+
+        let tmp_library = TempDir::new().unwrap();
+        let tmp_outside = TempDir::new().unwrap();
+
+        let library_path = tmp_library.path().join("music");
+        std::fs::create_dir_all(&library_path).unwrap();
+
+        // Create a file completely outside the configured library folders
+        let outside_file = tmp_outside.path().join("outside_song.mp3");
+        std::fs::write(&outside_file, b"bbb").unwrap();
+
+        let mut fs_storage = FileStorage::new(LibrarySource {
+            roots: vec![Location::from_path(&library_path)],
+            follow_symlinks: false,
+            ignored_dirs: vec![],
+        });
+
+        // Act
+        let result = fs_storage.reverse_resolve(&outside_file);
+
+        // Assert: It must fail with PathOutsideLibrary
+        assert!(result.is_err());
+        match result {
+            Err(StorageError::PathOutsideLibrary(failed_path)) => {
+                assert_eq!(failed_path, outside_file.canonicalize().unwrap());
+            }
+            _ => panic!("Expected StorageError::PathOutsideLibrary error variant"),
+        }
     }
 }
