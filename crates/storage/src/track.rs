@@ -1,6 +1,7 @@
 use serde::Serialize;
 
-use super::track_id::TrackId;
+/// Track id. Represents track entity
+pub type TrackId = i64;
 
 /// Represent a music track
 #[derive(Debug)]

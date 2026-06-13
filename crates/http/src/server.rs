@@ -11,7 +11,10 @@ use std::{
 
 use crate::{HttpConfig, error::ApiError};
 use localdeck_storage::{
-    TrackId, error::StorageError, location::Location, operations::Storage, track::TrackMetadata,
+    error::StorageError,
+    location::Location,
+    operations::Storage,
+    track::{TrackId, TrackMetadata},
 };
 
 pub struct HttpServer {
@@ -44,9 +47,6 @@ impl HttpServer {
             (GET) (/tracks/{id: String}/stream) => {
                 self.handle_get_track_stream(id, request)
             },
-            (GET) (/listen/{_id: String}) => {
-                        Self::handle_listen_page()
-            },
             (GET) (/play) => {
                 self.handle_play(request)
             },
@@ -70,9 +70,9 @@ impl HttpServer {
     }
 
     fn handle_get_track(id: String, storage: &Arc<Mutex<Storage>>) -> Response {
-        let track_id = match TrackId::from_hex(&id) {
+        let track_id = match storage.lock().unwrap().resolve_track(id) {
             Ok(id) => id,
-            Err(e) => return ApiError::from(StorageError::InvalidTrackId(e)).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         };
 
         let data = {
@@ -92,13 +92,14 @@ impl HttpServer {
     /// streams music file, respecting byterange
     /// returns Response with ok status, or ApiError
     fn get_track_stream(&self, id: String, request: &Request) -> Result<Response, ApiError> {
-        let track_id = TrackId::from_hex(&id).map_err(|e| StorageError::InvalidTrackId(e))?;
-
         let mut storage = self.storage.lock().map_err(|e| {
             StorageError::Internal(anyhow!(
                 "Could not access localdeck storage under lock: {e}"
             ))
         })?;
+
+        let track_id = storage.resolve_track(id.clone())?;
+
         let (path, _, meta) = storage.find_track_file_with_meta(track_id)?;
         let mime = Self::mime_for_track(&path);
 
@@ -196,10 +197,6 @@ impl HttpServer {
         }
     }
 
-    fn handle_listen_page() -> Response {
-        Response::html(include_str!("../html/stream.html"))
-    }
-
     fn mime_for_track(path: &PathBuf) -> String {
         let ext = path
             .extension()
@@ -245,7 +242,7 @@ impl HttpServer {
 
 #[derive(Serialize, Deserialize)]
 struct TrackResponse {
-    track_id: String,
+    track_id: TrackId,
     location: Location,
     metadata: Option<TrackMetadataResponse>,
 }
@@ -262,7 +259,7 @@ struct TrackMetadataResponse {
 impl TrackResponse {
     fn from_domain(track: &TrackId, location: Location, meta: Option<TrackMetadata>) -> Self {
         Self {
-            track_id: track.to_string(),
+            track_id: *track,
             location,
             metadata: meta.map(|metadata| TrackMetadataResponse {
                 artist: metadata.artist.clone(),
@@ -289,12 +286,14 @@ mod tests {
     use super::*;
     use localdeck_storage::{
         config::{Config, Database, LibrarySource},
-        operations::{MetadataUpdate, Storage},
+        file_hash::FileHash,
+        operations::{HashedFile, MetadataUpdate, Storage},
         track::ArtworkRef,
     };
 
     use rouille::Request;
     use std::{
+        collections::{HashMap, HashSet},
         fs,
         path::Path,
         sync::{Arc, Mutex},
@@ -318,13 +317,15 @@ mod tests {
         }
     }
 
-    fn create_server_with_tracks<S: AsRef<Path>>(lib_root: S) -> HttpServer {
+    fn create_server_with_tracks<S: AsRef<Path>>(
+        lib_root: S,
+    ) -> (HttpServer, HashMap<TrackId, HashSet<HashedFile>>) {
         let storage = setup_storage(Some(Location::from_path(lib_root))).unwrap();
-        {
+        let files = {
             let mut locked = storage.lock().unwrap();
-            locked.update_db_with_new_files().unwrap();
-        }
-        create_server(&storage)
+            locked.update_db_with_new_files().unwrap()
+        };
+        (create_server(&storage), files)
     }
 
     fn create_empty_server() -> HttpServer {
@@ -354,9 +355,10 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
-        let id = TrackId::from_file(&file_path)?;
 
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+
+        let (id, _) = files.into_iter().next().unwrap();
 
         let request = Request::fake_http("GET", format!("/tracks/{}", id), vec![], vec![]);
 
@@ -365,25 +367,8 @@ mod tests {
 
         let body: TrackResponse = parse_json_response(response)?;
 
-        assert_eq!(body.track_id, id.to_string());
+        assert_eq!(body.track_id, id);
         assert_eq!(body.location, Location::from_path(file_path));
-
-        Ok(())
-    }
-
-    // --------------------------------------------------
-    // ❌ INVALID TRACK ID
-    // --------------------------------------------------
-
-    #[test]
-    fn test_http_get_track_invalid_id() -> anyhow::Result<()> {
-        let storage = setup_storage(None)?;
-
-        let request = Request::fake_http("GET", "/tracks/not-a-valid-id", vec![], vec![]);
-
-        let response = create_server(&storage).handle_request(&request);
-
-        assert_eq!(response.status_code, 400);
 
         Ok(())
     }
@@ -396,7 +381,7 @@ mod tests {
     fn test_http_get_track_not_found() -> anyhow::Result<()> {
         let storage = setup_storage(None)?;
 
-        let track_id = TrackId::from_bytes(&[0, 1, 3]).to_hex();
+        let track_id = "3";
 
         let request = Request::fake_http("GET", format!("/tracks/{}", track_id), vec![], vec![]);
 
@@ -412,9 +397,9 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
-        let id = TrackId::from_file(&file_path)?;
 
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+        let (id, _) = files.into_iter().next().unwrap();
 
         let request = Request::fake_http("GET", format!("/tracks/{}/stream", id), vec![], vec![]);
 
@@ -438,7 +423,7 @@ mod tests {
     #[test]
     fn test_http_get_track_stream_not_found() -> anyhow::Result<()> {
         let storage = setup_storage(None)?;
-        let track_id = TrackId::from_bytes(&[0, 1, 3]);
+        let track_id = FileHash::from_bytes(&[0, 1, 3]);
 
         let request = Request::fake_http(
             "GET",
@@ -450,19 +435,6 @@ mod tests {
         let response = create_server(&storage).handle_request(&request);
 
         assert_eq!(response.status_code, 404);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_http_get_track_stream_invalid_id() -> anyhow::Result<()> {
-        let storage = setup_storage(None)?;
-
-        let request = Request::fake_http("GET", "/tracks/not-a-valid-id/stream", vec![], vec![]);
-
-        let response = create_server(&storage).handle_request(&request);
-
-        assert_eq!(response.status_code, 400);
 
         Ok(())
     }
@@ -498,8 +470,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x").unwrap();
-        let track_id = TrackId::from_file(&file_path).unwrap();
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+        let (track_id, _) = files.into_iter().next().unwrap();
 
         let request =
             Request::fake_http("GET", format!("/tracks/{track_id}/stream"), vec![], vec![]);
@@ -530,8 +502,8 @@ mod tests {
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"asdfghjkas").unwrap();
 
-        let track_id = TrackId::from_file(&file_path).unwrap();
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+        let (track_id, _) = files.into_iter().next().unwrap();
 
         // Request a partial range
         let request = Request::fake_http(
@@ -564,9 +536,9 @@ mod tests {
         let file_path = dir.path().join("song.mp3");
 
         fs::write(&file_path, b"x").unwrap();
-        let track_id = TrackId::from_file(&file_path).unwrap();
 
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+        let (track_id, _) = files.into_iter().next().unwrap();
 
         // Request a range beyond file size
         let request = Request::fake_http(
@@ -590,11 +562,11 @@ mod tests {
         let dir = tempdir()?;
         let file_path = dir.path().join("song.mp3");
         fs::write(&file_path, b"x")?;
-        let id = TrackId::from_file(&file_path)?;
 
         // ---------- Setup server with track and metadata ----------
         // `create_server_with_tracks` should accept metadata if we extend it
-        let server = create_server_with_tracks(dir.path());
+        let (server, files) = create_server_with_tracks(dir.path());
+        let (id, _) = files.into_iter().next().unwrap();
 
         server.storage.lock().unwrap().update_track_metadata(
             id,
@@ -618,7 +590,7 @@ mod tests {
         let body: TrackResponse = parse_json_response(response)?;
 
         // ---------- Assertions ----------
-        assert_eq!(body.track_id, id.to_string());
+        assert_eq!(body.track_id, id);
         assert_eq!(body.location, Location::from_path(file_path));
 
         // Metadata assertions

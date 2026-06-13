@@ -7,40 +7,31 @@ use std::{
 use anyhow::anyhow;
 use chrono::{DateTime, Local};
 
+#[cfg(test)]
+use crate::config::LibrarySource;
 use crate::{
-    TrackId,
-    config::{Config, Database, LibrarySource},
-    db::{self, DBConfig, SecondsSinceUnix, i64_seconds_to_local_time, system_time_to_i64},
+    CardId,
+    config::{Config, Database},
+    db::{self, DBConfig, i64_seconds_to_local_time, system_time_to_i64},
     error::StorageError,
-    fs::{FileStorage, FileWithMeta, FsSnapshot, HashedFile, is_valid_music_path},
+    file_hash::FileHash,
+    fs::{FileStorage, FileWithMeta, FsSnapshot, is_valid_music_path},
     location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
     schema::{columns, tables},
-    track::{ArtworkRef, Track, TrackMetadata},
+    track::{ArtworkRef, Track, TrackId, TrackMetadata},
     usb::ResolveError,
 };
 
 use columns::*;
-use rusqlite::{ErrorCode, Transaction, params};
+use rusqlite::{ErrorCode, OptionalExtension, Transaction, params};
 use tables::*;
 
-#[derive(Debug)]
-pub struct DBSnapshot {
-    pub updated_at: DateTime<Local>,
-    pub files: Vec<HashedFile>,
-}
+pub use crate::fs::HashedFile;
 
 /// Main structure that implements all storage logic
 pub struct Storage {
     pub(crate) db: rusqlite::Connection,
-    source: LibrarySource,
     fs: FileStorage,
-}
-
-#[derive(Debug)]
-pub struct TrackListEntry {
-    pub track_id: TrackId,
-    pub available_files: Vec<Location>,
-    pub unavailable_files: Vec<Location>,
 }
 
 #[derive(Debug)]
@@ -72,7 +63,7 @@ impl Storage {
     /// when called, opens a data base connection
     /// and applies migrations
     pub fn new(config: Config) -> Result<Self, StorageError> {
-        let mut fs = FileStorage::new();
+        let mut fs = FileStorage::new(config.library_source);
         let db_config = match config.database {
             Database::InMemory => DBConfig::InMemory,
             Database::OnDisk { location } => DBConfig::OnDisk {
@@ -83,84 +74,95 @@ impl Storage {
         };
 
         let db: rusqlite::Connection = db::open(db_config)?;
-        Ok(Self {
-            db,
-            source: config.library_source,
-            fs: FileStorage::new(),
-        })
+        Ok(Self { db, fs })
     }
 
     #[cfg(test)]
     fn from_existing_conn(db: rusqlite::Connection, lib_config: LibrarySource) -> Self {
         Self {
             db,
-            source: lib_config,
-            fs: FileStorage::new(),
+            fs: FileStorage::new(lib_config),
         }
     }
 
-    pub fn scan_db(&mut self) -> Result<DBSnapshot, StorageError> {
-        println!("Scanning music on database...");
+    /// Retrieves all tracks present in database
+    fn get_tracks(&mut self) -> Result<Vec<TrackId>, StorageError> {
+        // TODO: test
         let tx = self.db.transaction()?;
+        let track_ids = {
+            let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID} FROM {TRACKS}"))?;
 
-        let (files, updated_at) = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {TRACK_ID}, {USB_LABEL}, {PATH}, {FILE_SIZE} FROM {FILES}"
-            ))?;
-            let files = stmt
-                .query_map([], |row| {
-                    let track_id_hex: String = row.get(0)?;
-                    let usb_label: String = row.get(1)?;
-                    let path: String = row.get(2)?;
-                    let file_size: i64 = row.get(3)?;
-
-                    Ok((
-                        TrackId::from_hex(&track_id_hex).map_err(StorageError::InvalidTrackId),
-                        FileWithMeta {
-                            loc: LocationRow { usb_label, path }.into(),
-                            file_size,
-                        },
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            let updated_at: SecondsSinceUnix = tx.query_row(
-                &format!("SELECT COALESCE(MAX({UPDATED_AT}), 0) FROM {UPDATES}"),
-                [],
-                |row| row.get(0),
-            )?;
-            (files, updated_at)
+            stmt.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(id)
+            })?
+            .collect::<Result<Vec<TrackId>, _>>()?
         };
-
         tx.commit()?;
+        Ok(track_ids)
+    }
+
+    /// Opens transaction, must not be used in a loop for performance
+    fn get_track_files(&mut self, track: TrackId) -> Result<Vec<HashedFile>, StorageError> {
+        let mut tx = self.db.transaction()?;
+        let res = Self::_get_track_files(&mut tx, track)?;
+        tx.commit()?;
+        Ok(res)
+    }
+
+    /// Retrieves all files from database that correspond to the given track
+    fn _get_track_files(
+        tx: &mut Transaction,
+        track: TrackId,
+    ) -> Result<Vec<HashedFile>, StorageError> {
+        // TODO: write test
+        let files = {
+            // Query the files table directly filtering by the integer track_id
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {USB_LABEL}, {PATH}, {FILE_SIZE}, {FILE_HASH}
+             FROM {FILES}
+             WHERE {TRACK_ID} = ?"
+            ))?;
+
+            stmt.query_map([track], |row| {
+                let usb_label: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let file_size: i64 = row.get(2)?;
+                let hash: String = row.get(3)?;
+
+                Ok((LocationRow { usb_label, path }, file_size, hash))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
 
         let files = files
             .into_iter()
-            .map(|(track, file)| Ok(HashedFile::new(track?, file)))
+            .map(|(lr, file_size, hash)| {
+                Ok(HashedFile {
+                    hash: FileHash::from_hex(hash).map_err(|e| {
+                        StorageError::Internal(anyhow!("Database contains invalid file hash {e}"))
+                    })?,
+                    file: FileWithMeta {
+                        loc: lr.into(),
+                        file_size,
+                    },
+                })
+            })
             .collect::<Result<Vec<_>, StorageError>>()?;
 
-        let updated_at = i64_seconds_to_local_time(updated_at).map_err(|e| {
-            StorageError::Internal(e.context("database update times contains invalid time"))
-        })?;
-
-        Ok(DBSnapshot { updated_at, files })
+        Ok(files)
     }
 
     pub fn scan_metadata(&mut self) -> Result<Vec<Track>, StorageError> {
         let tx = self.db.transaction()?; // rusqlite::Error propagates here
 
         let mut stmt = tx.prepare(
-            "SELECT track_id, title, artist, year, label, artwork_url FROM track_metadata",
+            &format!("SELECT {TRACK_ID}, {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL} FROM {TRACK_METADATA}"),
         )?;
 
         // query_map returns Result<Rows<Result<Track, StorageError>>, rusqlite::Error>
         let rows = stmt.query_map([], |row| {
-            let track_id_hex: String = row.get(0)?;
-
-            // explicitly handle TrackId conversion
-            let track_id = match TrackId::from_hex(&track_id_hex) {
-                Ok(id) => id,
-                Err(e) => return Ok(Err(StorageError::InvalidTrackId(e))), // store error explicitly
-            };
+            let track_id: i64 = row.get(0)?;
 
             Ok(Ok(Track {
                 id: track_id,
@@ -195,71 +197,124 @@ impl Storage {
         Ok(())
     }
 
-    /// Inserts new tracks entries into the database
-    ///
-    /// Files already present in database will raise error
-    fn insert_tracks(
-        &mut self,
-        tracks_with_files: impl IntoIterator<Item = (TrackId, FileWithMeta)>,
-    ) -> Result<(), StorageError> {
-        let tx = self.db.transaction()?; // start a transaction
-        for (track_id, file) in tracks_with_files {
-            let track_id_str = track_id.to_string();
+    /// Reads the latest updated timestamp from the database.
+    pub fn updated_at(&mut self) -> Result<DateTime<Local>, StorageError> {
+        // We use COALESCE to gracefully fall back to 0 if the table is empty
+        let sql = format!("SELECT COALESCE(MAX({UPDATED_AT}), 0) FROM {UPDATES}");
+        let latest_time: i64 = self.db.query_one(&sql, [], |row| row.get(0))?;
+        i64_seconds_to_local_time(latest_time).map_err(|e| StorageError::Internal(e))
+    }
 
-            // ---------- Insert track if it does not exist ----------
-            tx.execute(
-                "INSERT OR IGNORE INTO tracks (track_id) VALUES (?1)",
-                params![&track_id_str],
-            )?;
+    /// Helper to look up an existing track ID by file hash, or provision a new track row if missing.
+    fn get_or_create_track_id(
+        tx: &Transaction,
+        hash: &FileHash,
+    ) -> Result<TrackId, rusqlite::Error> {
+        let hash = hash.to_string();
+        // Query to find existing track by file hash
+        let query = format!("SELECT {TRACK_ID} FROM {FILES} WHERE {FILE_HASH} = ?1 LIMIT 1");
+        let mut find_track_stmt = tx.prepare_cached(&query)?;
 
-            let loc: LocationRow = LocationRow::from_location(file.loc.clone())?;
+        let existing_track_id: Option<TrackId> = find_track_stmt
+            .query_row(params![hash], |row| row.get(0))
+            .optional()?;
 
-            // ---------- Insert file (must NOT already exist) ----------
-            tx.execute(
-                &format!(
-                    "INSERT INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}, {FILE_SIZE})
-                            VALUES (?1, ?2, ?3, ?4)"
-                ),
-                params![&loc.usb_label, &loc.path, &track_id_str, file.file_size,],
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::SqliteFailure(ref err, _)
-                    if err.code == ErrorCode::ConstraintViolation =>
-                {
-                    StorageError::DuplicateLocation {
-                        path: file.loc,
-                        hint: "Attempted to insert a location that already exists. \
-                           This usually means the file content changed without renaming. \
-                           Consider forgetting the old entry and running update again."
-                            .into(),
-                    }
-                }
-                e => StorageError::Database(e),
-            })?;
+        if let Some(id) = existing_track_id {
+            Ok(id)
+        } else {
+            // Insert a new default row into tracks to auto-increment a new ID
+            let insert_query = format!("INSERT INTO {TRACKS} DEFAULT VALUES");
+            let mut insert_track_stmt = tx.prepare_cached(&insert_query)?;
+            insert_track_stmt.execute([])?;
+
+            Ok(tx.last_insert_rowid())
         }
-        Self::insert_update_time(&tx)?;
+    }
 
-        tx.commit()?; // commit everything at once
-        Ok(())
+    /// Inserts a single file entry bound to a specific TrackId.
+    /// Returns `Ok(true)` if inserted, or `Ok(false)` if ignored due to a location conflict.
+    fn insert_file(
+        tx: &rusqlite::Transaction,
+        track_id: TrackId,
+        hashed_file: &HashedFile,
+    ) -> Result<bool, StorageError> {
+        let insert_file_query = format!(
+            "INSERT OR IGNORE INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}, {FILE_SIZE}, {FILE_HASH}) \
+             VALUES (?1, ?2, ?3, ?4, ?5)"
+        );
+        let mut stmt = tx.prepare_cached(&insert_file_query)?;
+
+        let loc_row = LocationRow::from_location(hashed_file.file.loc.clone())?;
+        let rows_changed = stmt.execute(rusqlite::params![
+            loc_row.usb_label,
+            loc_row.path,
+            track_id,
+            hashed_file.file.file_size,
+            hashed_file.hash.to_string()
+        ])?;
+
+        Ok(rows_changed > 0)
+    }
+
+    /// Inserts track files, grouping by hash. Reuses track IDs on hash matches.
+    ///
+    /// Ignores location conflicts. Returns only newly inserted items.
+    fn insert_files(
+        &mut self,
+        files: impl IntoIterator<Item = HashedFile>,
+    ) -> Result<HashMap<TrackId, HashSet<HashedFile>>, StorageError> {
+        let mut grouped_by_hash: HashMap<FileHash, Vec<HashedFile>> = HashMap::new();
+        for hashed_file in files {
+            grouped_by_hash
+                .entry(hashed_file.hash.clone())
+                .or_default()
+                .push(hashed_file);
+        }
+
+        let tx = self.db.transaction()?;
+        let mut inserted_tracks: HashMap<TrackId, HashSet<HashedFile>> = HashMap::new();
+
+        for (hash, hashed_files) in grouped_by_hash {
+            // Find existing track or generate a brand new one for this content hash
+            let track_id = Self::get_or_create_track_id(&tx, &hash)?;
+
+            for hashed_file in hashed_files {
+                // Call the granular single insert helper
+                if Self::insert_file(&tx, track_id, &hashed_file)? {
+                    inserted_tracks
+                        .entry(track_id)
+                        .or_default()
+                        .insert(hashed_file);
+                }
+            }
+        }
+
+        if !inserted_tracks.is_empty() {
+            Self::insert_update_time(&tx)?;
+        }
+
+        tx.commit()?;
+        Ok(inserted_tracks)
     }
 
     /// Recursively scans all music files in the library source. Retrieves their paths and metadata
-    fn scan_fs(&mut self) -> Result<FsSnapshot, StorageError> {
+    fn scan_fs(self_fs: &mut FileStorage) -> Result<FsSnapshot, StorageError> {
         println!("Scanning music on file system...");
-        let fs = self.fs.scan(&self.source)?;
+        let fs = self_fs.scan()?;
         Ok(fs)
     }
 
     /// checks for new music files not present in database
     pub fn check_new(&mut self) -> Result<HashSet<FileWithMeta>, StorageError> {
-        let fs = self.scan_fs()?;
-        let db: HashSet<FileWithMeta> = self
-            .scan_db()?
-            .files
-            .into_iter()
-            .map(|fm| fm.file)
-            .collect();
-        Ok(fs.difference(&db).cloned().collect())
+        let mut fs = HashSet::new();
+        let mut tx = self.db.transaction()?;
+        for file in Self::scan_fs(&mut self.fs)? {
+            if Self::_find_track_by_file(&mut tx, &file)?.is_none() {
+                fs.insert(file);
+            }
+        }
+        tx.commit()?;
+        Ok(fs)
     }
 
     /// Returns tracks that have no associated files.
@@ -286,10 +341,10 @@ impl Storage {
             ))?;
 
             stmt.query_map([], |row| {
-                let track_id_hex: String = row.get(0)?;
+                let track_id: i64 = row.get(0)?;
                 let has_metadata: bool = row.get(1)?;
 
-                Ok((track_id_hex, has_metadata))
+                Ok((track_id, has_metadata))
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
@@ -298,13 +353,7 @@ impl Storage {
 
         let mut result = StaleTracks::default();
 
-        for (track_id_hex, has_metadata) in stale_rows {
-            let track_id = TrackId::from_hex(&track_id_hex).map_err(|e| {
-                StorageError::InvalidTrackId(format!(
-                    "Database contains invalid track id in stale track query: {e}"
-                ))
-            })?;
-
+        for (track_id, has_metadata) in stale_rows {
             if has_metadata {
                 result.metadata_only.push(track_id);
             } else {
@@ -315,7 +364,10 @@ impl Storage {
         Ok(result)
     }
 
-    pub fn update_db_with_new_files(&mut self) -> Result<Vec<HashedFile>, StorageError> {
+    /// Scans for untracked files, hashes them, and commits them to the database.
+    pub fn update_db_with_new_files(
+        &mut self,
+    ) -> Result<HashMap<TrackId, HashSet<HashedFile>>, StorageError> {
         let new_files = self.check_new()?;
         if !new_files.is_empty() {
             println!("Hashing {} new files", new_files.len());
@@ -326,43 +378,125 @@ impl Storage {
                 Ok(path) => path,
                 Err(e) => return Err(StorageError::Internal(anyhow!("Failed to resolve a file location. Possibly a drive got removed during the operation: {e}"))),
             };
-            let id = TrackId::from_file(&path)?;
-            Ok((id, f))
+            let hash = FileHash::from_file(&path)?;
+            Ok(HashedFile::new(hash, f))
         }).collect::<Result<Vec<_>, _>>()?;
-        self.insert_tracks(with_hash.clone())?;
-        Ok(with_hash
-            .into_iter()
-            .map(|(id, f)| HashedFile {
-                track_id: id,
-                file: f,
-            })
-            .collect())
+        self.insert_files(with_hash.clone())
     }
 
     /// checks for tracks without available files.
-    ///
-    /// ignores tracks that have at least one available file
     pub fn check_missing(
         &mut self,
     ) -> Result<HashMap<TrackId, HashSet<FileWithMeta>>, StorageError> {
-        let fs = self.scan_fs()?;
-        let db = self.scan_db()?.files;
+        let fs = self.fs.scan()?;
 
         let mut track_db_locs: HashMap<TrackId, HashSet<FileWithMeta>> = Default::default();
-        let mut seen_tracks: HashSet<TrackId> = Default::default();
-        for hf in db {
-            if fs.contains(&hf.file) {
-                seen_tracks.insert(hf.track_id);
+
+        let tracks = self.get_tracks()?;
+
+        let mut tx = self.db.transaction()?;
+        for track in tracks {
+            let track_files = Self::_get_track_files(&mut tx, track)?;
+            for db_file in track_files {
+                if !fs.contains(&db_file.file) {
+                    track_db_locs
+                        .entry(track)
+                        .or_insert(Default::default())
+                        .insert(db_file.file);
+                }
             }
-            track_db_locs
-                .entry(hf.track_id)
-                .or_insert(Default::default())
-                .insert(hf.file);
         }
-        for track in seen_tracks {
-            track_db_locs.remove(&track);
-        }
+        tx.commit()?;
         Ok(track_db_locs)
+    }
+
+    /// Merges a slave track into a master track.
+    /// All files and card mappings belonging to the slave are moved to the master.
+    /// The slave track and its metadata are completely deleted.
+    ///
+    /// # Errors
+    /// Returns `StorageError::SlaveTrackHasMetadata` if the slave track has metadata
+    /// AND `ignore_slave_meta` is set to `false`.
+    pub fn merge_tracks(
+        &mut self,
+        master_id: TrackId,
+        slave_id: TrackId,
+        ignore_slave_meta: bool,
+    ) -> Result<(), StorageError> {
+        if master_id == slave_id {
+            return Ok(());
+        }
+
+        let tx = self.db.transaction()?;
+
+        // 1. Protection Check: Check if the slave track has metadata
+        let slave_has_meta_query =
+            format!("SELECT 1 FROM {TRACK_METADATA} WHERE {TRACK_ID} = ?1 LIMIT 1");
+        let has_meta: bool = tx
+            .prepare_cached(&slave_has_meta_query)?
+            .query_row(rusqlite::params![slave_id], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+
+        if has_meta && !ignore_slave_meta {
+            return Err(StorageError::SlaveTrackHasMetadata(slave_id));
+        }
+
+        // 2. Point all files belonging to the slave track to the master track
+        let update_files_query =
+            format!("UPDATE {FILES} SET {TRACK_ID} = ?1 WHERE {TRACK_ID} = ?2");
+        tx.prepare_cached(&update_files_query)?
+            .execute(rusqlite::params![master_id, slave_id])?;
+
+        // 3. Point all card mappings belonging to the slave track to the master track
+        let update_cards_query =
+            format!("UPDATE {CARD_MAPPINGS} SET {TRACK_ID} = ?1 WHERE {TRACK_ID} = ?2");
+        tx.prepare_cached(&update_cards_query)?
+            .execute(rusqlite::params![master_id, slave_id])?;
+
+        // 4. Delete the slave track from the tracks ledger.
+        // Due to FOREIGN KEY (... ) ON DELETE CASCADE, this automatically deletes
+        // the slave track's metadata entry from the track_metadata table.
+        let delete_track_query = format!("DELETE FROM {TRACKS} WHERE {TRACK_ID} = ?1");
+        tx.prepare_cached(&delete_track_query)?
+            .execute(rusqlite::params![slave_id])?;
+
+        // 5. Update ledger tracking time since the library structures changed
+        Self::insert_update_time(&tx)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Links a physical file path to an existing master track.
+    /// This is useful for adding high-quality, fixed, or alternative versions.
+    pub fn add_file_to_track(
+        &mut self,
+        master_id: TrackId,
+        physical_path: &Path,
+    ) -> Result<(), StorageError> {
+        // 1. Invert the physical path back to a structured library Location
+        let location = self.fs.reverse_resolve(physical_path)?;
+        // 2. Compute the file properties needed for insertion
+        let file_size = std::fs::metadata(physical_path)?.len() as i64;
+        let hash = FileHash::from_file(physical_path)?;
+
+        let hashed_file = HashedFile::new(
+            hash,
+            FileWithMeta {
+                loc: location,
+                file_size,
+            },
+        );
+        let mut tx = self.db.transaction()?;
+        // Make sure master track exists
+        let _ = Self::_resolve_track(&mut tx, master_id.to_string())?;
+        let inserted = Self::insert_file(&tx, master_id, &hashed_file)?;
+        if inserted {
+            Self::insert_update_time(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_track_metadata(
@@ -392,6 +526,52 @@ impl Storage {
         }))
     }
 
+    /// Looks up a track with given file location
+    fn _find_track_by_file(
+        tx: &mut Transaction,
+        file: &FileWithMeta,
+    ) -> Result<Option<(TrackId, HashedFile)>, StorageError> {
+        let loc_row = LocationRow::from_location(file.loc.clone())?;
+
+        let result = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {TRACK_ID}, {FILE_HASH}
+             FROM {FILES}
+             WHERE {USB_LABEL} = ?1 AND {PATH} = ?2
+             LIMIT 1"
+            ))?;
+
+            // query_row returns Optional values cleanly if we catch Optional results or query gracefully
+            let mut rows = stmt.query([&loc_row.usb_label, &loc_row.path])?;
+
+            if let Some(row) = rows.next()? {
+                let track_id_raw: i64 = row.get(0)?;
+                let hash_str: String = row.get(1)?;
+
+                Some((track_id_raw, hash_str))
+            } else {
+                None
+            }
+        };
+
+        // Map the database string hash and integer ID into the strongly-typed structures
+        match result {
+            Some((track_id, hash_str)) => {
+                let hash = FileHash::from_hex(&hash_str).map_err(|e| {
+                    StorageError::Internal(anyhow!("Database contains invalid file hash {e}"))
+                })?;
+
+                let hashed_file = HashedFile {
+                    hash,
+                    file: file.clone(),
+                };
+
+                Ok(Some((track_id, hashed_file)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// retrieves file of the track, checking that it is a valid music file in the file system
     ///
     /// If multiple paths point to the same track, chooses one of them.
@@ -415,7 +595,7 @@ impl Storage {
         .map_err(StorageError::Database)?;
 
         if paths.is_empty() {
-            return Err(StorageError::TrackNotFound(track_id));
+            return Err(StorageError::TrackNotFound(track_id.to_string()));
         }
 
         let mut unmounted_locations = vec![];
@@ -453,6 +633,43 @@ impl Storage {
         })
     }
 
+    fn _resolve_track(tx: &mut Transaction, card_id: CardId) -> Result<TrackId, StorageError> {
+        let card_str = card_id.to_string();
+        // Parse into a valid integer ID if possible, otherwise default to an invalid ID like -1
+        let parsed_id = card_str.parse::<i64>().unwrap_or(-1);
+
+        // LEFT JOIN ensures tracks without card mappings are still accessible via their raw ID
+        let query = format!(
+            "SELECT t.{TRACK_ID}
+             FROM {TRACKS} t
+             LEFT JOIN {CARD_MAPPINGS} cm ON t.{TRACK_ID} = cm.{TRACK_ID}
+             WHERE cm.{CARD_ID} = ?1 OR t.{TRACK_ID} = ?2
+             LIMIT 1"
+        );
+
+        let mut stmt = tx.prepare_cached(&query)?;
+        let track_id: Option<TrackId> = stmt
+            .query_row(rusqlite::params![&card_str, parsed_id], |row| row.get(0))
+            .optional()?;
+
+        drop(stmt);
+
+        match track_id {
+            Some(id) => Ok(id),
+            None => Err(StorageError::TrackNotFound(card_id)),
+        }
+    }
+
+    /// Finds track id based on card_id alias
+    ///
+    /// If given id is a valid track id, tries it as it is as well
+    pub fn resolve_track(&mut self, card_id: CardId) -> Result<TrackId, StorageError> {
+        let mut tx = self.db.transaction()?;
+        let res = Self::_resolve_track(&mut tx, card_id)?;
+        tx.commit()?;
+        Ok(res)
+    }
+
     pub fn find_track_file_with_meta(
         &mut self,
         track: TrackId,
@@ -462,7 +679,7 @@ impl Storage {
         Ok((path, loc, meta))
     }
 
-    /// searches for a file where path, track_id, artist or title matches the query
+    /// searches for a file where path, track_id, hash, card_id, artist or title matches the query
     ///
     /// conditionally selects only tracks without meta data
     pub fn find_files(
@@ -475,85 +692,60 @@ impl Storage {
         let cleaned_query = query.trim().to_lowercase();
         let like_query = format!("%{}%", cleaned_query);
 
+        // 1. Build base query with all required table joins using constants
         let mut sql = format!(
-            "
-            SELECT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
-            FROM {FILES} f
-            LEFT JOIN {TRACK_METADATA} tm
-                ON f.{TRACK_ID} = tm.{TRACK_ID}
-            WHERE 1=1
-            "
+            "SELECT DISTINCT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
+             FROM {FILES} f
+             LEFT JOIN {TRACK_METADATA} tm ON f.{TRACK_ID} = tm.{TRACK_ID}
+             LEFT JOIN {CARD_MAPPINGS} cm ON f.{TRACK_ID} = cm.{TRACK_ID}
+             WHERE 1=1"
         );
 
-        // Apply search filter
+        // 2. Append conditional filters
         if !cleaned_query.is_empty() {
             sql.push_str(&format!(
-                "
-        AND (
-            LOWER(f.{PATH}) LIKE ?1 OR
-            LOWER(f.{TRACK_ID}) LIKE ?1 OR
-            LOWER(tm.{ARTIST}) LIKE ?1 OR
-            LOWER(tm.{TITLE}) LIKE ?1
-        )
-        "
+                " AND (
+                    LOWER(f.{PATH}) LIKE ?1 OR
+                    LOWER(f.{TRACK_ID}) LIKE ?1 OR
+                    LOWER(f.{FILE_HASH}) LIKE ?1 OR
+                    LOWER(cm.{CARD_ID}) LIKE ?1 OR
+                    LOWER(tm.{ARTIST}) LIKE ?1 OR
+                    LOWER(tm.{TITLE}) LIKE ?1
+                )"
             ));
         }
 
-        // Apply no_meta filter
         if no_meta {
-            sql.push_str(" AND tm.track_id IS NULL ");
+            sql.push_str(&format!(" AND tm.{TRACK_ID} IS NULL"));
         }
 
+        // 3. Prepare statement and run execution cleanly via a single branch
         let mut stmt = tx.prepare(&sql)?;
 
-        let results = if !cleaned_query.is_empty() {
-            stmt.query_map([like_query], |row| {
-                let track_id_hex: String = row.get(0)?;
-                let usb_label: String = row.get(1)?;
-                let path: String = row.get(2)?;
-
-                match TrackId::from_hex(&track_id_hex) {
-                    Ok(track_id) => {
-                        let loc: Location = LocationRow { usb_label, path }.into();
-                        Ok(Some((track_id, loc)))
-                    }
-                    Err(_) => {
-                        log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
-                        Ok(None)
-                    }
-                }
-            })?
-            .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, _>>()?
+        let params = if !cleaned_query.is_empty() {
+            rusqlite::params![like_query]
         } else {
-            stmt.query_map([], |row| {
-                let track_id_hex: String = row.get(0)?;
+            rusqlite::params![]
+        };
+
+        let rows = stmt
+            .query_map(params, |row| {
+                let track_id: i64 = row.get(0)?;
                 let usb_label: String = row.get(1)?;
                 let path: String = row.get(2)?;
 
-                match TrackId::from_hex(&track_id_hex) {
-                    Ok(track_id) => {
-                        let loc: Location = LocationRow { usb_label, path }.into();
-                        Ok(Some((track_id, loc)))
-                    }
-                    Err(_) => {
-                        log::warn!("Corrupted track_id '{}' in table {}", track_id_hex, FILES);
-                        Ok(None)
-                    }
-                }
+                let loc: Location = LocationRow { usb_label, path }.into();
+                Ok((track_id, loc))
             })?
-            .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, _>>()?
-        };
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
         drop(stmt);
         tx.commit()?;
 
-        // build map
+        // 4. Construct response hash map grouping locations by track ID
         let mut map: HashMap<TrackId, HashSet<Location>> = HashMap::new();
-
-        for (key, value) in results {
-            map.entry(key).or_default().insert(value);
+        for (track_id, loc) in rows {
+            map.entry(track_id).or_default().insert(loc);
         }
 
         Ok(map)
@@ -586,7 +778,7 @@ impl Storage {
             "
             ))?;
 
-            stmt.query_map([], |row| row.get::<_, String>(0))?
+            stmt.query_map([], |row| row.get::<_, TrackId>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
 
@@ -644,7 +836,7 @@ impl Storage {
 
         let affected_track_ids = stmt
             .query_map(params![path_prefix, dir_prefix], |row| {
-                row.get::<_, String>(0)
+                row.get::<_, TrackId>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -707,7 +899,7 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let tx = self.db.transaction()?;
 
-        // ---------- Step 2: load current metadata ----------
+        // ---------- load current metadata ----------
         let current_meta: Option<TrackMetadata> = (|| {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL}
@@ -732,7 +924,7 @@ impl Storage {
 
         let merged = Self::update_meta(track_id, current_meta, new_meta, allow_overwrite)?;
 
-        // ---------- Step 5: upsert ----------
+        // ---------- upsert ----------
         let _ = tx
             .execute(
                 &format!(
@@ -760,7 +952,7 @@ impl Storage {
                 rusqlite::Error::SqliteFailure(error, _)
                     if error.code == ErrorCode::ConstraintViolation =>
                 {
-                    StorageError::TrackNotFound(track_id)
+                    StorageError::TrackNotFound(track_id.to_string())
                 }
                 e => StorageError::Database(e),
             })?;
@@ -903,14 +1095,14 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        TrackId,
         config::LibrarySource,
-        db::i64_seconds_to_local_time,
         error::StorageError,
-        fs::FileWithMeta,
+        file_hash::FileHash,
+        fs::{FileWithMeta, HashedFile},
         location::Location,
         operations::{MetadataUpdate, Storage, replace_windows_slashes},
         schema::{self, *},
+        track::TrackId,
         usb::LocationResolver,
     };
 
@@ -920,13 +1112,13 @@ mod tests {
         size
     }
 
-    fn mock_trackid(x: i32) -> TrackId {
+    fn mock_hash(x: i32) -> FileHash {
         let bytes = x.to_be_bytes();
-        TrackId::from_bytes(&bytes)
+        FileHash::from_bytes(&bytes)
     }
 
-    fn mock_trackid_str(x: i32) -> String {
-        mock_trackid(x).to_hex()
+    fn mock_hash_str(x: i32) -> String {
+        mock_hash(x).to_hex()
     }
 
     fn setup_storage(tmp_dir: &Path) -> anyhow::Result<Storage> {
@@ -945,14 +1137,41 @@ mod tests {
         ))
     }
 
-    fn insert_tracks(conn: &Connection, tracks: impl IntoIterator<Item = TrackId>) {
-        for track in tracks {
-            conn.execute(
-                &format!("INSERT INTO {TRACKS} ({TRACK_ID}) VALUES (?1)"),
-                params![track.to_string()],
-            )
-            .unwrap();
+    fn setup_clean_storage() -> anyhow::Result<Storage> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        Ok(Storage::from_existing_conn(
+            conn,
+            LibrarySource {
+                roots: vec![],
+                follow_symlinks: false,
+                ignored_dirs: vec![],
+            },
+        ))
+    }
+
+    /// Helper to seed tracks in tests, returning the generated IDs in order
+    fn insert_tracks(conn: &mut Connection, count: usize) -> Vec<TrackId> {
+        let tx = conn.transaction().unwrap();
+        let mut generated_ids = Vec::with_capacity(count);
+
+        {
+            let mut stmt = tx
+                .prepare(&format!("INSERT INTO {TRACKS} ({TRACK_ID}) VALUES (NULL)"))
+                .unwrap();
+
+            for _ in 0..count {
+                stmt.execute([]).unwrap();
+
+                // Snatch the ID SQLite just minted
+                let id = tx.last_insert_rowid();
+                generated_ids.push(id);
+            }
         }
+
+        tx.commit().unwrap();
+        generated_ids
     }
 
     fn insert_fake_files<S: AsRef<str>>(
@@ -961,7 +1180,7 @@ mod tests {
         usb_label: Option<String>,
     ) {
         for (track, path, fs) in tracks {
-            insert_file(&conn, &track.to_string(), path.as_ref(), &usb_label, fs);
+            insert_file(&conn, track, path.as_ref(), &usb_label, fs);
         }
     }
 
@@ -973,35 +1192,212 @@ mod tests {
         for (track, path) in tracks {
             let p: &str = path.as_ref();
             let fs = file_size(p.as_ref());
-            insert_file(&conn, &track.to_string(), path.as_ref(), &usb_label, fs);
+            insert_file(&conn, track, path.as_ref(), &usb_label, fs);
         }
     }
 
     #[test]
-    fn test_scan_db() -> anyhow::Result<()> {
+    fn test_resolve_track_success() -> anyhow::Result<()> {
         let mut conn = rusqlite::Connection::open_in_memory()?;
-
         schema::init(&conn)?;
 
-        insert_tracks(&mut conn, [mock_trackid(1)]);
-        insert_fake_files(
-            &mut conn,
-            [(mock_trackid(1), "song.mp3", MOCKED_FILE_SIZE)],
-            None,
-        );
+        // Provision an internal track ID to link against
+        let tracks = insert_tracks(&mut conn, 1);
+        let expected_track_id = tracks[0];
+        let card_id = "RFID_SUCCESS_123";
 
+        // Manually seed the card mapping row
         conn.execute(
-            &format!("INSERT INTO {UPDATES} ({UPDATED_AT}) VALUES (?1)"),
-            params![200],
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params![card_id, expected_track_id],
         )?;
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let snapshot = storage.scan_db()?;
+        // Act
+        let resolved_id = storage.resolve_track(card_id.into())?;
+        let resolved_id2 = storage.resolve_track(expected_track_id.to_string())?;
 
-        assert_eq!(snapshot.files.len(), 1);
-        assert_eq!(snapshot.files[0].file.loc, Location::from_path("song.mp3"));
-        assert_eq!(snapshot.updated_at, i64_seconds_to_local_time(200).unwrap());
+        // Assert
+        assert_eq!(resolved_id, expected_track_id);
+        assert_eq!(resolved_id2, expected_track_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_trackid_itself() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        // Provision an internal track ID to link against
+        let tracks = insert_tracks(&mut conn, 1);
+        let expected_track_id = tracks[0];
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        // Act
+        let resolved_id = storage.resolve_track(expected_track_id.to_string())?;
+
+        // Assert
+        assert_eq!(resolved_id, expected_track_id);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_track_not_found() -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+        let missing_card_id = "RFID_MISSING_999";
+
+        // Act
+        let result = storage.resolve_track(missing_card_id.into());
+
+        // Assert
+        assert!(result.is_err(), "Expected an error for an unmapped card ID");
+
+        match result {
+            Err(StorageError::TrackNotFound(returned_card_id)) => {
+                assert_eq!(returned_card_id.to_string(), missing_card_id);
+            }
+            _ => panic!("Expected StorageError::TrackNotFound variant"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_tracks() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+
+        // Provision 2 tracks: 0 will be Master, 1 will be Slave
+        let tracks = insert_tracks(&mut conn, 2);
+        let master = tracks[0];
+        let slave = tracks[1];
+
+        // Seed Files
+        insert_fake_files(
+            &mut conn,
+            vec![
+                (master, "old_low_quality.mp3", MOCKED_FILE_SIZE),
+                (slave, "new_high_quality.flac", MOCKED_FILE_SIZE),
+            ],
+            None,
+        );
+
+        // Seed a Card Mapping to the Slave track
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["SLAVE_CARD_RFID", slave],
+        )?;
+
+        // Seed Metadata for both (Master has good metadata, Slave has none or dummy)
+        conn.execute(
+            &format!(
+                "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}) VALUES (?1, ?2, ?3)"
+            ),
+            rusqlite::params![master, "Good Title", "Great Artist"],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}) VALUES (?1, ?2, ?3)"
+            ),
+            rusqlite::params![slave, "Dummy Title", "Dummy Artist"],
+        )?;
+
+        let mut storage = Storage::from_existing_conn(conn, Default::default());
+
+        // Act: Merge slave into master
+        assert!(
+            storage.merge_tracks(master, slave, false).is_err(),
+            "expected failure because slave had metadata"
+        );
+        storage.merge_tracks(master, slave, true)?;
+
+        // Assert 1: Both files should now belong to the master track ID
+        let mut stmt = storage.db.prepare(&format!(
+            "SELECT {PATH} FROM {FILES} WHERE {TRACK_ID} = ?1 ORDER BY {PATH}"
+        ))?;
+        let files: Vec<String> = stmt
+            .query_map([master], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], "new_high_quality.flac");
+        assert_eq!(files[1], "old_low_quality.mp3");
+
+        // Assert 2: The card mapping should have transferred seamlessly to the master track
+        let card_track_id: i64 = storage.db.query_row(
+            &format!("SELECT {TRACK_ID} FROM {CARD_MAPPINGS} WHERE {CARD_ID} = ?1"),
+            ["SLAVE_CARD_RFID"],
+            |r| r.get(0),
+        )?;
+        assert_eq!(card_track_id, master);
+
+        // Assert 3: Slave track and its metadata are completely gone
+        let slave_track_exists: i64 = storage.db.query_row(
+            &format!("SELECT COUNT(*) FROM {TRACKS} WHERE {TRACK_ID} = ?1"),
+            [slave],
+            |r| r.get(0),
+        )?;
+        assert_eq!(slave_track_exists, 0);
+
+        let slave_meta_exists: i64 = storage.db.query_row(
+            &format!("SELECT COUNT(*) FROM {TRACK_METADATA} WHERE {TRACK_ID} = ?1"),
+            [slave],
+            |r| r.get(0),
+        )?;
+        assert_eq!(slave_meta_exists, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_file_to_track_fails_if_master_missing() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("song_hq.mp3");
+        std::fs::write(&path, b"audio_data")?;
+
+        let mut storage = setup_storage(dir.path())?;
+
+        let result = storage.add_file_to_track(99999, &path);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_file_to_track_success() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("song_hq.mp3");
+        std::fs::write(&path, b"audio_high_res")?;
+
+        let mut storage = setup_storage(dir.path())?;
+
+        // 1. Manually insert an empty track row into the ledger to get a master ID
+        storage
+            .db
+            .execute("INSERT INTO tracks DEFAULT VALUES", [])?;
+        let master_id: i64 = storage.db.last_insert_rowid();
+
+        // 2. Act: Link our new physical file directly to that master ID
+        storage.add_file_to_track(master_id, &path)?;
+
+        // 3. Assert: Verify the file row points to our master ID
+        let mut stmt = storage
+            .db
+            .prepare("SELECT track_id, path FROM files LIMIT 1")?;
+
+        let (linked_track_id, file_path) = stmt.query_row([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        assert_eq!(linked_track_id, master_id);
+        assert!(file_path.ends_with("song_hq.mp3"));
 
         Ok(())
     }
@@ -1021,23 +1417,26 @@ mod tests {
 
         // IMPORTANT:
         // insert tracks but NO file rows yet
-        let track1 = TrackId::from_file(&path1)?;
-        let track2 = TrackId::from_file(&path2)?;
-
+        let track1 = FileHash::from_file(&path1)?;
+        let track2 = FileHash::from_file(&path2)?;
         // --- run update ---
         let result = storage.update_db_with_new_files()?;
 
         // --- verify return value ---
         assert_eq!(result.len(), 2);
 
-        let ids: Vec<_> = result.iter().map(|h| h.track_id.clone()).collect();
-        assert!(ids.contains(&track1));
-        assert!(ids.contains(&track2));
+        let hashes: HashSet<_> = result
+            .iter()
+            .flat_map(|h| h.1.clone().into_iter())
+            .map(|f| f.hash)
+            .collect();
+        assert!(hashes.contains(&track1));
+        assert!(hashes.contains(&track2));
 
         // --- verify DB state ---
         let mut stmt = storage
             .db
-            .prepare("SELECT track_id, path FROM files ORDER BY track_id")?;
+            .prepare("SELECT file_hash, path FROM files ORDER BY path")?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -1060,6 +1459,142 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_files_fresh_tracks() -> anyhow::Result<()> {
+        let mut storage = setup_clean_storage()?;
+
+        let file_a = HashedFile::new(
+            mock_hash(1),
+            FileWithMeta {
+                loc: Location::from_path("a.mp3"),
+                file_size: 100,
+            },
+        );
+        let file_b = HashedFile::new(
+            mock_hash(2),
+            FileWithMeta {
+                loc: Location::from_path("b.mp3"),
+                file_size: 200,
+            },
+        );
+
+        // Path 1: Insert completely brand new files
+        let result = storage.insert_files([file_a.clone(), file_b.clone()])?;
+
+        // Should return both items under 2 distinct generated track IDs
+        assert_eq!(result.len(), 2);
+
+        // Verify update time was bumped because rows were inserted
+        let count: i64 =
+            storage
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {UPDATES}"), [], |r| r.get(0))?;
+        assert_eq!(count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_files_reuses_track_id_for_matching_hashes() -> anyhow::Result<()> {
+        let mut storage = setup_clean_storage()?;
+        let shared_hash = mock_hash(1);
+
+        let file_a = HashedFile::new(
+            shared_hash.clone(),
+            FileWithMeta {
+                loc: Location::from_path("a.mp3"),
+                file_size: 100,
+            },
+        );
+        let file_b = HashedFile::new(
+            shared_hash.clone(),
+            FileWithMeta {
+                loc: Location::from_path("b.mp3"),
+                file_size: 100,
+            },
+        );
+
+        // Path 2: Distinct locations, but identical file content hashes
+        let result = storage.insert_files([file_a, file_b])?;
+
+        // Should group both files under exactly ONE TrackId entry
+        assert_eq!(result.len(), 1);
+        let (_, grouped_files) = result.iter().next().unwrap();
+        assert_eq!(grouped_files.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_files_ignores_duplicate_locations() -> anyhow::Result<()> {
+        let mut storage = setup_clean_storage()?;
+
+        let file_original = HashedFile::new(
+            mock_hash(1),
+            FileWithMeta {
+                loc: Location::from_path("collision.mp3"),
+                file_size: 100,
+            },
+        );
+        // Different hash, but exact same target location path
+        let file_conflict = HashedFile::new(
+            mock_hash(2),
+            FileWithMeta {
+                loc: Location::from_path("collision.mp3"),
+                file_size: 999,
+            },
+        );
+
+        // Seed the first file safely
+        storage.insert_files([file_original])?;
+
+        // Path 3: Attempt to insert to a primary key location that already exists
+        let result = storage.insert_files([file_conflict])?;
+
+        // Should be completely ignored by `INSERT OR IGNORE` and excluded from return map
+        assert!(
+            result.is_empty(),
+            "Conflicting locations must be skipped and omitted from return payload"
+        );
+
+        // DB state verification: Total file count in DB should still be exactly 1
+        let total_files: i64 =
+            storage
+                .db
+                .query_row(&format!("SELECT COUNT(*) FROM {FILES}"), [], |r| r.get(0))?;
+        assert_eq!(total_files, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_or_create_track_id() -> anyhow::Result<()> {
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        schema::init(&conn)?;
+        let tx = conn.transaction()?;
+
+        let hash_a = mock_hash(1);
+        let hash_b = mock_hash(2);
+
+        // 1. Fresh hashes must create unique, new track IDs
+        let id_a1 = Storage::get_or_create_track_id(&tx, &hash_a)?;
+        let id_b = Storage::get_or_create_track_id(&tx, &hash_b)?;
+        assert_ne!(id_a1, id_b);
+
+        // 2. Link hash_a to its track ID in the files table
+        tx.execute(
+        &format!("INSERT INTO {FILES} ({USB_LABEL}, {PATH}, {TRACK_ID}, {FILE_SIZE}, {FILE_HASH}) VALUES (?1, ?2, ?3, ?4, ?5)"),
+            rusqlite::params!["USB", "a.mp3", id_a1, 100, &hash_a.to_string()],
+        )?;
+
+        // 3. Querying hash_a again must reuse that exact track ID
+        let id_a2 = Storage::get_or_create_track_id(&tx, &hash_a)?;
+        assert_eq!(id_a1, id_a2);
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
     fn test_insert_tracks() -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open_in_memory()?;
         schema::init(&conn)?;
@@ -1070,66 +1605,51 @@ mod tests {
             loc: Location::from_path("a.mp3"),
             file_size: 100,
         };
-
         let file2 = FileWithMeta {
             loc: Location::from_path("b.mp3"),
             file_size: 200,
         };
 
-        let mut track1 = mock_trackid(1);
-        let mut track2 = mock_trackid(2);
+        let track1 = mock_hash(1);
+        let track2 = mock_hash(2);
 
-        if track1.to_string() > track2.to_string() {
-            std::mem::swap(&mut track1, &mut track2);
-        }
+        // 1. Run the insert and capture the generated Track IDs from the returned map
+        let result = storage.insert_files([
+            HashedFile::new(track1.clone(), file1.clone()),
+            HashedFile::new(track2.clone(), file2.clone()),
+        ])?;
 
-        // insert
-        storage.insert_tracks([(track1, file1.clone()), (track2, file2.clone())])?;
+        // Find which track ID belongs to which hash dynamically
+        let id1 = result
+            .iter()
+            .find(|(_, files)| files.iter().any(|f| f.hash == track1))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let id2 = result
+            .iter()
+            .find(|(_, files)| files.iter().any(|f| f.hash == track2))
+            .map(|(id, _)| *id)
+            .unwrap();
 
-        // --- verify DB state directly ---
-        let mut stmt = storage
-            .db
-            .prepare("SELECT track_id, path, file_size FROM files ORDER BY track_id")?;
+        // 2. Verify DB state
+        let query =
+            format!("SELECT {TRACK_ID}, {PATH}, {FILE_SIZE} FROM {FILES} WHERE {TRACK_ID} = ?1");
+        let mut stmt = storage.db.prepare(&query)?;
 
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        // Check file 1 row
+        let row1: (i64, String, i64) =
+            stmt.query_row([id1], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        assert_eq!(row1.0, id1);
+        assert_eq!(row1.1, "a.mp3");
+        assert_eq!(row1.2, 100);
 
-        assert_eq!(rows.len(), 2);
+        // Check file 2 row
+        let row2: (i64, String, i64) =
+            stmt.query_row([id2], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        assert_eq!(row2.0, id2);
+        assert_eq!(row2.1, "b.mp3");
+        assert_eq!(row2.2, 200);
 
-        // track 1
-        assert_eq!(rows[0].0, track1.to_string());
-        assert_eq!(rows[0].1, "a.mp3");
-        assert_eq!(rows[0].2, 100);
-
-        // track 2
-        assert_eq!(rows[1].0, track2.to_string());
-        assert_eq!(rows[1].1, "b.mp3");
-        assert_eq!(rows[1].2, 200);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_insert_tracks_duplicate_path() -> anyhow::Result<()> {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        schema::init(&conn)?;
-
-        let mut storage = Storage::from_existing_conn(conn, Default::default());
-        let file = FileWithMeta {
-            loc: Location::from_path("a.mp3"),
-            file_size: 39,
-        };
-        let err = storage
-            .insert_tracks([(mock_trackid(1), file.clone()), (mock_trackid(2), file)])
-            .unwrap_err();
-        assert!(matches!(err, StorageError::DuplicateLocation { .. }));
         Ok(())
     }
 
@@ -1144,13 +1664,11 @@ mod tests {
         // Create valid music file
         fs::write(&file_path, b"x")?;
 
-        let track_id = mock_trackid(1);
-
-        insert_tracks(&mut conn, [track_id]);
+        let tracks = insert_tracks(&mut conn, 1);
         insert_fake_files(
             &mut conn,
             [(
-                track_id,
+                tracks[0],
                 &replace_windows_slashes(&file_path),
                 MOCKED_FILE_SIZE,
             )],
@@ -1159,9 +1677,9 @@ mod tests {
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let (track, path, _) = storage.find_track_file(track_id)?;
+        let (track, path, _) = storage.find_track_file(tracks[0])?;
 
-        assert_eq!(track, track_id);
+        assert_eq!(track, tracks[0]);
         assert_eq!(path, file_path);
 
         Ok(())
@@ -1182,15 +1700,13 @@ mod tests {
         let file_path = usb_mount.join("song.mp3");
         std::fs::write(&file_path, b"x")?;
 
-        let track_id = mock_trackid(1);
-
         // insert USB location into DB
         let usb_label = "DJ_USB";
 
-        insert_tracks(&mut conn, [track_id]);
+        let tracks = insert_tracks(&mut conn, 1);
         insert_fake_files(
             &mut conn,
-            [(track_id, "song.mp3", MOCKED_FILE_SIZE)],
+            [(tracks[0], "song.mp3", MOCKED_FILE_SIZE)],
             Some(usb_label.to_string()),
         );
 
@@ -1200,9 +1716,9 @@ mod tests {
         storage.fs.loc_resolver =
             LocationResolver::test_resolver([(usb_label.to_string(), usb_mount.clone())]);
 
-        let (track, path, loc) = storage.find_track_file(track_id)?;
+        let (track, path, loc) = storage.find_track_file(tracks[0])?;
 
-        assert_eq!(track, track_id);
+        assert_eq!(track, tracks[0]);
         assert_eq!(path, file_path);
 
         match loc {
@@ -1226,9 +1742,7 @@ mod tests {
 
         fs::write(&bad_path, b"x")?;
 
-        let track_id = mock_trackid(3);
-
-        insert_tracks(&mut conn, [track_id]);
+        let track_id = insert_tracks(&mut conn, 1)[0];
         insert_fake_files(
             &mut conn,
             [(
@@ -1261,9 +1775,7 @@ mod tests {
         fs::write(&bad, b"x")?;
         fs::write(&good, b"x")?;
 
-        let track_id = mock_trackid(5);
-
-        insert_tracks(&mut conn, [track_id]);
+        let track_id = insert_tracks(&mut conn, 1)[0];
         insert_fake_files(
             &mut conn,
             [
@@ -1289,9 +1801,7 @@ mod tests {
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
-        let track_id = mock_trackid(42);
-
-        let err = storage.find_track_file(track_id).unwrap_err();
+        let err = storage.find_track_file(0).unwrap_err();
 
         assert!(matches!(err, StorageError::TrackNotFound(..)));
 
@@ -1304,9 +1814,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let mut storage = setup_storage(temp_dir.path()).unwrap();
         // ---------- Insert test data ----------
-        let track_id = mock_trackid(123);
-
-        insert_tracks(&mut storage.db, [track_id]);
+        let track_id = insert_tracks(&mut storage.db, 1)[0];
 
         storage
             .db
@@ -1360,29 +1868,18 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
 
-        // Insert some test rows
+        let tracks = insert_tracks(&mut conn, 3);
+
         let data = vec![
+            (tracks[0], "Some Artist - Track Name.mp3", MOCKED_FILE_SIZE),
+            (tracks[1], "AnotherArtist_Track Name.flac", MOCKED_FILE_SIZE),
             (
-                mock_trackid(1),
-                "Some Artist - Track Name.mp3",
-                MOCKED_FILE_SIZE,
-            ),
-            (
-                mock_trackid(2),
-                "AnotherArtist_Track Name.flac",
-                MOCKED_FILE_SIZE,
-            ),
-            (
-                mock_trackid(3),
+                tracks[2],
                 "completely-different-track.mp3",
                 MOCKED_FILE_SIZE,
             ),
         ];
 
-        insert_tracks(
-            &mut conn,
-            [mock_trackid(1), mock_trackid(2), mock_trackid(3)],
-        );
         insert_fake_files(&mut conn, data, None);
 
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
@@ -1392,23 +1889,24 @@ mod tests {
         assert_files(
             &results,
             [
-                (mock_trackid(1), vec!["Some Artist - Track Name.mp3"]),
-                (mock_trackid(2), vec!["AnotherArtist_Track Name.flac"]),
+                (tracks[0], vec!["Some Artist - Track Name.mp3"]),
+                (tracks[1], vec!["AnotherArtist_Track Name.flac"]),
             ],
         );
 
         // Search with different casing and spaces
         let results2 = storage.find_files("another", false).unwrap();
+
         assert_files(
             &results2,
-            [(mock_trackid(2), vec!["AnotherArtist_Track Name.flac"])],
+            [(tracks[1], vec!["AnotherArtist_Track Name.flac"])],
         );
 
         // Search for trackid
-        let results3 = storage.find_files(&mock_trackid_str(3), false).unwrap();
+        let results3 = storage.find_files(&mock_hash_str(3), false).unwrap();
         assert_files(
             &results3,
-            [(mock_trackid(3), vec!["completely-different-track.mp3"])],
+            [(tracks[2], vec!["completely-different-track.mp3"])],
         );
 
         // Search for non-existent track
@@ -1422,16 +1920,15 @@ mod tests {
         schema::init(&conn).unwrap();
 
         // --- Insert tracks ---
-        let tracks = [mock_trackid(1), mock_trackid(2), mock_trackid(3)];
-        insert_tracks(&mut conn, tracks);
+        let tracks = insert_tracks(&mut conn, 3);
 
         // --- Insert files ---
         insert_fake_files(
             &mut conn,
             vec![
-                (mock_trackid(1), "foo.mp3", MOCKED_FILE_SIZE),
-                (mock_trackid(2), "bar.mp3", MOCKED_FILE_SIZE),
-                (mock_trackid(3), "baz.mp3", MOCKED_FILE_SIZE),
+                (tracks[0], "foo.mp3", MOCKED_FILE_SIZE),
+                (tracks[1], "bar.mp3", MOCKED_FILE_SIZE),
+                (tracks[2], "baz.mp3", MOCKED_FILE_SIZE),
             ],
             None,
         );
@@ -1440,14 +1937,14 @@ mod tests {
         conn.execute(
             "INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
          VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
-            rusqlite::params![mock_trackid_str(1), "Cool Track", "DJ Alpha"],
+            rusqlite::params![tracks[0], "Cool Track", "DJ Alpha"],
         )
         .unwrap();
 
         conn.execute(
             "INSERT INTO track_metadata (track_id, title, artist, year, label, artwork_url)
          VALUES (?1, ?2, ?3, NULL, NULL, NULL)",
-            rusqlite::params![mock_trackid_str(2), "Another Banger", "Beta Artist"],
+            rusqlite::params![tracks[1], "Another Banger", "Beta Artist"],
         )
         .unwrap();
 
@@ -1455,15 +1952,15 @@ mod tests {
 
         // --- Search by artist ---
         let results = storage.find_files("alpha", false).unwrap();
-        assert_files(&results, [(mock_trackid(1), vec!["foo.mp3"])]);
+        assert_files(&results, [(tracks[0], vec!["foo.mp3"])]);
 
         // --- Search by title ---
         let results = storage.find_files("banger", false).unwrap();
-        assert_files(&results, [(mock_trackid(2), vec!["bar.mp3"])]);
+        assert_files(&results, [(tracks[1], vec!["bar.mp3"])]);
 
         // --- no_meta: should return ONLY track 3 ---
         let results = storage.find_files("", true).unwrap();
-        assert_files(&results, [(mock_trackid(3), vec!["baz.mp3"])]);
+        assert_files(&results, [(tracks[2], vec!["baz.mp3"])]);
 
         // --- combined: query + no_meta (should be empty here) ---
         let results = storage.find_files("cool", true).unwrap();
@@ -1474,21 +1971,93 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[test]
+    fn test_find_files_by_card_id() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let tracks = insert_tracks(&mut conn, 2);
+
+        insert_fake_files(
+            &mut conn,
+            vec![
+                (tracks[0], "card_mapped_1.mp3", MOCKED_FILE_SIZE),
+                (tracks[1], "card_mapped_2.mp3", MOCKED_FILE_SIZE),
+            ],
+            None,
+        );
+
+        // Link card IDs to tracks
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["RFID_CARD_XYZ_123", tracks[0]],
+        )?;
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["RFID_CARD_ABC_789", tracks[1]],
+        )?;
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        // Test exact Card ID match
+        let results = storage.find_files("RFID_CARD_XYZ_123", false)?;
+        assert_files(&results, [(tracks[0], vec!["card_mapped_1.mp3"])]);
+
+        // Test case-insensitive/partial card ID match
+        let results = storage.find_files("abc", false)?;
+        assert_files(&results, [(tracks[1], vec!["card_mapped_2.mp3"])]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_files_empty_query_returns_all() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let tracks = insert_tracks(&mut conn, 2);
+
+        insert_fake_files(
+            &mut conn,
+            vec![
+                (tracks[0], "file_a.mp3", MOCKED_FILE_SIZE),
+                (tracks[1], "file_b.mp3", MOCKED_FILE_SIZE),
+            ],
+            None,
+        );
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        // Empty query string should match everything
+        let results = storage.find_files("", false)?;
+        assert_files(
+            &results,
+            [
+                (tracks[0], vec!["file_a.mp3"]),
+                (tracks[1], vec!["file_b.mp3"]),
+            ],
+        );
+
+        Ok(())
+    }
+
     static MOCKED_FILE_SIZE: i64 = 228;
 
     fn insert_file(
         conn: &Connection,
-        track_id: &str,
+        track_id: i64,
         path: &str,
         usb_label: &Option<String>,
         file_size: i64,
     ) {
+        let hash = mock_hash(track_id as i32);
         conn.execute(
             &format!(
-                "INSERT INTO {FILES} (track_id, usb_label, path, file_size) VALUES (?1, ?2, ?3, ?4)"
+                "INSERT INTO {FILES} ({TRACK_ID}, {FILE_HASH}, {USB_LABEL}, {PATH}, {FILE_SIZE}) VALUES (?1, ?2, ?3, ?4, ?5)"
             ),
             params![
                 track_id,
+                hash.to_string(),
                 usb_label.clone().unwrap_or(String::new()),
                 path,
                 file_size
@@ -1505,20 +2074,14 @@ mod tests {
         let storage = Storage::from_existing_conn(conn, LibrarySource::default());
         let mut storage = storage;
 
-        let tracks = [mock_trackid(1), mock_trackid(2), mock_trackid(3)];
+        let tracks = insert_tracks(&mut storage.db, 3);
         let track_files = [
-            (mock_trackid(1), "/music/track_a1.mp3", MOCKED_FILE_SIZE),
-            (
-                mock_trackid(1),
-                "/music/subdir/track_a2.mp3",
-                MOCKED_FILE_SIZE,
-            ),
-            (mock_trackid(2), "/music/track_b.mp3", MOCKED_FILE_SIZE),
-            (mock_trackid(3), "/hello/track_c.mp3", MOCKED_FILE_SIZE), // outside deleted path
-            (mock_trackid(1), "/hello/track_a3.mp3", MOCKED_FILE_SIZE), // outside deleted path
+            (tracks[0], "/music/track_a1.mp3", MOCKED_FILE_SIZE),
+            (tracks[0], "/music/subdir/track_a2.mp3", MOCKED_FILE_SIZE),
+            (tracks[1], "/music/track_b.mp3", MOCKED_FILE_SIZE),
+            (tracks[2], "/hello/track_c.mp3", MOCKED_FILE_SIZE), // outside deleted path
+            (tracks[0], "/hello/track_a3.mp3", MOCKED_FILE_SIZE), // outside deleted path
         ];
-
-        insert_tracks(&storage.db, tracks);
         insert_fake_files(&storage.db, track_files, None);
 
         // Forget top-level directory
@@ -1530,7 +2093,7 @@ mod tests {
         assert_eq!(report.removed_tracks, 1); // b
 
         // Remaining DB entries
-        let remaining: Vec<String> = storage
+        let remaining: Vec<TrackId> = storage
             .db
             .prepare("SELECT track_id FROM files")
             .unwrap()
@@ -1550,17 +2113,11 @@ mod tests {
         let storage = Storage::from_existing_conn(conn, LibrarySource::default());
         let mut storage = storage;
 
-        let tracks = [mock_trackid(1)];
+        let track = insert_tracks(&mut storage.db, 1)[0];
         let track_files = [
-            (mock_trackid(1), "C:/music/track_a1.mp3", MOCKED_FILE_SIZE),
-            (
-                mock_trackid(1),
-                "C:/music/subdir/track_a2.mp3",
-                MOCKED_FILE_SIZE,
-            ),
+            (track, "C:/music/track_a1.mp3", MOCKED_FILE_SIZE),
+            (track, "C:/music/subdir/track_a2.mp3", MOCKED_FILE_SIZE),
         ];
-
-        insert_tracks(&storage.db, tracks);
         insert_fake_files(&storage.db, track_files, None);
 
         let path_to_forget = Path::new("C:\\music\\subdir");
@@ -1609,7 +2166,7 @@ mod tests {
         use super::*;
 
         fn tid() -> TrackId {
-            mock_trackid(1)
+            1
         }
 
         fn old_meta() -> TrackMetadata {
@@ -1786,11 +2343,11 @@ mod tests {
             artwork: None,
         };
 
-        let result = storage.update_track_metadata(mock_trackid(42), update, false);
+        let result = storage.update_track_metadata(42, update, false);
 
         assert!(matches!(
             result,
-            Err(StorageError::TrackNotFound(id)) if id == mock_trackid(42)
+            Err(StorageError::TrackNotFound(id)) if id == "42".to_string()
         ));
 
         Ok(())
@@ -1801,7 +2358,7 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory()?;
         schema::init(&conn)?;
 
-        insert_tracks(&mut conn, [mock_trackid(1)]);
+        let track = insert_tracks(&mut conn, 1)[0];
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
@@ -1813,10 +2370,10 @@ mod tests {
             artwork: None,
         };
 
-        storage.update_track_metadata(mock_trackid(1), update, false)?;
+        storage.update_track_metadata(track, update, false)?;
 
         // Verify
-        let meta = storage.get_track_metadata(mock_trackid(1))?;
+        let meta = storage.get_track_metadata(track)?;
         let meta = meta.unwrap();
         assert_eq!(meta.title, "Song A");
         assert_eq!(meta.artist, "Artist A");
@@ -1829,13 +2386,13 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory()?;
         schema::init(&conn)?;
 
-        insert_tracks(&mut conn, [mock_trackid(1)]);
+        let track = insert_tracks(&mut conn, 1)[0];
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
         // First insert
         storage.update_track_metadata(
-            mock_trackid(1),
+            track,
             MetadataUpdate {
                 title: Some("Original".into()),
                 artist: Some("helo".into()),
@@ -1848,7 +2405,7 @@ mod tests {
 
         // Attempt overwrite without permission
         let result = storage.update_track_metadata(
-            mock_trackid(1),
+            track,
             MetadataUpdate {
                 title: Some("New Title".into()),
                 artist: Some("test".into()),
@@ -1872,12 +2429,12 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory()?;
         schema::init(&conn)?;
 
-        insert_tracks(&mut conn, [mock_trackid(1)]);
+        let track = insert_tracks(&mut conn, 1)[0];
 
         let mut storage = Storage::from_existing_conn(conn, Default::default());
 
         storage.update_track_metadata(
-            mock_trackid(1),
+            track,
             MetadataUpdate {
                 title: Some("Original".into()),
                 artist: Some("blabla".into()),
@@ -1889,7 +2446,7 @@ mod tests {
         )?;
 
         storage.update_track_metadata(
-            mock_trackid(1),
+            track,
             MetadataUpdate {
                 title: Some("Updated".into()),
                 artist: None,
@@ -1900,7 +2457,7 @@ mod tests {
             true,
         )?;
 
-        let meta = storage.get_track_metadata(mock_trackid(1))?;
+        let meta = storage.get_track_metadata(track)?;
         assert_eq!(meta.unwrap().title, "Updated");
 
         Ok(())
@@ -1910,11 +2467,10 @@ mod tests {
         use tempfile::tempdir;
 
         use crate::{
-            TrackId,
             location::{Location, replace_windows_slashes},
             operations::tests::{
-                MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks,
-                mock_trackid, setup_storage,
+                MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks, mock_hash,
+                setup_storage,
             },
         };
 
@@ -1926,12 +2482,10 @@ mod tests {
             let path = dir.path().join("song.mp3");
             std::fs::write(&path, b"x")?;
 
-            let track_id = TrackId::from_file(&path)?;
-
-            insert_tracks(&mut storage.db, [track_id]);
+            let tracks = insert_tracks(&mut storage.db, 1);
             insert_real_files(
                 &mut storage.db,
-                [(track_id, replace_windows_slashes(&path))],
+                [(tracks[0], replace_windows_slashes(&path))],
                 None,
             );
 
@@ -1970,10 +2524,8 @@ mod tests {
             std::fs::write(&path1, b"x")?;
             std::fs::write(&path2, b"x")?;
 
-            let track_id = TrackId::from_file(&path1)?;
-
             // DB only knows about first path
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
             insert_real_files(
                 &mut storage.db,
                 [(track_id, replace_windows_slashes(&path1))],
@@ -1994,9 +2546,8 @@ mod tests {
             let mut storage = setup_storage(dir.path())?;
 
             let path = dir.path().join("song.mp3");
-            let track_id = mock_trackid(123); // file not created
 
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
             insert_fake_files(
                 &mut storage.db,
                 [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
@@ -2018,9 +2569,7 @@ mod tests {
             let path = dir.path().join("song.mp3");
             std::fs::write(&path, b"x")?;
 
-            let track_id = TrackId::from_file(&path)?;
-
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
             insert_real_files(
                 &mut storage.db,
                 [(track_id, replace_windows_slashes(&path))],
@@ -2041,9 +2590,8 @@ mod tests {
             let path = dir.path().join("song.mp3");
             // file NOT created
 
-            let track_id = mock_trackid(123);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
 
-            insert_tracks(&mut storage.db, [track_id]);
             insert_fake_files(
                 &mut storage.db,
                 [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
@@ -2062,41 +2610,6 @@ mod tests {
         }
 
         #[test]
-        fn test_check_missing_ignores_partially_available_track() -> anyhow::Result<()> {
-            let dir = tempdir()?;
-            let mut storage = setup_storage(dir.path())?;
-
-            let available = dir.path().join("song1.mp3");
-            let missing = dir.path().join("song2.mp3");
-
-            std::fs::write(&available, b"x")?;
-
-            let track_id = TrackId::from_file(&available)?;
-
-            insert_tracks(&mut storage.db, [track_id]);
-            insert_real_files(
-                &mut storage.db,
-                [(track_id, replace_windows_slashes(&available))],
-                None,
-            );
-            insert_fake_files(
-                &mut storage.db,
-                [(
-                    track_id,
-                    replace_windows_slashes(&missing),
-                    MOCKED_FILE_SIZE,
-                )],
-                None,
-            );
-
-            let diff = storage.check_missing()?;
-
-            assert!(diff.is_empty());
-
-            Ok(())
-        }
-
-        #[test]
         fn test_check_missing_detects_renamed_track() -> anyhow::Result<()> {
             let dir = tempdir()?;
             let mut storage = setup_storage(dir.path())?;
@@ -2106,9 +2619,8 @@ mod tests {
 
             std::fs::write(&renamed, b"x")?;
 
-            let track_id = TrackId::from_file(&renamed)?;
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
 
-            insert_tracks(&mut storage.db, [track_id]);
             insert_fake_files(
                 &mut storage.db,
                 [(track_id, replace_windows_slashes(&path), MOCKED_FILE_SIZE)],
@@ -2134,9 +2646,7 @@ mod tests {
             let path = dir.path().join("song.mp3");
             std::fs::write(&path, b"x")?;
 
-            let track_id = TrackId::from_file(&path)?;
-
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
 
             insert_real_files(
                 &mut storage.db,
@@ -2157,9 +2667,7 @@ mod tests {
             let dir = tempdir()?;
             let mut storage = setup_storage(dir.path())?;
 
-            let track_id = mock_trackid(123);
-
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
 
             let stale = storage.check_stale()?;
 
@@ -2176,9 +2684,7 @@ mod tests {
             let dir = tempdir()?;
             let mut storage = setup_storage(dir.path())?;
 
-            let track_id = mock_trackid(555);
-
-            insert_tracks(&mut storage.db, [track_id]);
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
 
             storage
                 .db
@@ -2209,14 +2715,10 @@ mod tests {
             let existing = dir.path().join("existing.mp3");
             std::fs::write(&existing, b"x")?;
 
-            let good_track = TrackId::from_file(&existing)?;
-            let dangling_track = mock_trackid(999);
-            let metadata_only_track = mock_trackid(555);
-
-            insert_tracks(
-                &mut storage.db,
-                [good_track, dangling_track, metadata_only_track],
-            );
+            let tracks = insert_tracks(&mut storage.db, 3);
+            let good_track = tracks[0];
+            let dangling_track = tracks[1];
+            let metadata_only_track = tracks[2];
 
             insert_real_files(
                 &mut storage.db,
@@ -2256,21 +2758,9 @@ mod tests {
         let existing = dir.path().join("existing.mp3");
         std::fs::write(&existing, b"x")?;
 
-        let good_track = TrackId::from_file(&existing)?;
-        let dangling_track = mock_trackid(999);
-        let metadata_only_track = mock_trackid(555);
-        let file_only_track = mock_trackid(777);
-
-        // Insert all tracks
-        insert_tracks(
-            &mut storage.db,
-            [
-                good_track,
-                dangling_track,
-                metadata_only_track,
-                file_only_track,
-            ],
-        );
+        let tracks = insert_tracks(&mut storage.db, 4);
+        let (good_track, dangling_track, metadata_only_track, file_only_track) =
+            (tracks[0], tracks[1], tracks[2], tracks[3]);
 
         // Good track: file exists
         insert_real_files(
@@ -2295,7 +2785,7 @@ mod tests {
         INSERT INTO track_metadata (track_id, title, artist)
         VALUES (?1, ?2, ?3)
         "#,
-            [&metadata_only_track.to_string(), "Test Song", "Test Artist"],
+            params![&metadata_only_track, "Test Song", "Test Artist"],
         )?;
 
         // --------------------------------------------------

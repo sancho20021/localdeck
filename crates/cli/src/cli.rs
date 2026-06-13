@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use log::info;
 use std::env;
@@ -6,9 +6,8 @@ use std::path::PathBuf;
 
 use crate::music_player::Output;
 use crate::{card_player, config};
-use localdeck_storage::TrackId;
 use localdeck_storage::operations::{MetadataUpdate, Storage};
-use localdeck_storage::track::{ArtworkRef, TrackMetadata};
+use localdeck_storage::track::{ArtworkRef, TrackId, TrackMetadata};
 
 #[derive(Parser)]
 #[command(name = "localdeck")]
@@ -32,8 +31,29 @@ pub enum Commands {
         #[command(subcommand)]
         action: Option<CheckAction>,
     },
-    /// Update library
+    /// Automatically update library by scanning configured directories
     Update,
+    /// Link a specific music file to an existing track ID
+    /// (Useful for adding high-quality, fixed, or alternative versions)
+    Add {
+        /// The existing track ID to append the file to
+        track_id: TrackId,
+        /// Path to the physical music file
+        path: PathBuf,
+    },
+    /// Merge a duplicate or lower-quality track into a master track
+    Merge {
+        /// The slave track ID that will be completely deleted
+        slave_id: TrackId,
+
+        /// The master track ID that absorbs all files and mappings
+        #[arg(long, short = 'i', name = "MASTER_ID")]
+        into: TrackId,
+
+        /// Skip checking or raising an error if the slave track contains metadata
+        #[arg(long)]
+        ignore_slave_meta: bool,
+    },
     /// Run http server hosting library
     Serve,
     /// Find a track
@@ -53,7 +73,7 @@ pub enum Commands {
     },
     /// Generate url for a track to be printed on qr code or nfc chip
     /// Currently does not include youtube link
-    Url { track_id: String },
+    Url { track_id: TrackId },
 
     /// get or edit metadata
     Meta {
@@ -89,7 +109,7 @@ pub enum MetaAction {
     /// Get track metadata
     Get {
         /// Track Id to fetch
-        track_id: String,
+        track_id: TrackId,
         /// Use json format
         #[arg(long)]
         json: bool,
@@ -97,7 +117,7 @@ pub enum MetaAction {
     /// Add or update metadata
     Add {
         /// Track ID
-        track_id: String,
+        track_id: TrackId,
 
         /// Track title
         #[arg(short, long)]
@@ -234,8 +254,8 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                let ds = storage.scan_db()?;
-                println!("Data base was updated {}", ds.updated_at);
+                let time = storage.updated_at()?;
+                println!("Data base was updated {}", time);
             }
         }
 
@@ -243,8 +263,11 @@ pub fn run() -> anyhow::Result<()> {
             let mut storage = Storage::new(cfg.storage)?;
             let files = storage.update_db_with_new_files()?;
             println!("Database updated, new files ({}):", files.len());
-            for file in &files {
-                println!("    - {} at {}", file.track_id, file.file.loc);
+            for (track, files) in &files {
+                println!("  * track {track}:");
+                for file in files {
+                    println!("    - {}", file.file.loc);
+                }
             }
         }
 
@@ -292,7 +315,6 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Url { track_id } => {
-            let track_id = TrackId::from_hex(track_id).map_err(|e| anyhow!("{e}"))?;
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let _ = storage.get_track_metadata(track_id).unwrap();
             println!("{track_id}");
@@ -302,7 +324,6 @@ pub fn run() -> anyhow::Result<()> {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             match action {
                 MetaAction::Get { track_id, json } => {
-                    let track_id = TrackId::from_hex(&track_id).map_err(|e| anyhow!("{e}"))?;
                     let meta = storage.get_track_metadata(track_id)?;
                     if let Some(meta) = meta {
                         let str = if json {
@@ -325,7 +346,6 @@ pub fn run() -> anyhow::Result<()> {
                     artwork,
                     overwrite,
                 } => {
-                    let track_id = TrackId::from_hex(&track_id).map_err(|e| anyhow!("{e}"))?;
                     let update = Commands::to_metadata_update(title, artist, year, label, artwork);
 
                     storage.update_track_metadata(track_id, update, overwrite)?;
@@ -352,12 +372,26 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Scan { device } => {
-            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage)?;
             let output = match device {
                 Some(d) => Output::Device(d),
                 None => Output::Default,
             };
             card_player::run_card_player(&mut storage, output).unwrap();
+        }
+        Commands::Add { track_id, path } => {
+            let mut storage = Storage::new(cfg.storage)?;
+            storage.add_file_to_track(track_id, &path)?;
+            println!("Linked {} to track {}", path.to_string_lossy(), track_id);
+        }
+        Commands::Merge {
+            slave_id,
+            into,
+            ignore_slave_meta,
+        } => {
+            let mut storage = Storage::new(cfg.storage)?;
+            storage.merge_tracks(into, slave_id, ignore_slave_meta)?;
+            println!("Track {} successfully merged into {}", slave_id, into);
         }
     }
     Ok(())

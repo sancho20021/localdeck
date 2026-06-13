@@ -2,20 +2,20 @@ use std::path::Path;
 
 use blake3::Hash;
 
-/// Represents the track ID.
+/// Represents file hash.
 ///
-/// One can get track ID from a music file,
+/// One can get file hash from a music file,
 /// and then use it to search for that file in the filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrackId(pub Hash);
+pub struct FileHash(pub Hash);
 
-impl std::fmt::Display for TrackId {
+impl std::fmt::Display for FileHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_hex())
     }
 }
 
-impl TrackId {
+impl FileHash {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(blake3::hash(bytes))
     }
@@ -26,7 +26,7 @@ impl TrackId {
 
     pub fn from_hex<S: AsRef<[u8]>>(hex: S) -> Result<Self, String> {
         Ok(Self(
-            blake3::Hash::from_hex(hex).map_err(|e| format!("Failed to parse track id: {e}"))?,
+            blake3::Hash::from_hex(hex).map_err(|e| format!("Failed to parse file hash: {e}"))?,
         ))
     }
 
@@ -41,7 +41,7 @@ impl TrackId {
 mod tests {
     use tempfile::TempDir;
 
-    use crate::TrackId;
+    use crate::file_hash::FileHash;
 
     #[test]
     fn same_contents_same_hash() {
@@ -52,8 +52,8 @@ mod tests {
         std::fs::write(&a, b"same").unwrap();
         std::fs::write(&b, b"same").unwrap();
 
-        let ha = TrackId::from_file(&a).unwrap();
-        let hb = TrackId::from_file(&b).unwrap();
+        let ha = FileHash::from_file(&a).unwrap();
+        let hb = FileHash::from_file(&b).unwrap();
 
         assert_eq!(ha, hb);
     }
@@ -67,8 +67,8 @@ mod tests {
         std::fs::write(&a, b"something").unwrap();
         std::fs::write(&b, b"soomething").unwrap();
 
-        let ha = TrackId::from_file(&a).unwrap();
-        let hb = TrackId::from_file(&b).unwrap();
+        let ha = FileHash::from_file(&a).unwrap();
+        let hb = FileHash::from_file(&b).unwrap();
 
         assert_ne!(ha, hb);
     }

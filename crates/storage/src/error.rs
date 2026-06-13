@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{location::Location, track_id::TrackId};
+use crate::{location::Location, track::TrackId};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -8,19 +8,13 @@ pub enum StorageError {
     Database(#[from] rusqlite::Error),
 
     #[error("track {0} not found")]
-    TrackNotFound(TrackId),
+    TrackNotFound(String),
 
     #[error("track {track} has no valid music files: {extra}")]
     InvalidTrackFile { track: TrackId, extra: String },
 
     #[error("filesystem error: {0}")]
     Fs(#[from] std::io::Error),
-
-    #[error("invalid track id: {0}")]
-    InvalidTrackId(String),
-
-    #[error("duplicate location error, location: {path}, hint: {hint}")]
-    DuplicateLocation { path: Location, hint: String },
 
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
@@ -29,4 +23,12 @@ pub enum StorageError {
 
     #[error("required metadata (title, artist, ...) not provided for track {0}")]
     RequiredMetaMissing(TrackId),
+
+    #[error(
+        "Slave track {0} contains metadata. Set ignore_slave_meta to true to overwrite or discard it."
+    )]
+    SlaveTrackHasMetadata(TrackId),
+
+    #[error("The path '{0}' is outside of all configured library directories and USB roots.")]
+    PathOutsideLibrary(std::path::PathBuf),
 }
