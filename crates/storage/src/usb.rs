@@ -138,7 +138,7 @@ mod for_windows {
         core::PCWSTR,
     };
 
-    use crate::storage::usb::ResolveError;
+    use crate::usb::ResolveError;
 
     pub(super) fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
         for drive in get_all_drives_with_labels()? {
@@ -213,7 +213,7 @@ mod for_windows {
 
     #[cfg(test)]
     mod tests {
-        use crate::storage::usb::for_windows::get_all_drives_with_labels;
+        use crate::usb::for_windows::get_all_drives_with_labels;
 
         #[test]
         fn test_get_all_drives_windows() {
