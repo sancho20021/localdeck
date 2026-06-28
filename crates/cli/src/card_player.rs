@@ -85,6 +85,7 @@ pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<
                         if raw == STOP_MUSIC {
                             player.stop();
                             println!("Music stopped");
+                            continue;
                         }
 
                         let card_id = match extract_cardid(&raw) {
