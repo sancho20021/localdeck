@@ -6,8 +6,9 @@ pub mod tables {
     pub const TRACK_METADATA: &str = "track_metadata";
     pub const TRACKS: &str = "tracks";
     pub const CARD_MAPPINGS: &str = "card_mappings";
+    pub const PRINTED_TRACKS: &str = "printed_tracks";
 
-    pub const ALL_TABLES: &[&str] = &[TRACKS, FILES, UPDATES, TRACK_METADATA, CARD_MAPPINGS];
+    pub const ALL_TABLES: &[&str] = &[TRACKS, FILES, UPDATES, TRACK_METADATA, CARD_MAPPINGS, PRINTED_TRACKS];
 }
 
 pub mod columns {
@@ -62,6 +63,11 @@ CREATE TABLE IF NOT EXISTS track_metadata (
     year INTEGER,
     label TEXT,
     artwork_url TEXT,
+    FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS printed_tracks (
+    track_id INTEGER PRIMARY KEY,
     FOREIGN KEY (track_id) REFERENCES tracks(track_id) ON DELETE CASCADE
 );
 

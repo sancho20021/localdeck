@@ -1019,6 +1019,57 @@ impl Storage {
         }
         Ok(merged_meta)
     }
+
+    pub fn mark_printed(&mut self, track: TrackId) -> Result<(), StorageError> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {PRINTED_TRACKS} ({TRACK_ID})
+             VALUES (?1)"
+            ),
+            params![track.to_string()],
+        )?;
+        Self::insert_update_time(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_unprinted(&mut self, track: TrackId) -> Result<(), StorageError> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {PRINTED_TRACKS}
+             WHERE {TRACK_ID} = ?1"
+            ),
+            params![track.to_string()],
+        )?;
+        Self::insert_update_time(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_unprinted(&self) -> Result<Vec<TrackId>, StorageError> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT DISTINCT t.{TRACK_ID}
+         FROM {TRACKS} t
+         INNER JOIN {FILES} f ON t.{TRACK_ID} = f.{TRACK_ID}
+         INNER JOIN {TRACK_METADATA} m ON t.{TRACK_ID} = m.{TRACK_ID}
+         LEFT JOIN {PRINTED_TRACKS} pt ON t.{TRACK_ID} = pt.{TRACK_ID}
+         WHERE pt.{TRACK_ID} IS NULL"
+        ))?;
+
+        let rows = stmt.query_map([], |row| row.get::<_, TrackId>(0))?;
+
+        rows.map(|r| -> Result<_, StorageError> { Ok(r?) })
+            .collect()
+    }
+
+    pub fn is_printed(&self, track: TrackId) -> Result<bool, StorageError> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT 1 FROM {PRINTED_TRACKS} WHERE {TRACK_ID} = ?1"
+        ))?;
+        Ok(stmt.exists(params![track.to_string()])?)
+    }
 }
 
 /// DB format of storing file location
@@ -2469,7 +2520,7 @@ mod tests {
         use crate::{
             location::{Location, replace_windows_slashes},
             operations::tests::{
-                MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks, mock_hash,
+                MOCKED_FILE_SIZE, insert_fake_files, insert_real_files, insert_tracks,
                 setup_storage,
             },
         };
@@ -2869,6 +2920,115 @@ mod tests {
                 }
                 Location::File { .. } => panic!("expected Usb variant, got File"),
             }
+        }
+    }
+
+    /// Inserts dummy metadata for a track using update_track_metadata.
+    fn insert_test_metadata(
+        storage: &mut Storage,
+        track: TrackId,
+        title: &str,
+        artist: &str,
+    ) -> anyhow::Result<()> {
+        storage.update_track_metadata(
+            track,
+            MetadataUpdate {
+                title: Some(title.into()),
+                artist: Some(artist.into()),
+                year: None,
+                label: None,
+                artwork: None,
+            },
+            false,
+        )?;
+        Ok(())
+    }
+
+    /// Helper to attach a dummy physical file to a track.
+    fn attach_dummy_file(
+        storage: &mut Storage,
+        dir: &std::path::Path,
+        filename: &str,
+        track: TrackId,
+    ) -> anyhow::Result<()> {
+        let file_path = dir.join(filename);
+        std::fs::write(&file_path, b"x")?;
+        insert_real_files(
+            &mut storage.db,
+            [(track, replace_windows_slashes(&file_path))],
+            None,
+        );
+        Ok(())
+    }
+
+    mod print_tests {
+        use tempfile::tempdir;
+
+        use crate::operations::tests::{
+            attach_dummy_file, insert_test_metadata, insert_tracks, setup_storage,
+        };
+
+        #[test]
+        fn test_mark_printed_and_get_unprinted() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let tracks = insert_tracks(&mut storage.db, 4);
+            let (playable_and_meta, file_only_track, metadata_only_track, _dangling_track) =
+                (tracks[0], tracks[1], tracks[2], tracks[3]);
+
+            // 1. File + Metadata -> Eligible for printing
+            attach_dummy_file(&mut storage, dir.path(), "song1.mp3", playable_and_meta)?;
+            insert_test_metadata(&mut storage, playable_and_meta, "Test Song", "Test Artist")?;
+
+            // 2. File only (no metadata) -> NOT eligible
+            attach_dummy_file(&mut storage, dir.path(), "song2.mp3", file_only_track)?;
+
+            // 3. Metadata only (no file) -> NOT eligible
+            insert_test_metadata(
+                &mut storage,
+                metadata_only_track,
+                "Test Song 2",
+                "Test Artist 2",
+            )?;
+
+            // Initial state: Only track with BOTH file and metadata appears
+            let unprinted = storage.get_unprinted()?;
+            assert_eq!(unprinted, vec![playable_and_meta]);
+
+            // Act: Mark as printed
+            storage.mark_printed(playable_and_meta)?;
+            assert!(storage.get_unprinted()?.is_empty());
+
+            // Idempotency check
+            storage.mark_printed(playable_and_meta)?;
+            assert!(storage.get_unprinted()?.is_empty());
+
+            Ok(())
+        }
+
+        #[test]
+        fn test_mark_unprinted() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let track_id = insert_tracks(&mut storage.db, 1)[0];
+
+            attach_dummy_file(&mut storage, dir.path(), "song1.mp3", track_id)?;
+            insert_test_metadata(&mut storage, track_id, "Test Song", "Test Artist")?;
+
+            // Mark as printed first
+            storage.mark_printed(track_id)?;
+            assert!(storage.get_unprinted()?.is_empty());
+
+            // Act: Mark unprinted (e.g. card was torn up)
+            storage.mark_unprinted(track_id)?;
+
+            // Assert: Should show up in get_unprinted again
+            let unprinted = storage.get_unprinted()?;
+            assert_eq!(unprinted, vec![track_id]);
+
+            Ok(())
         }
     }
 }

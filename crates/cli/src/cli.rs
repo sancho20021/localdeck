@@ -90,6 +90,24 @@ pub enum Commands {
         #[arg(short, long)]
         device: Option<String>,
     },
+
+    /// Manage card printing status
+    Print {
+        #[command(subcommand)]
+        action: PrintAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PrintAction {
+    /// List all track IDs ready for card printing
+    List,
+    /// Check if a track ID has already been printed
+    Check { track_id: TrackId },
+    /// Mark a track ID as printed
+    Mark { track_id: TrackId },
+    /// Unmark a track ID (return to unprinted queue)
+    Unmark { track_id: TrackId },
 }
 
 #[derive(Subcommand)]
@@ -392,6 +410,32 @@ pub fn run() -> anyhow::Result<()> {
             let mut storage = Storage::new(cfg.storage)?;
             storage.merge_tracks(into, slave_id, ignore_slave_meta)?;
             println!("Track {} successfully merged into {}", slave_id, into);
+        }
+        Commands::Print { action } => {
+            let mut storage = Storage::new(cfg.storage)?;
+            match action {
+                PrintAction::List => {
+                    let unprinted = storage.get_unprinted()?;
+                    for track_id in unprinted {
+                        println!("{track_id}");
+                    }
+                }
+                PrintAction::Check { track_id } => {
+                    if storage.is_printed(track_id)? {
+                        println!("Track {track_id} is printed.");
+                    } else {
+                        println!("Track {track_id} is NOT printed.");
+                    }
+                }
+                PrintAction::Mark { track_id } => {
+                    storage.mark_printed(track_id)?;
+                    println!("Marked track {track_id} as printed.");
+                }
+                PrintAction::Unmark { track_id } => {
+                    storage.mark_unprinted(track_id)?;
+                    println!("Marked track {track_id} as unprinted.");
+                }
+            }
         }
     }
     Ok(())
