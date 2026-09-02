@@ -7,7 +7,10 @@ use std::path::PathBuf;
 
 use crate::music_player::Output;
 use crate::{card_player, config};
-use localdeck_storage::operations::{ChangedFile, HashedFile, MetadataUpdate, Storage};
+use localdeck_storage::operations::{
+    ChangedFile, HashedFile, LibraryStatus, MetadataUpdate, Storage,
+};
+use localdeck_storage::location::Location;
 use localdeck_storage::track::{ArtworkRef, TrackId, TrackMetadata};
 
 #[derive(Parser)]
@@ -28,6 +31,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Check library status
+    #[command(alias = "status")]
     Check {
         #[command(subcommand)]
         action: Option<CheckAction>,
@@ -131,6 +135,8 @@ pub enum CheckAction {
     Missing,
     /// Check for tracks without any files recorded in database
     Stale,
+    /// Check for recorded files whose content changed without moving
+    Changed,
 }
 
 #[derive(Subcommand)]
@@ -195,6 +201,9 @@ impl Commands {
 }
 
 fn print_added(added: &HashMap<TrackId, HashSet<HashedFile>>) {
+    if added.is_empty() {
+        return;
+    }
     println!("New files ({}):", added.len());
     for (track, files) in added {
         println!("  * track {track}:");
@@ -205,15 +214,81 @@ fn print_added(added: &HashMap<TrackId, HashSet<HashedFile>>) {
 }
 
 fn print_refreshed(refreshed: &[ChangedFile]) {
+    if refreshed.is_empty() {
+        return;
+    }
     println!("Refreshed files ({}):", refreshed.len());
-    for file in refreshed {
-        println!("  * track {}:", file.track);
+    print_changed(refreshed);
+}
+
+fn print_changed(changed: &[ChangedFile]) {
+    for file in changed {
+        println!("  {:>5}  {}", file.track, file.current.loc);
         println!(
-            "    - {}\n      {:.2} MB -> {:.2} MB",
-            file.current.loc,
-            file.recorded.size_mb(),
-            file.current.size_mb()
+            "         {} -> {} ({:+})",
+            file.recorded.file_size,
+            file.current.file_size,
+            file.current.file_size - file.recorded.file_size
         );
+    }
+}
+
+fn print_stale_track(storage: &mut Storage, track: TrackId) -> anyhow::Result<()> {
+    let meta = storage.get_track_metadata(track)?;
+    let name = meta
+        .map(|m| format!("{} - {}", m.artist, m.title))
+        .unwrap_or_else(|| "no metadata".to_string());
+    let printed = if storage.is_printed(track)? {
+        "  printed"
+    } else {
+        ""
+    };
+
+    println!("  {track:>5}  {name}{printed}");
+    Ok(())
+}
+
+fn print_summary(roots: &[Location], updated: &str, status: &LibraryStatus) {
+    let roots = roots
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("{roots}    updated {updated}\n");
+
+    let missing: usize = status.diff.missing.values().map(|files| files.len()).sum();
+    let stale = status.stale.metadata_only.len() + status.stale.dangling.len();
+
+    let rows = [
+        (
+            missing,
+            "missing",
+            "recorded file is gone from disk",
+            "localdeck check missing",
+        ),
+        (
+            status.diff.changed.len(),
+            "changed",
+            "content differs from the record",
+            "localdeck update --changed",
+        ),
+        (
+            status.diff.new.len(),
+            "new",
+            "on disk, not in the library",
+            "localdeck update --new",
+        ),
+        (
+            stale,
+            "stale",
+            "track kept for its metadata only",
+            "localdeck check stale",
+        ),
+        (status.diff.ok, "ok", "", ""),
+    ];
+
+    for (count, name, what, fix) in rows {
+        println!("{}", format!("{count:>5}  {name:<8} {what:<33} {fix}").trim_end());
     }
 }
 
@@ -237,6 +312,7 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Check { action } => {
+            let roots = cfg.storage.library_source.roots.clone();
             let mut storage = Storage::new(cfg.storage)?;
             if let Some(action) = action {
                 match action {
@@ -271,57 +347,70 @@ pub fn run() -> anyhow::Result<()> {
                             println!("No missing files!");
                         }
                     }
+                    CheckAction::Changed => {
+                        let changed = storage.check_changed()?;
+                        if changed.is_empty() {
+                            println!("No files changed in place!");
+                        } else {
+                            println!("{} files changed in place:", changed.len());
+                            print_changed(&changed);
+                            println!("\nRepair with: localdeck update --changed");
+                        }
+                    }
                     CheckAction::Stale => {
                         let stale = storage.check_stale()?;
 
-                        let has_metadata_only = !stale.metadata_only.is_empty();
-                        let has_dangling = !stale.dangling.is_empty();
-
-                        if has_metadata_only || has_dangling {
-                            if has_metadata_only {
-                                println!("Tracks with metadata but no associated files:");
-
-                                for track in stale.metadata_only {
-                                    println!("  - {track}");
-                                }
-
-                                println!();
-                            }
-
-                            if has_dangling {
-                                println!("Dangling tracks (no files and no metadata):");
-
-                                for track in stale.dangling {
-                                    println!("  - {track}");
-                                }
-
-                                println!();
-
-                                println!("You can remove dangling tracks with:");
-                                println!("localdeck clean");
-                            }
-                        } else {
+                        if stale.metadata_only.is_empty() && stale.dangling.is_empty() {
                             println!("No stale tracks!");
+                        } else {
+                            if !stale.metadata_only.is_empty() {
+                                println!(
+                                    "{} tracks kept for their metadata only:",
+                                    stale.metadata_only.len()
+                                );
+                                for track in &stale.metadata_only {
+                                    print_stale_track(&mut storage, *track)?;
+                                }
+                                println!();
+                            }
+
+                            if !stale.dangling.is_empty() {
+                                println!(
+                                    "{} dangling tracks (no files and no metadata):",
+                                    stale.dangling.len()
+                                );
+                                for track in &stale.dangling {
+                                    println!("  {track}");
+                                }
+                                println!("\nRemove them with: localdeck clean");
+                            }
                         }
                     }
                 }
             } else {
-                let time = storage.updated_at()?;
-                println!("Data base was updated {}", time);
+                let updated = storage.updated_at()?.to_string();
+                let status = storage.status()?;
+                print_summary(&roots, &updated, &status);
             }
         }
 
         Commands::Update { new, changed } => {
             let mut storage = Storage::new(cfg.storage)?;
 
-            if new {
-                print_added(&storage.add_new_files()?);
+            let (added, refreshed) = if new {
+                (storage.add_new_files()?, Vec::new())
             } else if changed {
-                print_refreshed(&storage.refresh_changed_files()?);
+                (HashMap::new(), storage.refresh_changed_files()?)
             } else {
                 let report = storage.sync()?;
-                print_added(&report.added);
-                print_refreshed(&report.refreshed);
+                (report.added, report.refreshed)
+            };
+
+            print_added(&added);
+            print_refreshed(&refreshed);
+
+            if added.is_empty() && refreshed.is_empty() {
+                println!("Library already up to date");
             }
         }
 

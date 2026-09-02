@@ -15,7 +15,7 @@ use crate::{
     db::{self, DBConfig, i64_seconds_to_local_time, system_time_to_i64},
     error::StorageError,
     file_hash::FileHash,
-    fs::{FileStorage, FileWithMeta, FsSnapshot, is_valid_music_path},
+    fs::{FileStorage, FileWithMeta, is_valid_music_path},
     location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
     schema::{columns, tables},
     track::{ArtworkRef, Track, TrackId, TrackMetadata},
@@ -77,13 +77,22 @@ pub struct SyncReport {
 
 /// The file system compared against the files recorded in the database.
 #[derive(Debug, Default)]
-struct LibraryDiff {
+pub struct LibraryDiff {
     /// on disk, not recorded
-    new: HashSet<FileWithMeta>,
+    pub new: HashSet<FileWithMeta>,
     /// recorded and on disk, but the content differs
-    changed: Vec<ChangedFile>,
+    pub changed: Vec<ChangedFile>,
     /// recorded, not on disk
-    missing: HashMap<TrackId, HashSet<FileWithMeta>>,
+    pub missing: HashMap<TrackId, HashSet<FileWithMeta>>,
+    /// recorded files that match the file system
+    pub ok: usize,
+}
+
+/// Everything `check` reports, gathered in a single scan.
+#[derive(Debug, Default)]
+pub struct LibraryStatus {
+    pub diff: LibraryDiff,
+    pub stale: StaleTracks,
 }
 
 impl Storage {
@@ -307,17 +316,12 @@ impl Storage {
         Ok(inserted_tracks)
     }
 
-    /// Recursively scans all music files in the library source. Retrieves their paths and metadata
-    fn scan_fs(self_fs: &mut FileStorage) -> Result<FsSnapshot, StorageError> {
-        println!("Scanning music on file system...");
-        let fs = self_fs.scan()?;
-        Ok(fs)
-    }
-
     /// Compares the file system against the files recorded in the database.
     fn diff_library(&mut self) -> Result<LibraryDiff, StorageError> {
         // Locations left to account for, mapped to their current size
-        let mut on_disk: HashMap<Location, i64> = Self::scan_fs(&mut self.fs)?
+        let mut on_disk: HashMap<Location, i64> = self
+            .fs
+            .scan()?
             .into_iter()
             .map(|f| (f.loc, f.file_size))
             .collect();
@@ -364,7 +368,7 @@ impl Storage {
                             },
                         });
                     }
-                    Some(_) => {}
+                    Some(_) => diff.ok += 1,
                 }
             }
         }
@@ -396,6 +400,14 @@ impl Storage {
     /// checks for recorded files whose content changed without moving
     pub fn check_changed(&mut self) -> Result<Vec<ChangedFile>, StorageError> {
         Ok(self.diff_library()?.changed)
+    }
+
+    /// Everything the checks report, gathered in a single scan.
+    pub fn status(&mut self) -> Result<LibraryStatus, StorageError> {
+        Ok(LibraryStatus {
+            diff: self.diff_library()?,
+            stale: self.check_stale()?,
+        })
     }
 
     /// Returns tracks that have no associated files.
@@ -2858,6 +2870,146 @@ mod tests {
             assert_eq!(stale.dangling[0], dangling_track);
 
             Ok(())
+        }
+
+        mod status_tests {
+            use tempfile::tempdir;
+
+            use crate::{
+                location::{Location, replace_windows_slashes},
+                operations::tests::{
+                    insert_fake_files, insert_real_files, insert_tracks, setup_storage,
+                },
+                track::TrackId,
+                operations::Storage,
+            };
+
+            fn given_metadata(storage: &mut Storage, track: TrackId) {
+                storage
+                    .db
+                    .execute(
+                        "INSERT INTO track_metadata (track_id, title, artist) VALUES (?1, ?2, ?3)",
+                        [&track.to_string(), "Deleted Song", "Some Artist"],
+                    )
+                    .unwrap();
+            }
+
+            #[test]
+            fn status_reports_every_category() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let untouched = dir.path().join("untouched.mp3");
+                let retagged = dir.path().join("retagged.mp3");
+                let deleted = dir.path().join("deleted.mp3");
+                let unknown = dir.path().join("unknown.mp3");
+
+                std::fs::write(&untouched, b"kept as recorded")?;
+                std::fs::write(&retagged, b"grown by a tag block")?;
+                std::fs::write(&unknown, b"never scanned before")?;
+                // `deleted` is never written
+
+                let tracks = insert_tracks(&mut storage.db, 4);
+                let (ok_track, changed_track, missing_track, stale_track) =
+                    (tracks[0], tracks[1], tracks[2], tracks[3]);
+
+                insert_real_files(
+                    &mut storage.db,
+                    [(ok_track, replace_windows_slashes(&untouched))],
+                    None,
+                );
+                insert_fake_files(
+                    &mut storage.db,
+                    [
+                        (changed_track, replace_windows_slashes(&retagged), 1),
+                        (missing_track, replace_windows_slashes(&deleted), 1),
+                    ],
+                    None,
+                );
+                given_metadata(&mut storage, stale_track);
+
+                let status = storage.status()?;
+
+                assert_eq!(status.diff.ok, 1, "untouched file");
+
+                let changed = &status.diff.changed;
+                assert_eq!(changed.len(), 1);
+                assert_eq!(changed[0].track, changed_track);
+                assert_eq!(changed[0].current.loc, Location::from_path(&retagged));
+
+                let new = status.diff.new.iter().collect::<Vec<_>>();
+                assert_eq!(new.len(), 1);
+                assert_eq!(new[0].loc, Location::from_path(&unknown));
+
+                let missing = status.diff.missing;
+                assert_eq!(missing.len(), 1);
+                let missing_locs = missing
+                    .get(&missing_track)
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.loc.clone())
+                    .collect::<Vec<_>>();
+                assert_eq!(missing_locs, vec![Location::from_path(&deleted)]);
+
+                assert_eq!(status.stale.metadata_only, vec![stale_track]);
+                assert!(status.stale.dangling.is_empty());
+
+                Ok(())
+            }
+
+            #[test]
+            fn status_of_a_library_in_sync_is_empty() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                std::fs::write(&path, b"in sync")?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_real_files(
+                    &mut storage.db,
+                    [(track_id, replace_windows_slashes(&path))],
+                    None,
+                );
+
+                let status = storage.status()?;
+
+                assert_eq!(status.diff.ok, 1);
+                assert!(status.diff.new.is_empty());
+                assert!(status.diff.changed.is_empty());
+                assert!(status.diff.missing.is_empty());
+                assert!(status.stale.metadata_only.is_empty());
+                assert!(status.stale.dangling.is_empty());
+
+                Ok(())
+            }
+
+            /// The two sizes drive what `check changed` prints, so they must not be
+            /// the other way round.
+            #[test]
+            fn changed_keeps_recorded_and_current_size_apart() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                let content = b"twenty bytes of mp3";
+                std::fs::write(&path, content)?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_fake_files(
+                    &mut storage.db,
+                    [(track_id, replace_windows_slashes(&path), 7)],
+                    None,
+                );
+
+                let changed = storage.check_changed()?;
+
+                assert_eq!(changed.len(), 1);
+                assert_eq!(changed[0].recorded.file_size, 7);
+                assert_eq!(changed[0].current.file_size, content.len() as i64);
+
+                Ok(())
+            }
         }
 
         /// Tests for files whose content changed in place, without moving.

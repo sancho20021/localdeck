@@ -45,7 +45,7 @@ impl FileStorage {
         let scanned_dirs = roots
             .iter()
             .map(|root| {
-                println!("Scanning {root}");
+                log::info!("Scanning {root}");
                 self.scan_dir(root)
             })
             .collect::<Result<Vec<_>, _>>()?;
