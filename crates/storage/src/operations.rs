@@ -59,6 +59,33 @@ pub struct StaleTracks {
     pub dangling: Vec<TrackId>,
 }
 
+/// A recorded file whose content changed while staying at the same location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub track: TrackId,
+    /// as recorded when the file was last hashed
+    pub recorded: FileWithMeta,
+    /// as found on disk now
+    pub current: FileWithMeta,
+}
+
+#[derive(Debug)]
+pub struct SyncReport {
+    pub added: HashMap<TrackId, HashSet<HashedFile>>,
+    pub refreshed: Vec<ChangedFile>,
+}
+
+/// The file system compared against the files recorded in the database.
+#[derive(Debug, Default)]
+struct LibraryDiff {
+    /// on disk, not recorded
+    new: HashSet<FileWithMeta>,
+    /// recorded and on disk, but the content differs
+    changed: Vec<ChangedFile>,
+    /// recorded, not on disk
+    missing: HashMap<TrackId, HashSet<FileWithMeta>>,
+}
+
 impl Storage {
     /// when called, opens a data base connection
     /// and applies migrations
@@ -83,23 +110,6 @@ impl Storage {
             db,
             fs: FileStorage::new(lib_config),
         }
-    }
-
-    /// Retrieves all tracks present in database
-    fn get_tracks(&mut self) -> Result<Vec<TrackId>, StorageError> {
-        // TODO: test
-        let tx = self.db.transaction()?;
-        let track_ids = {
-            let mut stmt = tx.prepare(&format!("SELECT {TRACK_ID} FROM {TRACKS}"))?;
-
-            stmt.query_map([], |row| {
-                let id: i64 = row.get(0)?;
-                Ok(id)
-            })?
-            .collect::<Result<Vec<TrackId>, _>>()?
-        };
-        tx.commit()?;
-        Ok(track_ids)
     }
 
     /// Opens transaction, must not be used in a loop for performance
@@ -304,17 +314,88 @@ impl Storage {
         Ok(fs)
     }
 
-    /// checks for new music files not present in database
-    pub fn check_new(&mut self) -> Result<HashSet<FileWithMeta>, StorageError> {
-        let mut fs = HashSet::new();
-        let mut tx = self.db.transaction()?;
-        for file in Self::scan_fs(&mut self.fs)? {
-            if Self::_find_track_by_file(&mut tx, &file)?.is_none() {
-                fs.insert(file);
+    /// Compares the file system against the files recorded in the database.
+    fn diff_library(&mut self) -> Result<LibraryDiff, StorageError> {
+        // Locations left to account for, mapped to their current size
+        let mut on_disk: HashMap<Location, i64> = Self::scan_fs(&mut self.fs)?
+            .into_iter()
+            .map(|f| (f.loc, f.file_size))
+            .collect();
+
+        let mut diff = LibraryDiff::default();
+
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {TRACK_ID}, {USB_LABEL}, {PATH}, {FILE_SIZE} FROM {FILES}"
+            ))?;
+
+            let rows = stmt.query_map([], |row| {
+                let track: TrackId = row.get(0)?;
+                let loc_row = LocationRow {
+                    usb_label: row.get(1)?,
+                    path: row.get(2)?,
+                };
+                let loc: Location = loc_row.into();
+                let recorded_size: i64 = row.get(3)?;
+                Ok((track, loc, recorded_size))
+            })?;
+
+            for row in rows {
+                let (track, loc, recorded_size) = row?;
+
+                match on_disk.remove(&loc) {
+                    None => {
+                        diff.missing.entry(track).or_default().insert(FileWithMeta {
+                            loc,
+                            file_size: recorded_size,
+                        });
+                    }
+                    Some(current_size) if current_size != recorded_size => {
+                        diff.changed.push(ChangedFile {
+                            track,
+                            recorded: FileWithMeta {
+                                loc: loc.clone(),
+                                file_size: recorded_size,
+                            },
+                            current: FileWithMeta {
+                                loc,
+                                file_size: current_size,
+                            },
+                        });
+                    }
+                    Some(_) => {}
+                }
             }
         }
         tx.commit()?;
-        Ok(fs)
+
+        // Anything the database did not account for has not been seen before
+        diff.new = on_disk
+            .into_iter()
+            .map(|(loc, file_size)| FileWithMeta { loc, file_size })
+            .collect();
+
+        Ok(diff)
+    }
+
+    /// Resolves a location, reporting a drive that went away mid operation.
+    fn resolve_path(&mut self, loc: &Location) -> Result<PathBuf, StorageError> {
+        self.fs.loc_resolver.resolve(loc).map_err(|e| {
+            StorageError::Internal(anyhow!(
+                "Failed to resolve a file location. Possibly a drive got removed during the operation: {e}"
+            ))
+        })
+    }
+
+    /// checks for new music files not present in database
+    pub fn check_new(&mut self) -> Result<HashSet<FileWithMeta>, StorageError> {
+        Ok(self.diff_library()?.new)
+    }
+
+    /// checks for recorded files whose content changed without moving
+    pub fn check_changed(&mut self) -> Result<Vec<ChangedFile>, StorageError> {
+        Ok(self.diff_library()?.changed)
     }
 
     /// Returns tracks that have no associated files.
@@ -365,49 +446,75 @@ impl Storage {
     }
 
     /// Scans for untracked files, hashes them, and commits them to the database.
-    pub fn update_db_with_new_files(
-        &mut self,
-    ) -> Result<HashMap<TrackId, HashSet<HashedFile>>, StorageError> {
-        let new_files = self.check_new()?;
+    pub fn add_new_files(&mut self) -> Result<HashMap<TrackId, HashSet<HashedFile>>, StorageError> {
+        let new_files = self.diff_library()?.new;
         if !new_files.is_empty() {
             println!("Hashing {} new files", new_files.len());
         }
-        let with_hash = new_files.into_iter().map(|f| {
-            let path = self.fs.loc_resolver.resolve(&f.loc);
-            let path = match path {
-                Ok(path) => path,
-                Err(e) => return Err(StorageError::Internal(anyhow!("Failed to resolve a file location. Possibly a drive got removed during the operation: {e}"))),
-            };
-            let hash = FileHash::from_file(&path)?;
-            Ok(HashedFile::new(hash, f))
-        }).collect::<Result<Vec<_>, _>>()?;
-        self.insert_files(with_hash.clone())
+
+        let with_hash = new_files
+            .into_iter()
+            .map(|f| {
+                let path = self.resolve_path(&f.loc)?;
+                Ok(HashedFile::new(FileHash::from_file(&path)?, f))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+
+        self.insert_files(with_hash)
+    }
+
+    /// Re-hashes recorded files whose content changed in place.
+    ///
+    /// Only size and hash are rewritten, a file never changes the track it belongs to.
+    pub fn refresh_changed_files(&mut self) -> Result<Vec<ChangedFile>, StorageError> {
+        let changed = self.diff_library()?.changed;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        println!("Rehashing {} changed files", changed.len());
+
+        let mut hashes = Vec::with_capacity(changed.len());
+        for file in &changed {
+            let path = self.resolve_path(&file.current.loc)?;
+            hashes.push(FileHash::from_file(&path)?);
+        }
+
+        let tx = self.db.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(&format!(
+                "UPDATE {FILES} SET {FILE_SIZE} = ?1, {FILE_HASH} = ?2
+                 WHERE {USB_LABEL} = ?3 AND {PATH} = ?4"
+            ))?;
+
+            for (file, hash) in changed.iter().zip(&hashes) {
+                let loc_row = LocationRow::from_location(file.current.loc.clone())?;
+                stmt.execute(params![
+                    file.current.file_size,
+                    hash.to_string(),
+                    loc_row.usb_label,
+                    loc_row.path
+                ])?;
+            }
+        }
+        Self::insert_update_time(&tx)?;
+        tx.commit()?;
+
+        Ok(changed)
+    }
+
+    /// Adds files not yet recorded and repairs the ones that changed in place.
+    pub fn sync(&mut self) -> Result<SyncReport, StorageError> {
+        Ok(SyncReport {
+            added: self.add_new_files()?,
+            refreshed: self.refresh_changed_files()?,
+        })
     }
 
     /// checks for tracks without available files.
     pub fn check_missing(
         &mut self,
     ) -> Result<HashMap<TrackId, HashSet<FileWithMeta>>, StorageError> {
-        let fs = self.fs.scan()?;
-
-        let mut track_db_locs: HashMap<TrackId, HashSet<FileWithMeta>> = Default::default();
-
-        let tracks = self.get_tracks()?;
-
-        let mut tx = self.db.transaction()?;
-        for track in tracks {
-            let track_files = Self::_get_track_files(&mut tx, track)?;
-            for db_file in track_files {
-                if !fs.contains(&db_file.file) {
-                    track_db_locs
-                        .entry(track)
-                        .or_insert(Default::default())
-                        .insert(db_file.file);
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(track_db_locs)
+        Ok(self.diff_library()?.missing)
     }
 
     /// Merges a slave track into a master track.
@@ -524,52 +631,6 @@ impl Storage {
             label: row.get(3)?,
             artwork: row.get::<_, Option<String>>(4)?.map(ArtworkRef),
         }))
-    }
-
-    /// Looks up a track with given file location
-    fn _find_track_by_file(
-        tx: &mut Transaction,
-        file: &FileWithMeta,
-    ) -> Result<Option<(TrackId, HashedFile)>, StorageError> {
-        let loc_row = LocationRow::from_location(file.loc.clone())?;
-
-        let result = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {TRACK_ID}, {FILE_HASH}
-             FROM {FILES}
-             WHERE {USB_LABEL} = ?1 AND {PATH} = ?2
-             LIMIT 1"
-            ))?;
-
-            // query_row returns Optional values cleanly if we catch Optional results or query gracefully
-            let mut rows = stmt.query([&loc_row.usb_label, &loc_row.path])?;
-
-            if let Some(row) = rows.next()? {
-                let track_id_raw: i64 = row.get(0)?;
-                let hash_str: String = row.get(1)?;
-
-                Some((track_id_raw, hash_str))
-            } else {
-                None
-            }
-        };
-
-        // Map the database string hash and integer ID into the strongly-typed structures
-        match result {
-            Some((track_id, hash_str)) => {
-                let hash = FileHash::from_hex(&hash_str).map_err(|e| {
-                    StorageError::Internal(anyhow!("Database contains invalid file hash {e}"))
-                })?;
-
-                let hashed_file = HashedFile {
-                    hash,
-                    file: file.clone(),
-                };
-
-                Ok(Some((track_id, hashed_file)))
-            }
-            None => Ok(None),
-        }
     }
 
     /// retrieves file of the track, checking that it is a valid music file in the file system
@@ -1454,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_db_with_new_files() -> anyhow::Result<()> {
+    fn test_add_new_files() -> anyhow::Result<()> {
         let dir = tempdir()?;
 
         // --- create real files ---
@@ -1471,7 +1532,7 @@ mod tests {
         let track1 = FileHash::from_file(&path1)?;
         let track2 = FileHash::from_file(&path2)?;
         // --- run update ---
-        let result = storage.update_db_with_new_files()?;
+        let result = storage.add_new_files()?;
 
         // --- verify return value ---
         assert_eq!(result.len(), 2);
@@ -2797,6 +2858,282 @@ mod tests {
             assert_eq!(stale.dangling[0], dangling_track);
 
             Ok(())
+        }
+
+        /// Tests for files whose content changed in place, without moving.
+        ///
+        /// A player rewriting ID3 tags grows the file by a padding block, so the
+        /// path stays valid while the recorded size and hash go stale. Such a file
+        /// is neither new nor missing, and the checks must say so consistently.
+        mod retagged_file_tests {
+            use std::{
+                collections::HashSet,
+                path::{Path, PathBuf},
+            };
+
+            use tempfile::tempdir;
+
+            use crate::{
+                config::LibrarySource,
+                file_hash::FileHash,
+                location::{Location, replace_windows_slashes},
+                operations::{
+                    Storage,
+                    tests::{insert_fake_files, insert_real_files, insert_tracks, setup_storage},
+                },
+                schema,
+                track::TrackId,
+                usb::LocationResolver,
+            };
+
+            const ORIGINAL: &[u8] = b"audio frames";
+            /// Same audio, now carrying a tag block a player appended in place
+            const RETAGGED: &[u8] = b"audio frames + ID3 padding block";
+
+            /// Records a file in the database as it was scanned, then rewrites it in
+            /// place so the stored size and hash no longer match the disk.
+            fn given_retagged_file(storage: &mut Storage, path: &Path) -> anyhow::Result<TrackId> {
+                std::fs::write(path, ORIGINAL)?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_real_files(
+                    &mut storage.db,
+                    [(track_id, replace_windows_slashes(path))],
+                    None,
+                );
+
+                std::fs::write(path, RETAGGED)?;
+                assert_ne!(
+                    ORIGINAL.len(),
+                    RETAGGED.len(),
+                    "fixture must actually change the file size"
+                );
+
+                Ok(track_id)
+            }
+
+            const USB_LABEL: &str = "MUSIC_DRIVE";
+
+            /// Mirrors the real config: a library rooted on a USB drive, so location
+            /// matching has to survive the `Location::Usb` roundtrip through the
+            /// database, where the label and the path live in separate columns.
+            fn setup_usb_storage(mount: &Path) -> anyhow::Result<Storage> {
+                let conn = rusqlite::Connection::open_in_memory()?;
+                schema::init(&conn)?;
+
+                let mut storage = Storage::from_existing_conn(
+                    conn,
+                    LibrarySource {
+                        roots: vec![Location::Usb {
+                            label: USB_LABEL.to_string(),
+                            path: PathBuf::from("music"),
+                        }],
+                        follow_symlinks: false,
+                        ignored_dirs: vec![],
+                    },
+                );
+
+                storage.fs.loc_resolver =
+                    LocationResolver::test_resolver([(USB_LABEL.to_string(), mount.to_path_buf())]);
+
+                std::fs::create_dir_all(mount.join("music"))?;
+
+                Ok(storage)
+            }
+
+            fn stored_hash(storage: &mut Storage, path: &Path) -> anyhow::Result<FileHash> {
+                let hash: String = storage.db.query_one(
+                    "SELECT file_hash FROM files WHERE path = ?1",
+                    [replace_windows_slashes(path)],
+                    |row| row.get(0),
+                )?;
+
+                FileHash::from_hex(&hash).map_err(|e| anyhow::anyhow!(e))
+            }
+
+            /// The file is right where the database says it is, so nothing is missing.
+            #[test]
+            fn retagged_file_is_not_reported_missing() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                let track_id = given_retagged_file(&mut storage, &path)?;
+
+                let missing = storage.check_missing()?;
+
+                assert!(
+                    missing.is_empty(),
+                    "track {track_id} is present at {}, but check_missing reported {missing:?}",
+                    path.display()
+                );
+
+                Ok(())
+            }
+
+            /// Counterpart to the test above: the same file is already known, so it is
+            /// not new either. Pins the asymmetry between the two checks.
+            #[test]
+            fn retagged_file_is_not_reported_new() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                given_retagged_file(&mut storage, &path)?;
+
+                let new = storage.check_new()?;
+
+                assert!(
+                    new.is_empty(),
+                    "{} is already recorded, but check_new reported {new:?}",
+                    path.display()
+                );
+
+                Ok(())
+            }
+
+            /// Only the file that actually left the disk may be reported, otherwise
+            /// there is no way to tell which location to forget.
+            #[test]
+            fn retagged_file_does_not_mask_a_genuinely_deleted_sibling() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let retagged = dir.path().join("kept.mp3");
+                let deleted = dir.path().join("deleted.mp3");
+
+                let track_id = given_retagged_file(&mut storage, &retagged)?;
+
+                // Second file of the same track, never written to disk
+                insert_fake_files(
+                    &mut storage.db,
+                    [(
+                        track_id,
+                        replace_windows_slashes(&deleted),
+                        ORIGINAL.len() as i64,
+                    )],
+                    None,
+                );
+
+                let missing = storage.check_missing()?;
+
+                let reported: HashSet<Location> = missing
+                    .get(&track_id)
+                    .map(|files| files.iter().map(|f| f.loc.clone()).collect())
+                    .unwrap_or_default();
+
+                assert_eq!(
+                    reported,
+                    HashSet::from([Location::from_path(&deleted)]),
+                    "expected only the deleted file to be missing"
+                );
+
+                Ok(())
+            }
+
+            /// A plain `deck update` has to repair a stale hash, otherwise the recorded
+            /// hash stays wrong forever and content based lookups keep missing the file.
+            #[test]
+            fn sync_refreshes_a_retagged_files_hash() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                given_retagged_file(&mut storage, &path)?;
+
+                storage.sync()?;
+
+                assert_eq!(
+                    stored_hash(&mut storage, &path)?,
+                    FileHash::from_file(&path)?,
+                    "hash recorded for {} does not match the file on disk",
+                    path.display()
+                );
+
+                Ok(())
+            }
+
+            /// Guards the fix: matching on location alone still has to line up a
+            /// `Location::Usb` produced by the scan with the label and path columns
+            /// recorded in the database. If that roundtrip breaks, every file on the
+            /// drive is reported missing at once.
+            #[test]
+            fn usb_unchanged_file_is_neither_new_nor_missing() -> anyhow::Result<()> {
+                let mount = tempdir()?;
+                let mut storage = setup_usb_storage(mount.path())?;
+
+                std::fs::write(mount.path().join("music/song.mp3"), ORIGINAL)?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_fake_files(
+                    &mut storage.db,
+                    [(track_id, "music/song.mp3", ORIGINAL.len() as i64)],
+                    Some(USB_LABEL.to_string()),
+                );
+
+                assert!(
+                    storage.check_new()?.is_empty(),
+                    "file is already recorded under its USB location"
+                );
+                assert!(
+                    storage.check_missing()?.is_empty(),
+                    "file is present on the mounted drive"
+                );
+
+                Ok(())
+            }
+
+            /// The same content change as the tests above, on the location shape the
+            /// real library actually uses.
+            #[test]
+            fn usb_retagged_file_is_not_reported_missing() -> anyhow::Result<()> {
+                let mount = tempdir()?;
+                let mut storage = setup_usb_storage(mount.path())?;
+
+                let path = mount.path().join("music/song.mp3");
+                std::fs::write(&path, ORIGINAL)?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_fake_files(
+                    &mut storage.db,
+                    [(track_id, "music/song.mp3", ORIGINAL.len() as i64)],
+                    Some(USB_LABEL.to_string()),
+                );
+
+                std::fs::write(&path, RETAGGED)?;
+
+                let missing = storage.check_missing()?;
+
+                assert!(
+                    missing.is_empty(),
+                    "track {track_id} is present on the drive, but check_missing reported {missing:?}"
+                );
+
+                Ok(())
+            }
+
+            /// Guards the fix from the other side: an untouched file stays out of both
+            /// reports.
+            #[test]
+            fn unchanged_file_is_neither_new_nor_missing() -> anyhow::Result<()> {
+                let dir = tempdir()?;
+                let mut storage = setup_storage(dir.path())?;
+
+                let path = dir.path().join("song.mp3");
+                std::fs::write(&path, ORIGINAL)?;
+
+                let track_id = insert_tracks(&mut storage.db, 1)[0];
+                insert_real_files(
+                    &mut storage.db,
+                    [(track_id, replace_windows_slashes(&path))],
+                    None,
+                );
+
+                assert!(storage.check_new()?.is_empty());
+                assert!(storage.check_missing()?.is_empty());
+
+                Ok(())
+            }
         }
     }
 

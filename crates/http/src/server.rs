@@ -323,7 +323,7 @@ mod tests {
         let storage = setup_storage(Some(Location::from_path(lib_root))).unwrap();
         let files = {
             let mut locked = storage.lock().unwrap();
-            locked.update_db_with_new_files().unwrap()
+            locked.add_new_files().unwrap()
         };
         (create_server(&storage), files)
     }

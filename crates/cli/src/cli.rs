@@ -1,12 +1,13 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use log::info;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 
 use crate::music_player::Output;
 use crate::{card_player, config};
-use localdeck_storage::operations::{MetadataUpdate, Storage};
+use localdeck_storage::operations::{ChangedFile, HashedFile, MetadataUpdate, Storage};
 use localdeck_storage::track::{ArtworkRef, TrackId, TrackMetadata};
 
 #[derive(Parser)]
@@ -32,7 +33,17 @@ pub enum Commands {
         action: Option<CheckAction>,
     },
     /// Automatically update library by scanning configured directories
-    Update,
+    ///
+    /// Without flags, adds new files and refreshes changed ones
+    Update {
+        /// Only add files that are not in the database yet
+        #[arg(long, conflicts_with = "changed")]
+        new: bool,
+
+        /// Only refresh files whose content changed without moving
+        #[arg(long)]
+        changed: bool,
+    },
     /// Link a specific music file to an existing track ID
     /// (Useful for adding high-quality, fixed, or alternative versions)
     Add {
@@ -183,6 +194,29 @@ impl Commands {
     }
 }
 
+fn print_added(added: &HashMap<TrackId, HashSet<HashedFile>>) {
+    println!("New files ({}):", added.len());
+    for (track, files) in added {
+        println!("  * track {track}:");
+        for file in files {
+            println!("    - {}", file.file.loc);
+        }
+    }
+}
+
+fn print_refreshed(refreshed: &[ChangedFile]) {
+    println!("Refreshed files ({}):", refreshed.len());
+    for file in refreshed {
+        println!("  * track {}:", file.track);
+        println!(
+            "    - {}\n      {:.2} MB -> {:.2} MB",
+            file.current.loc,
+            file.recorded.size_mb(),
+            file.current.size_mb()
+        );
+    }
+}
+
 /// Entrypoint for CLI
 pub fn run() -> anyhow::Result<()> {
     env_logger::builder()
@@ -277,15 +311,17 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Update {} => {
+        Commands::Update { new, changed } => {
             let mut storage = Storage::new(cfg.storage)?;
-            let files = storage.update_db_with_new_files()?;
-            println!("Database updated, new files ({}):", files.len());
-            for (track, files) in &files {
-                println!("  * track {track}:");
-                for file in files {
-                    println!("    - {}", file.file.loc);
-                }
+
+            if new {
+                print_added(&storage.add_new_files()?);
+            } else if changed {
+                print_refreshed(&storage.refresh_changed_files()?);
+            } else {
+                let report = storage.sync()?;
+                print_added(&report.added);
+                print_refreshed(&report.refreshed);
             }
         }
 
