@@ -1,8 +1,7 @@
 use anyhow::bail;
-use url::Url;
 
 use crate::music_player::{AudioPlayerError, MusicPlayer, Output, start_music_player};
-use localdeck_qr_scanner::{QrScanner, start_qr_scanner};
+use localdeck_qr_scanner::{QrScanner, extract_cardid, start_qr_scanner};
 use localdeck_storage::operations::Storage;
 
 const STOP_LOCALDECK: &'static str = "FINISH";
@@ -91,13 +90,7 @@ pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<
                             continue;
                         }
 
-                        let card_id = match extract_cardid(&raw) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                eprintln!("invalid qr payload: {e}");
-                                continue;
-                            }
-                        };
+                        let card_id = extract_cardid(raw);
 
                         let track_id = storage.resolve_track(card_id.clone())?;
 
@@ -141,36 +134,4 @@ pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<
 
     println!("card player stopped");
     Ok(())
-}
-
-/// Extracts card id from QR/card text.
-///
-/// Accepts:
-/// - raw hash:
-///     abc123
-///
-/// - full URL:
-///     https://example.com/play?h=abc123
-fn extract_cardid(text: &str) -> Result<String, String> {
-    let text = text.trim();
-
-    // -----------------------------------------
-    // Full URL:
-    // https://example.com/play?h=abc123
-    // -----------------------------------------
-    if let Ok(url) = Url::parse(text) {
-        if let Some(hash) = url
-            .query_pairs()
-            .find(|(k, _)| k == "h")
-            .map(|(_, v)| v.to_string())
-        {
-            return Ok(hash);
-        }
-    }
-
-    // -----------------------------------------
-    // raw hash:
-    // abc123
-    // -----------------------------------------
-    Ok(text.to_string())
 }

@@ -2,13 +2,35 @@ use std::io::{BufRead, BufReader};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam::channel::{Receiver, SendError, Sender, unbounded};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use thiserror::Error;
+use url::Url;
 
 /// Public so a caller can name the device it failed to reach.
 pub const LINUX_PORT_NAME: &'static str =
     "/dev/serial/by-id/usb-TMS_Virtual_ComPort_in_FS_Mode_1234567890abcd-if00";
 const BAUD_RATE: u32 = 9600;
+
+/// The card id a scanned payload refers to.
+///
+/// Two forms are in circulation, because cards printed at different times encode
+/// differently: a bare id, and a URL carrying it as the `h` query parameter.
+/// Anything else is taken at face value and left to the library to reject.
+pub fn extract_cardid(payload: &str) -> String {
+    let payload = payload.trim();
+
+    if let Ok(url) = Url::parse(payload) {
+        if let Some(id) = url
+            .query_pairs()
+            .find(|(key, _)| key == "h")
+            .map(|(_, value)| value.to_string())
+        {
+            return id;
+        }
+    }
+
+    payload.to_string()
+}
 
 /// Whether the gun is plugged in.
 ///
@@ -19,35 +41,19 @@ pub fn is_connected() -> bool {
 }
 
 #[derive(Debug, Error)]
-pub enum QrScannerError {
-    #[error("failed to open serial port: {0}")]
-    PortOpen(String),
-    /// `kind` is kept so a caller can tell an unplugged device from a
-    /// misbehaving one without matching on the message.
-    #[error("failed to read from serial device: {message}")]
-    ReadError {
-        kind: std::io::ErrorKind,
-        message: String,
-    },
-    // #[error("invalid UTF-8 from device")]
-    // Utf8Error,
+#[error("failed to open serial port: {0}")]
+pub struct PortOpenError(String);
 
-    // #[error("failed to send message through channel")]
-    // ChannelSend,
-
-    // #[error(transparent)]
-    // Io(#[from] io::Error),
-
-    // #[error("serial port not found or disconnected")]
-    // Disconnected,
-    #[error("failed to send message through channel: {0}")]
-    SendError(String),
-}
-
-impl<T> From<SendError<T>> for QrScannerError {
-    fn from(value: SendError<T>) -> Self {
-        Self::SendError(value.to_string())
-    }
+/// The last thing a scanner ever sends: it stopped reading and its thread has
+/// exited, so no further scans arrive on that channel.
+///
+/// `kind` is kept so a caller can tell an unplugged device from a misbehaving one
+/// without matching on the message.
+#[derive(Debug, Error)]
+#[error("qr scanner stopped: {message}")]
+pub struct ScannerStopped {
+    pub kind: std::io::ErrorKind,
+    pub message: String,
 }
 
 /// QR scanner handle that listens to scanned strings, and shutdowns on demand
@@ -69,14 +75,14 @@ impl QrScanner {
 /// The port is opened here rather than on the scanning thread, so a caller that
 /// cannot run without a scanner learns that before it commits to anything else.
 pub fn start_qr_scanner()
--> Result<(Receiver<Result<String, QrScannerError>>, QrScanner), QrScannerError> {
+-> Result<(Receiver<Result<String, ScannerStopped>>, QrScanner), PortOpenError> {
     let port = serialport::new(LINUX_PORT_NAME, BAUD_RATE)
         .timeout(Duration::from_millis(1000))
         .open()
-        .map_err(|e| QrScannerError::PortOpen(e.to_string()))?;
+        .map_err(|e| PortOpenError(e.to_string()))?;
     log::info!("qr scanner: initialized serial port");
 
-    let (tx, rx) = unbounded::<Result<String, QrScannerError>>();
+    let (tx, rx) = unbounded::<Result<String, ScannerStopped>>();
     let (shutdown_tx, shutdown_rx) = unbounded::<()>();
 
     let handle = thread::spawn(move || {
@@ -107,7 +113,7 @@ pub fn start_qr_scanner()
                     continue;
                 }
                 Err(e) => {
-                    let failure = QrScannerError::ReadError {
+                    let failure = ScannerStopped {
                         kind: e.kind(),
                         message: e.to_string(),
                     };
@@ -148,5 +154,52 @@ pub fn print_qrs() {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_cardid;
+
+    /// What the cards in circulation actually carry.
+    #[test]
+    fn a_bare_id_is_the_card_id() {
+        assert_eq!(extract_cardid("003778873f9d0ca7"), "003778873f9d0ca7");
+        assert_eq!(extract_cardid("1701"), "1701");
+    }
+
+    #[test]
+    fn a_url_gives_up_its_h_parameter() {
+        assert_eq!(
+            extract_cardid("http://main-deck:8080/play?h=003778873f9d0ca7"),
+            "003778873f9d0ca7"
+        );
+        assert_eq!(
+            extract_cardid("https://example.com/play?h=1701&y=abc"),
+            "1701"
+        );
+    }
+
+    #[test]
+    fn a_percent_encoded_value_is_decoded() {
+        assert_eq!(extract_cardid("https://example.com/play?h=a%2Fb"), "a/b");
+    }
+
+    /// A URL without the parameter is not a card id hiding somewhere else, so it
+    /// goes through whole and the library gets to reject it.
+    #[test]
+    fn a_url_without_h_is_left_alone() {
+        let payload = "https://example.com/play?x=1701";
+        assert_eq!(extract_cardid(payload), payload);
+    }
+
+    /// The gun's line ending survives as far as here.
+    #[test]
+    fn surrounding_whitespace_is_stripped() {
+        assert_eq!(extract_cardid("  1701 \r\n"), "1701");
+        assert_eq!(
+            extract_cardid("  https://example.com/play?h=1701  "),
+            "1701"
+        );
     }
 }

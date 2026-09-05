@@ -21,7 +21,6 @@ crossbeam = { workspace = true }
 # Use specific version of rodio to make sure the cpal / alsa fix from https://github.com/RustAudio/cpal/issues/1134 is applied
 # rodio = { git = "https://github.com/RustAudio/rodio", rev = "174ce9bd" }
 rodio = { git = "https://github.com/RustAudio/rodio" }
-url = "2.5"
 
 
 [dev-dependencies]

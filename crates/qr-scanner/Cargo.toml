@@ -8,3 +8,4 @@ thiserror = { workspace = true }
 log = { workspace = true }
 crossbeam = { workspace = true }
 serialport = "4.9"
+url = "2.5"

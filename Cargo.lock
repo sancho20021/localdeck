@@ -1116,7 +1116,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
- "url",
 ]
 
 [[package]]
@@ -1142,6 +1141,7 @@ dependencies = [
  "log",
  "serialport",
  "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]
