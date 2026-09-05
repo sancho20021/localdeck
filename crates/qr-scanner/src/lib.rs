@@ -5,16 +5,30 @@ use std::time::Duration;
 use crossbeam::channel::{Receiver, SendError, Sender, unbounded};
 use thiserror::Error;
 
-const LINUX_PORT_NAME: &'static str =
+/// Public so a caller can name the device it failed to reach.
+pub const LINUX_PORT_NAME: &'static str =
     "/dev/serial/by-id/usb-TMS_Virtual_ComPort_in_FS_Mode_1234567890abcd-if00";
 const BAUD_RATE: u32 = 9600;
+
+/// Whether the gun is plugged in.
+///
+/// Presence only: the port can still fail to open, when another process holds it
+/// or the permissions are wrong.
+pub fn is_connected() -> bool {
+    std::path::Path::new(LINUX_PORT_NAME).exists()
+}
 
 #[derive(Debug, Error)]
 pub enum QrScannerError {
     #[error("failed to open serial port: {0}")]
     PortOpen(String),
-    #[error("failed to read from serial device: {0}")]
-    ReadError(String),
+    /// `kind` is kept so a caller can tell an unplugged device from a
+    /// misbehaving one without matching on the message.
+    #[error("failed to read from serial device: {message}")]
+    ReadError {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
     // #[error("invalid UTF-8 from device")]
     // Utf8Error,
 
@@ -52,25 +66,20 @@ impl QrScanner {
     }
 }
 
-pub fn start_qr_scanner() -> (Receiver<Result<String, QrScannerError>>, QrScanner) {
+/// The port is opened here rather than on the scanning thread, so a caller that
+/// cannot run without a scanner learns that before it commits to anything else.
+pub fn start_qr_scanner()
+-> Result<(Receiver<Result<String, QrScannerError>>, QrScanner), QrScannerError> {
+    let port = serialport::new(LINUX_PORT_NAME, BAUD_RATE)
+        .timeout(Duration::from_millis(1000))
+        .open()
+        .map_err(|e| QrScannerError::PortOpen(e.to_string()))?;
+    log::info!("qr scanner: initialized serial port");
+
     let (tx, rx) = unbounded::<Result<String, QrScannerError>>();
     let (shutdown_tx, shutdown_rx) = unbounded::<()>();
 
     let handle = thread::spawn(move || {
-        let port = match serialport::new(LINUX_PORT_NAME, BAUD_RATE)
-            .timeout(Duration::from_millis(1000))
-            .open()
-        {
-            Ok(p) => p,
-            Err(e) => {
-                if let Err(e) = tx.send(Err(QrScannerError::PortOpen(e.to_string()))) {
-                    log::error!("qr scanner thread: failed to send message: {e}");
-                }
-                return;
-            }
-        };
-        log::info!("qr scanner: initialized serial port");
-
         let mut reader = BufReader::new(port);
 
         loop {
@@ -98,7 +107,11 @@ pub fn start_qr_scanner() -> (Receiver<Result<String, QrScannerError>>, QrScanne
                     continue;
                 }
                 Err(e) => {
-                    if let Err(e) = tx.send(Err(QrScannerError::ReadError(e.to_string()))) {
+                    let failure = QrScannerError::ReadError {
+                        kind: e.kind(),
+                        message: e.to_string(),
+                    };
+                    if let Err(e) = tx.send(Err(failure)) {
                         log::error!("qr scanner thread: failed to send error: {e}");
                     }
                     break;
@@ -107,17 +120,23 @@ pub fn start_qr_scanner() -> (Receiver<Result<String, QrScannerError>>, QrScanne
         }
     });
 
-    (
+    Ok((
         rx,
         QrScanner {
             shutdown: shutdown_tx,
             handle,
         },
-    )
+    ))
 }
 
 pub fn print_qrs() {
-    let (events, scanner) = start_qr_scanner();
+    let (events, scanner) = match start_qr_scanner() {
+        Ok(started) => started,
+        Err(e) => {
+            log::error!("{e}");
+            return;
+        }
+    };
 
     for event in events {
         match event {

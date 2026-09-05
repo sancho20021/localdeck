@@ -21,7 +21,12 @@ fn shutdown(player: MusicPlayer, scanner: QrScanner) {
 /// Then continuously:
 /// QR scan -> extract card id -> resolve path -> play
 pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<()> {
-    let (qr_events, scanner) = start_qr_scanner();
+    let (qr_events, scanner) = match start_qr_scanner() {
+        Ok(started) => started,
+        Err(e) => {
+            bail!("Failed to start qr scanner: {e}");
+        }
+    };
 
     let (audio_errors, player) = match start_music_player(output) {
         Ok(s) => s,
