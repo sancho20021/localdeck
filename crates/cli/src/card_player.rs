@@ -1,10 +1,8 @@
 use anyhow::bail;
 use url::Url;
 
-use crate::{
-    music_player::{AudioPlayerError, MusicPlayer, Output, start_music_player},
-    qr_scanner::{QrScanner, start_qr_scanner},
-};
+use crate::music_player::{AudioPlayerError, MusicPlayer, Output, start_music_player};
+use localdeck_qr_scanner::{QrScanner, start_qr_scanner};
 use localdeck_storage::operations::Storage;
 
 const STOP_LOCALDECK: &'static str = "FINISH";

@@ -1107,12 +1107,12 @@ dependencies = [
  "crossbeam",
  "env_logger",
  "localdeck-http",
+ "localdeck-qr-scanner",
  "localdeck-storage",
  "log",
  "rodio",
  "serde",
  "serde_json",
- "serialport",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -1131,6 +1131,16 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "localdeck-qr-scanner"
+version = "0.1.0"
+dependencies = [
+ "crossbeam",
+ "log",
+ "serialport",
  "thiserror 2.0.18",
 ]
 
