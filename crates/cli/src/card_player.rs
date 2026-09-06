@@ -1,7 +1,7 @@
 use anyhow::bail;
 
 use crate::music_player::{AudioPlayerError, MusicPlayer, Output, start_music_player};
-use localdeck_qr_scanner::{QrScanner, extract_cardid, start_qr_scanner};
+use localdeck_qr_scanner::{QrScanner, ScanEvent, extract_cardid, start_qr_scanner};
 use localdeck_storage::operations::Storage;
 
 const STOP_LOCALDECK: &'static str = "FINISH";
@@ -76,7 +76,7 @@ pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<
 
                 match event {
                     // QR successfully scanned
-                    Ok(raw) => {
+                    ScanEvent::Scan(raw) => {
                         let raw = raw.trim();
                         log::info!("scanned qr: {raw}");
 
@@ -121,8 +121,12 @@ pub fn run_card_player(storage: &mut Storage, output: Output) -> anyhow::Result<
                         player.play(&path);
                     }
 
+                    ScanEvent::Unreadable(why) => {
+                        eprintln!("could not read that card, scan it again: {why}");
+                    }
+
                     // Scanner failed mid-operation
-                    Err(e) => {
+                    ScanEvent::Stopped(e) => {
                         eprintln!("qr scanner error: {e}");
                         shutdown(player, scanner);
                         bail!("qr scanner failed");
