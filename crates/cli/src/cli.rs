@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::music_player::Output;
 use crate::{card_player, config};
 use localdeck_storage::operations::{
-    ChangedFile, HashedFile, LibraryStatus, MetadataUpdate, Storage,
+    ChangedFile, FindFilter, HashedFile, LibraryStatus, MetadataUpdate, Storage,
 };
 use localdeck_storage::location::Location;
 use localdeck_storage::track::{ArtworkRef, TrackId, TrackMetadata};
@@ -73,11 +73,17 @@ pub enum Commands {
     Serve,
     /// Find a track
     Find {
-        /// Artist, Track Name, Track Id or part of the filename to search for
+        /// Artist, Track Name, Track Id, Card Id or part of the filename to search for
         track: String,
         /// Find tracks only without metadata
         #[arg(long)]
         no_meta: bool,
+        /// Find only stale tracks, the ones that have no files left
+        #[arg(long, conflicts_with = "with_files")]
+        no_files: bool,
+        /// Find only tracks that still have files
+        #[arg(long)]
+        with_files: bool,
     },
     /// Remove specified path from the database.
     ///
@@ -431,13 +437,33 @@ pub fn run() -> anyhow::Result<()> {
         Commands::Find {
             track: name,
             no_meta,
+            no_files,
+            with_files,
         } => {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
-            let tracks = storage.find_files(&name, no_meta)?;
+            let filter = FindFilter {
+                no_meta,
+                has_files: if no_files {
+                    Some(false)
+                } else if with_files {
+                    Some(true)
+                } else {
+                    None
+                },
+            };
+            let tracks = storage.find_tracks(&name, filter)?;
             if !tracks.is_empty() {
-                for (trackid, paths) in tracks {
-                    println!("{trackid} at:");
-                    for path in paths {
+                for track in tracks {
+                    let name = match &track.meta {
+                        Some(meta) => format!("{} - {}", meta.artist, meta.title),
+                        None => "no metadata".to_string(),
+                    };
+                    if track.files.is_empty() {
+                        println!("{} ({name}): no files", track.track);
+                        continue;
+                    }
+                    println!("{} ({name}) at:", track.track);
+                    for path in track.files {
                         println!("    - {path}");
                     }
                 }

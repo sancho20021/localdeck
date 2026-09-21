@@ -50,6 +50,26 @@ pub struct CleanDanglingReport {
     pub removed_tracks: usize,
 }
 
+/// Narrows down the results of [`Storage::find_tracks`]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindFilter {
+    /// keep only tracks that have no metadata
+    pub no_meta: bool,
+    /// `Some(true)` keeps only tracks that still have files,
+    /// `Some(false)` only the stale ones that lost them
+    pub has_files: Option<bool>,
+}
+
+/// A track matched by [`Storage::find_tracks`]
+#[derive(Debug, Clone)]
+pub struct TrackMatch {
+    pub track: TrackId,
+    /// every file of the track, empty when it has none left
+    pub files: Vec<Location>,
+    /// `None` when the track has no metadata
+    pub meta: Option<TrackMetadata>,
+}
+
 #[derive(Debug, Default)]
 pub struct StaleTracks {
     /// Track exists in TRACKS and METADATA but has no files.
@@ -752,47 +772,74 @@ impl Storage {
         Ok((path, loc, meta))
     }
 
-    /// searches for a file where path, track_id, hash, card_id, artist or title matches the query
+    /// searches for tracks whose path, track_id, hash, card_id, artist or title matches the query
     ///
-    /// conditionally selects only tracks without meta data
-    pub fn find_files(
+    /// tracks with no files at all are matched too, so that an old card alias still
+    /// resolves to the track it was printed for
+    ///
+    /// a matched track is reported with *all* of its files, not just the ones that
+    /// matched the query
+    ///
+    /// results are ordered by track id
+    pub fn find_tracks(
         &mut self,
         query: &str,
-        no_meta: bool,
-    ) -> Result<HashMap<TrackId, HashSet<Location>>, StorageError> {
+        filter: FindFilter,
+    ) -> Result<Vec<TrackMatch>, StorageError> {
         let tx = self.db.transaction()?;
 
         let cleaned_query = query.trim().to_lowercase();
         let like_query = format!("%{}%", cleaned_query);
 
-        // 1. Build base query with all required table joins using constants
+        // 1. Pick the matching track ids. Driven by {TRACKS} so that stale tracks
+        //    (no files left on disk, but still reachable through an old card alias)
+        //    are found as well.
+        let matching_tracks = format!(
+            "SELECT m.{TRACK_ID}
+             FROM {TRACKS} m
+             LEFT JOIN {FILES} mf ON m.{TRACK_ID} = mf.{TRACK_ID}
+             LEFT JOIN {TRACK_METADATA} mtm ON m.{TRACK_ID} = mtm.{TRACK_ID}
+             LEFT JOIN {CARD_MAPPINGS} mcm ON m.{TRACK_ID} = mcm.{TRACK_ID}
+             WHERE
+                LOWER(mf.{PATH}) LIKE ?1 OR
+                LOWER(m.{TRACK_ID}) LIKE ?1 OR
+                LOWER(mf.{FILE_HASH}) LIKE ?1 OR
+                LOWER(mcm.{CARD_ID}) LIKE ?1 OR
+                LOWER(mtm.{ARTIST}) LIKE ?1 OR
+                LOWER(mtm.{TITLE}) LIKE ?1"
+        );
+
+        // 2. Collect them with everything we want to report back
         let mut sql = format!(
-            "SELECT DISTINCT f.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}
-             FROM {FILES} f
-             LEFT JOIN {TRACK_METADATA} tm ON f.{TRACK_ID} = tm.{TRACK_ID}
-             LEFT JOIN {CARD_MAPPINGS} cm ON f.{TRACK_ID} = cm.{TRACK_ID}
+            "SELECT DISTINCT
+                t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH},
+                tm.{TITLE}, tm.{ARTIST}, tm.{YEAR}, tm.{LABEL}, tm.{ARTWORK_URL}
+             FROM {TRACKS} t
+             LEFT JOIN {FILES} f ON t.{TRACK_ID} = f.{TRACK_ID}
+             LEFT JOIN {TRACK_METADATA} tm ON t.{TRACK_ID} = tm.{TRACK_ID}
              WHERE 1=1"
         );
 
-        // 2. Append conditional filters
+        // 3. Append the filters
         if !cleaned_query.is_empty() {
-            sql.push_str(&format!(
-                " AND (
-                    LOWER(f.{PATH}) LIKE ?1 OR
-                    LOWER(f.{TRACK_ID}) LIKE ?1 OR
-                    LOWER(f.{FILE_HASH}) LIKE ?1 OR
-                    LOWER(cm.{CARD_ID}) LIKE ?1 OR
-                    LOWER(tm.{ARTIST}) LIKE ?1 OR
-                    LOWER(tm.{TITLE}) LIKE ?1
-                )"
-            ));
+            sql.push_str(&format!(" AND t.{TRACK_ID} IN ({matching_tracks})"));
         }
 
-        if no_meta {
+        if filter.no_meta {
             sql.push_str(&format!(" AND tm.{TRACK_ID} IS NULL"));
         }
 
-        // 3. Prepare statement and run execution cleanly via a single branch
+        match filter.has_files {
+            Some(true) => sql.push_str(&format!(" AND f.{TRACK_ID} IS NOT NULL")),
+            Some(false) => sql.push_str(&format!(" AND f.{TRACK_ID} IS NULL")),
+            None => {}
+        }
+
+        // keeps the output stable between runs, and groups the files of a track together
+        sql.push_str(&format!(
+            " ORDER BY t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}"
+        ));
+
         let mut stmt = tx.prepare(&sql)?;
 
         let params = if !cleaned_query.is_empty() {
@@ -803,25 +850,53 @@ impl Storage {
 
         let rows = stmt
             .query_map(params, |row| {
-                let track_id: i64 = row.get(0)?;
-                let usb_label: String = row.get(1)?;
-                let path: String = row.get(2)?;
+                let track_id: TrackId = row.get(0)?;
+                // NULL when the track has no files left
+                let usb_label: Option<String> = row.get(1)?;
+                let path: Option<String> = row.get(2)?;
+                // NULL when the track has no metadata
+                let title: Option<String> = row.get(3)?;
+                let artist: Option<String> = row.get(4)?;
 
-                let loc: Location = LocationRow { usb_label, path }.into();
-                Ok((track_id, loc))
+                let loc = usb_label
+                    .zip(path)
+                    .map(|(usb_label, path)| LocationRow { usb_label, path }.into());
+
+                let meta = title
+                    .zip(artist)
+                    .map(|(title, artist)| {
+                        Ok::<_, rusqlite::Error>(TrackMetadata {
+                            title,
+                            artist,
+                            year: row.get(5)?,
+                            label: row.get(6)?,
+                            artwork: row.get::<_, Option<String>>(7)?.map(ArtworkRef),
+                        })
+                    })
+                    .transpose()?;
+
+                Ok((track_id, loc, meta))
             })?
             .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
         drop(stmt);
         tx.commit()?;
 
-        // 4. Construct response hash map grouping locations by track ID
-        let mut map: HashMap<TrackId, HashSet<Location>> = HashMap::new();
-        for (track_id, loc) in rows {
-            map.entry(track_id).or_default().insert(loc);
+        // 4. Fold the rows of one track into a single match. They are adjacent thanks
+        //    to the ORDER BY.
+        let mut matches: Vec<TrackMatch> = Vec::new();
+        for (track, loc, meta) in rows {
+            match matches.last_mut() {
+                Some(last) if last.track == track => last.files.extend(loc),
+                _ => matches.push(TrackMatch {
+                    track,
+                    files: loc.into_iter().collect(),
+                    meta,
+                }),
+            }
         }
 
-        Ok(map)
+        Ok(matches)
     }
 
     /// Removes dangling track entries from the database.
@@ -1224,7 +1299,7 @@ mod tests {
         file_hash::FileHash,
         fs::{FileWithMeta, HashedFile},
         location::Location,
-        operations::{MetadataUpdate, Storage, replace_windows_slashes},
+        operations::{FindFilter, MetadataUpdate, Storage, TrackMatch, replace_windows_slashes},
         schema::{self, *},
         track::TrackId,
         usb::LocationResolver,
@@ -1972,15 +2047,25 @@ mod tests {
         );
     }
 
-    fn assert_files<I>(results: &HashMap<TrackId, HashSet<Location>>, expected: I)
+    /// asserts that exactly the expected tracks were found, each with exactly the
+    /// expected files
+    fn assert_files<I>(results: &[TrackMatch], expected: I)
     where
         I: IntoIterator<Item = (TrackId, Vec<&'static str>)>,
     {
-        for (id, files) in expected {
-            let expected_set: HashSet<String> = files.into_iter().map(|s| s.to_string()).collect();
-            let actual_set: HashSet<String> = results[&id].iter().map(|l| l.to_string()).collect();
+        let expected: Vec<(TrackId, HashSet<String>)> = expected
+            .into_iter()
+            .map(|(id, files)| (id, files.into_iter().map(|s| s.to_string()).collect()))
+            .collect();
+
+        let found: Vec<TrackId> = results.iter().map(|m| m.track).collect();
+        let wanted: Vec<TrackId> = expected.iter().map(|(id, _)| *id).collect();
+        assert_eq!(found, wanted, "Found tracks do not match exactly");
+
+        for (m, (id, expected_files)) in results.iter().zip(expected) {
+            let actual: HashSet<String> = m.files.iter().map(|l| l.to_string()).collect();
             assert_eq!(
-                actual_set, expected_set,
+                actual, expected_files,
                 "Files for track {:?} do not match exactly",
                 id
             );
@@ -1988,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_files() {
+    fn test_find_tracks() {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
 
@@ -2009,7 +2094,7 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
         // Search for a liberal match
-        let results = storage.find_files("track name", false).unwrap();
+        let results = storage.find_tracks("track name", FindFilter::default()).unwrap();
         assert_files(
             &results,
             [
@@ -2019,7 +2104,7 @@ mod tests {
         );
 
         // Search with different casing and spaces
-        let results2 = storage.find_files("another", false).unwrap();
+        let results2 = storage.find_tracks("another", FindFilter::default()).unwrap();
 
         assert_files(
             &results2,
@@ -2027,19 +2112,19 @@ mod tests {
         );
 
         // Search for trackid
-        let results3 = storage.find_files(&mock_hash_str(3), false).unwrap();
+        let results3 = storage.find_tracks(&mock_hash_str(3), FindFilter::default()).unwrap();
         assert_files(
             &results3,
             [(tracks[2], vec!["completely-different-track.mp3"])],
         );
 
         // Search for non-existent track
-        let results4 = storage.find_files("nonexistent", false).unwrap();
+        let results4 = storage.find_tracks("nonexistent", FindFilter::default()).unwrap();
         assert!(results4.is_empty());
     }
 
     #[test]
-    fn test_find_files_metadata_and_no_meta() {
+    fn test_find_tracks_metadata_and_no_meta() {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
 
@@ -2075,28 +2160,28 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
         // --- Search by artist ---
-        let results = storage.find_files("alpha", false).unwrap();
+        let results = storage.find_tracks("alpha", FindFilter::default()).unwrap();
         assert_files(&results, [(tracks[0], vec!["foo.mp3"])]);
 
         // --- Search by title ---
-        let results = storage.find_files("banger", false).unwrap();
+        let results = storage.find_tracks("banger", FindFilter::default()).unwrap();
         assert_files(&results, [(tracks[1], vec!["bar.mp3"])]);
 
         // --- no_meta: should return ONLY track 3 ---
-        let results = storage.find_files("", true).unwrap();
+        let results = storage.find_tracks("", FindFilter { no_meta: true, ..Default::default() }).unwrap();
         assert_files(&results, [(tracks[2], vec!["baz.mp3"])]);
 
         // --- combined: query + no_meta (should be empty here) ---
-        let results = storage.find_files("cool", true).unwrap();
+        let results = storage.find_tracks("cool", FindFilter { no_meta: true, ..Default::default() }).unwrap();
         assert!(results.is_empty());
 
         // metadata exists but doesn't match query
-        let results = storage.find_files("gamma", false).unwrap();
+        let results = storage.find_tracks("gamma", FindFilter::default()).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
-    fn test_find_files_by_card_id() -> anyhow::Result<()> {
+    fn test_find_tracks_by_card_id() -> anyhow::Result<()> {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
 
@@ -2124,18 +2209,94 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
         // Test exact Card ID match
-        let results = storage.find_files("RFID_CARD_XYZ_123", false)?;
+        let results = storage.find_tracks("RFID_CARD_XYZ_123", FindFilter::default())?;
         assert_files(&results, [(tracks[0], vec!["card_mapped_1.mp3"])]);
 
         // Test case-insensitive/partial card ID match
-        let results = storage.find_files("abc", false)?;
+        let results = storage.find_tracks("abc", FindFilter::default())?;
         assert_files(&results, [(tracks[1], vec!["card_mapped_2.mp3"])]);
 
         Ok(())
     }
 
     #[test]
-    fn test_find_files_empty_query_returns_all() -> anyhow::Result<()> {
+    fn test_find_tracks_finds_tracks_without_files() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let tracks = insert_tracks(&mut conn, 3);
+
+        // Only the first track still has a file on disk; the second one is stale
+        insert_fake_files(
+            &mut conn,
+            vec![(tracks[0], "still_here.mp3", MOCKED_FILE_SIZE)],
+            None,
+        );
+
+        // Both tracks were printed as cards at some point
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["CARD_ALIVE", tracks[0]],
+        )?;
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["CARD_STALE", tracks[1]],
+        )?;
+
+        // ... and the stale one still carries its metadata
+        conn.execute(
+            &format!(
+                "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL})
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL)"
+            ),
+            rusqlite::params![tracks[1], "Lost Track", "DJ Gone"],
+        )?;
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        // By card alias: the stale track must still be retrievable, with no files
+        let results = storage.find_tracks("CARD_STALE", FindFilter::default())?;
+        assert_files(&results, [(tracks[1], vec![])]);
+
+        // By track id. Substring matching may pull in other tracks through their file
+        // hash, so only check that the stale one is in there
+        let results = storage.find_tracks(&tracks[1].to_string(), FindFilter::default())?;
+        let stale = results
+            .iter()
+            .find(|m| m.track == tracks[1])
+            .expect("stale track not found by its id");
+        assert!(stale.files.is_empty());
+
+        // By metadata, which is also reported back so the hit can be identified
+        let results = storage.find_tracks("lost", FindFilter::default())?;
+        assert_files(&results, [(tracks[1], vec![])]);
+        let meta = results[0].meta.as_ref().expect("metadata not reported");
+        assert_eq!(meta.title, "Lost Track");
+        assert_eq!(meta.artist, "DJ Gone");
+
+        // Empty query lists every track
+        let results = storage.find_tracks("", FindFilter::default())?;
+        assert_files(
+            &results,
+            [
+                (tracks[0], vec!["still_here.mp3"]),
+                (tracks[1], vec![]),
+                (tracks[2], vec![]),
+            ],
+        );
+
+        // no_meta: the fileless track without metadata shows up next to the normal one
+        let results = storage.find_tracks("", FindFilter { no_meta: true, ..Default::default() })?;
+        assert_files(
+            &results,
+            [(tracks[0], vec!["still_here.mp3"]), (tracks[2], vec![])],
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_tracks_empty_query_returns_all() -> anyhow::Result<()> {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
 
@@ -2153,7 +2314,7 @@ mod tests {
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
 
         // Empty query string should match everything
-        let results = storage.find_files("", false)?;
+        let results = storage.find_tracks("", FindFilter::default())?;
         assert_files(
             &results,
             [
