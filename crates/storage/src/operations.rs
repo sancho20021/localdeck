@@ -50,6 +50,31 @@ pub struct CleanDanglingReport {
     pub removed_tracks: usize,
 }
 
+/// A file [`Storage::plan_delete`] checked and [`Storage::execute_delete`] will remove
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    /// physical path on disk, already resolved
+    pub path: PathBuf,
+    /// size recorded in the database, re-checked right before removal
+    pub file_size: i64,
+}
+
+/// Everything [`Storage::execute_delete`] will remove for one track.
+/// Produced by [`Storage::plan_delete`] which validates every file up front,
+/// so the plan can be shown to the user before anything is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletePlan {
+    pub track: TrackId,
+    /// every file of the track, one to a few entries
+    pub files: Vec<PlannedFile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeleteReport {
+    /// files removed from disk and from the database
+    pub removed_files: usize,
+}
+
 /// Narrows down the results of [`Storage::find_tracks`]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FindFilter {
@@ -141,56 +166,6 @@ impl Storage {
         }
     }
 
-    /// Opens transaction, must not be used in a loop for performance
-    fn get_track_files(&mut self, track: TrackId) -> Result<Vec<HashedFile>, StorageError> {
-        let mut tx = self.db.transaction()?;
-        let res = Self::_get_track_files(&mut tx, track)?;
-        tx.commit()?;
-        Ok(res)
-    }
-
-    /// Retrieves all files from database that correspond to the given track
-    fn _get_track_files(
-        tx: &mut Transaction,
-        track: TrackId,
-    ) -> Result<Vec<HashedFile>, StorageError> {
-        // TODO: write test
-        let files = {
-            // Query the files table directly filtering by the integer track_id
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {USB_LABEL}, {PATH}, {FILE_SIZE}, {FILE_HASH}
-             FROM {FILES}
-             WHERE {TRACK_ID} = ?"
-            ))?;
-
-            stmt.query_map([track], |row| {
-                let usb_label: String = row.get(0)?;
-                let path: String = row.get(1)?;
-                let file_size: i64 = row.get(2)?;
-                let hash: String = row.get(3)?;
-
-                Ok((LocationRow { usb_label, path }, file_size, hash))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-
-        let files = files
-            .into_iter()
-            .map(|(lr, file_size, hash)| {
-                Ok(HashedFile {
-                    hash: FileHash::from_hex(hash).map_err(|e| {
-                        StorageError::Internal(anyhow!("Database contains invalid file hash {e}"))
-                    })?,
-                    file: FileWithMeta {
-                        loc: lr.into(),
-                        file_size,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-
-        Ok(files)
-    }
 
     pub fn scan_metadata(&mut self) -> Result<Vec<Track>, StorageError> {
         let tx = self.db.transaction()?; // rusqlite::Error propagates here
@@ -708,6 +683,7 @@ impl Storage {
                             "Error while resolving location {loc}: {e}"
                         )));
                     }
+                    #[cfg(target_os = "windows")]
                     ResolveError::WindowsError(..) => {
                         return Err(StorageError::Internal(anyhow!(
                             "Error while resolving location {loc}: {e}"
@@ -1039,6 +1015,122 @@ impl Storage {
         })
     }
 
+    /// Resolves every file of the track and checks it is safe to remove.
+    /// Read-only: touches neither the disk nor the database.
+    /// A track with no files yields an empty plan.
+    ///
+    /// [`StorageError::TrackNotFound`] when the track id does not exist.
+    /// Stops at the first file that cannot be deleted.
+    pub fn plan_delete(&mut self, track: TrackId) -> Result<DeletePlan, StorageError> {
+        let exists: Option<i64> = self
+            .db
+            .query_row(
+                &format!("SELECT 1 FROM {TRACKS} WHERE {TRACK_ID} = ?1"),
+                params![track],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(StorageError::TrackNotFound(track.to_string()));
+        }
+
+        let rows: Vec<(Location, i64)> = {
+            let mut stmt = self.db.prepare(&format!(
+                "SELECT {USB_LABEL}, {PATH}, {FILE_SIZE} FROM {FILES} WHERE {TRACK_ID} = ?1"
+            ))?;
+            stmt.query_map(params![track], |row| {
+                let loc: Location = LocationRow {
+                    usb_label: row.get(0)?,
+                    path: row.get(1)?,
+                }
+                .into();
+                Ok((loc, row.get::<_, i64>(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+
+        let mut files = Vec::with_capacity(rows.len());
+        for (loc, file_size) in rows {
+            let path = self.resolve_path(&loc)?;
+            Self::check_deletable(&path, file_size)?;
+            // never touch anything outside the configured library roots
+            self.fs.reverse_resolve(&path)?;
+            files.push(PlannedFile { path, file_size });
+        }
+
+        Ok(DeletePlan { track, files })
+    }
+
+    /// Removes the planned files from disk, then their rows from `{FILES}`.
+    /// The track row and its metadata stay, the track becomes stale.
+    ///
+    /// Every file is re-checked (regular file, same size) before the first
+    /// removal, so a file that changed between planning and execution
+    /// fails the whole operation with nothing removed.
+    pub fn execute_delete(&mut self, plan: DeletePlan) -> Result<DeleteReport, StorageError> {
+        if plan.files.is_empty() {
+            return Ok(DeleteReport { removed_files: 0 });
+        }
+
+        let tx = self.db.transaction()?;
+
+        // the database must still describe exactly what was planned
+        let recorded: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {FILES} WHERE {TRACK_ID} = ?1"),
+            params![plan.track],
+            |row| row.get(0),
+        )?;
+        if recorded != plan.files.len() as i64 {
+            return Err(StorageError::Internal(anyhow!(
+                "track {} has {recorded} recorded files but {} were planned, plan again",
+                plan.track,
+                plan.files.len()
+            )));
+        }
+
+        // all or nothing: re-check everything before removing anything
+        for file in &plan.files {
+            Self::check_deletable(&file.path, file.file_size)?;
+        }
+
+        let mut removed_files = 0;
+        for file in &plan.files {
+            std::fs::remove_file(&file.path)?;
+            log::info!("Deleted {}", file.path.display());
+            removed_files += 1;
+        }
+
+        tx.execute(
+            &format!("DELETE FROM {FILES} WHERE {TRACK_ID} = ?1"),
+            params![plan.track],
+        )?;
+        Self::insert_update_time(&tx)?;
+        tx.commit()?;
+
+        Ok(DeleteReport { removed_files })
+    }
+
+    /// The only kind of path the delete operation is willing to remove:
+    /// an existing regular file (no symlink, no directory) whose size still
+    /// matches what the database recorded.
+    fn check_deletable(path: &Path, recorded_size: i64) -> Result<(), StorageError> {
+        // symlink_metadata does not follow links, so a link shows up as a link
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::FileMissing(path.to_path_buf()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !meta.is_file() {
+            return Err(StorageError::NotARegularFile(path.to_path_buf()));
+        }
+        if meta.len() as i64 != recorded_size {
+            return Err(StorageError::FileChangedSinceSync(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
     pub fn update_track_metadata(
         &mut self,
         track_id: TrackId,
@@ -1285,7 +1377,7 @@ pub struct MetadataUpdate {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         fs::{self},
         path::{Path, PathBuf},
     };
@@ -1300,7 +1392,7 @@ mod tests {
         fs::{FileWithMeta, HashedFile},
         location::Location,
         operations::{FindFilter, MetadataUpdate, Storage, TrackMatch, replace_windows_slashes},
-        schema::{self, *},
+        schema::{self, columns::*, tables::*},
         track::TrackId,
         usb::LocationResolver,
     };
@@ -1330,7 +1422,6 @@ mod tests {
                 roots: vec![Location::File {
                     path: tmp_dir.to_path_buf(),
                 }],
-                follow_symlinks: false,
                 ignored_dirs: vec![],
             },
         ))
@@ -1344,7 +1435,6 @@ mod tests {
             conn,
             LibrarySource {
                 roots: vec![],
-                follow_symlinks: false,
                 ignored_dirs: vec![],
             },
         ))
@@ -3241,7 +3331,6 @@ mod tests {
                             label: USB_LABEL.to_string(),
                             path: PathBuf::from("music"),
                         }],
-                        follow_symlinks: false,
                         ignored_dirs: vec![],
                     },
                 );
@@ -3678,6 +3767,398 @@ mod tests {
             let unprinted = storage.get_unprinted()?;
             assert_eq!(unprinted, vec![track_id]);
 
+            Ok(())
+        }
+    }
+
+    mod delete_tests {
+        use std::path::{Path, PathBuf};
+
+        use rusqlite::Connection;
+        use tempfile::tempdir;
+
+        use crate::{
+            config::LibrarySource,
+            error::StorageError,
+            location::{Location, replace_windows_slashes},
+            operations::{
+                DeletePlan, PlannedFile, Storage,
+                tests::{insert_fake_files, insert_real_files, insert_tracks, setup_storage},
+            },
+            schema::{self, columns::*, tables::*},
+            track::TrackId,
+            usb::LocationResolver,
+        };
+
+        const AUDIO: &[u8] = b"audio frames";
+
+        /// Writes a music file under `dir` and records it for `track`, size taken from disk
+        fn given_file(storage: &Storage, track: TrackId, dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, AUDIO).unwrap();
+            insert_real_files(&storage.db, [(track, replace_windows_slashes(&path))], None);
+            path
+        }
+
+        fn given_metadata(conn: &Connection, track: TrackId) {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}) VALUES (?1, ?2, ?3)"
+                ),
+                rusqlite::params![track, "Gone Soon", "DJ Regret"],
+            )
+            .unwrap();
+        }
+
+        fn given_card(conn: &Connection, track: TrackId, card: &str) {
+            conn.execute(
+                &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+                rusqlite::params![card, track],
+            )
+            .unwrap();
+        }
+
+        fn count(conn: &Connection, table: &str, track: TrackId) -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {TRACK_ID} = ?1"),
+                rusqlite::params![track],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn count_updates(conn: &Connection) -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {UPDATES}"), [], |r| r.get(0))
+                .unwrap()
+        }
+
+        // ------------------------------------------------------------
+        // plan_delete
+        // ------------------------------------------------------------
+
+        #[test]
+        fn plan_delete_lists_all_files_without_touching_anything() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            let flac = given_file(&storage, track, dir.path(), "song.flac");
+
+            let plan = storage.plan_delete(track)?;
+
+            let expected = PlannedFile {
+                path: mp3.clone(),
+                file_size: AUDIO.len() as i64,
+            };
+            assert_eq!(plan.track, track);
+            assert_eq!(plan.files.len(), 2);
+            assert!(plan.files.contains(&expected));
+            assert!(plan.files.iter().any(|f| f.path == flac));
+
+            // planning is read-only
+            assert!(mp3.exists());
+            assert!(flac.exists());
+            assert_eq!(count(&storage.db, FILES, track), 2);
+            assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_unknown_track_is_not_found() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+
+            let err = storage.plan_delete(999).unwrap_err();
+            assert!(matches!(err, StorageError::TrackNotFound(_)), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn delete_stale_track_is_a_no_op() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            // deleted earlier, only its metadata is left
+            given_metadata(&storage.db, track);
+
+            let plan = storage.plan_delete(track)?;
+            assert_eq!(plan, DeletePlan { track, files: vec![] });
+
+            let report = storage.execute_delete(plan)?;
+            assert_eq!(report.removed_files, 0);
+            assert_eq!(count(&storage.db, TRACK_METADATA, track), 1);
+            assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_fails_when_a_file_is_missing() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            given_file(&storage, track, dir.path(), "still_here.mp3");
+            // recorded, but was deleted by hand since the last sync
+            let gone = dir.path().join("gone.mp3");
+            insert_fake_files(
+                &storage.db,
+                [(track, replace_windows_slashes(&gone), AUDIO.len() as i64)],
+                None,
+            );
+
+            let err = storage.plan_delete(track).unwrap_err();
+            assert!(matches!(err, StorageError::FileMissing(ref p) if *p == gone), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_fails_when_a_file_changed_since_sync() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let path = given_file(&storage, track, dir.path(), "song.mp3");
+            // a tag editor rewrote the file after it was recorded
+            std::fs::write(&path, b"audio frames + ID3 block")?;
+
+            let err = storage.plan_delete(track).unwrap_err();
+            assert!(
+                matches!(err, StorageError::FileChangedSinceSync(ref p) if *p == path),
+                "{err}"
+            );
+            assert!(path.exists());
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn plan_delete_refuses_symlink() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let elsewhere = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+
+            // a link inside the library pointing at a file outside of it
+            let target = elsewhere.path().join("precious.mp3");
+            std::fs::write(&target, AUDIO)?;
+            let link = dir.path().join("song.mp3");
+            std::os::unix::fs::symlink(&target, &link)?;
+            insert_real_files(&storage.db, [(track, replace_windows_slashes(&link))], None);
+
+            let err = storage.plan_delete(track).unwrap_err();
+            assert!(matches!(err, StorageError::NotARegularFile(ref p) if *p == link), "{err}");
+            assert!(target.exists());
+            assert!(link.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_refuses_directory() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+
+            let album = dir.path().join("album.mp3");
+            std::fs::create_dir(&album)?;
+            std::fs::write(album.join("inside.mp3"), AUDIO)?;
+            insert_fake_files(
+                &storage.db,
+                [(track, replace_windows_slashes(&album), std::fs::metadata(&album)?.len() as i64)],
+                None,
+            );
+
+            let err = storage.plan_delete(track).unwrap_err();
+            assert!(matches!(err, StorageError::NotARegularFile(ref p) if *p == album), "{err}");
+            assert!(album.join("inside.mp3").exists());
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_refuses_file_outside_library_roots() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let elsewhere = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            // a perfectly valid file, but recorded under a root that is no longer configured
+            let stray = given_file(&storage, track, elsewhere.path(), "stray.mp3");
+
+            let err = storage.plan_delete(track).unwrap_err();
+            assert!(matches!(err, StorageError::PathOutsideLibrary(_)), "{err}");
+            assert!(stray.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_fails_when_usb_is_not_mounted() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let local = given_file(&storage, track, dir.path(), "local_copy.mp3");
+            insert_fake_files(
+                &storage.db,
+                [(track, "usb_copy.mp3", AUDIO.len() as i64)],
+                Some("DJ_USB".to_string()),
+            );
+            // resolver knows no drives at all
+            storage.fs.loc_resolver = LocationResolver::test_resolver([]);
+
+            assert!(storage.plan_delete(track).is_err());
+            assert!(local.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_resolves_usb_files() -> anyhow::Result<()> {
+            let temp = tempdir()?;
+            let usb_mount = temp.path().join("usb");
+            std::fs::create_dir_all(&usb_mount)?;
+            let usb_label = "DJ_USB";
+
+            let conn = Connection::open_in_memory()?;
+            schema::init(&conn)?;
+            let mut storage = Storage::from_existing_conn(
+                conn,
+                LibrarySource {
+                    roots: vec![Location::Usb {
+                        label: usb_label.to_string(),
+                        path: PathBuf::new(),
+                    }],
+                    ..Default::default()
+                },
+            );
+            storage.fs.loc_resolver =
+                LocationResolver::test_resolver([(usb_label.to_string(), usb_mount.clone())]);
+
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let on_usb = usb_mount.join("song.mp3");
+            std::fs::write(&on_usb, AUDIO)?;
+            insert_fake_files(
+                &storage.db,
+                [(track, "song.mp3", AUDIO.len() as i64)],
+                Some(usb_label.to_string()),
+            );
+
+            let plan = storage.plan_delete(track)?;
+            assert_eq!(
+                plan,
+                DeletePlan {
+                    track,
+                    files: vec![PlannedFile {
+                        path: on_usb,
+                        file_size: AUDIO.len() as i64
+                    }],
+                }
+            );
+            Ok(())
+        }
+
+        // ------------------------------------------------------------
+        // execute_delete
+        // ------------------------------------------------------------
+
+        #[test]
+        fn execute_delete_removes_files_and_their_rows_only() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let tracks = insert_tracks(&mut storage.db, 2);
+            let (doomed, other) = (tracks[0], tracks[1]);
+
+            let mp3 = given_file(&storage, doomed, dir.path(), "doomed.mp3");
+            let flac = given_file(&storage, doomed, dir.path(), "doomed.flac");
+            given_metadata(&storage.db, doomed);
+            given_card(&storage.db, doomed, "CARD_DOOMED");
+            let kept = given_file(&storage, other, dir.path(), "kept.mp3");
+
+            let plan = storage.plan_delete(doomed)?;
+            let report = storage.execute_delete(plan)?;
+            assert_eq!(report.removed_files, 2);
+
+            // gone from disk and from FILES
+            assert!(!mp3.exists());
+            assert!(!flac.exists());
+            assert_eq!(count(&storage.db, FILES, doomed), 0);
+
+            // the track is stale now, not purged
+            assert_eq!(count(&storage.db, TRACKS, doomed), 1);
+            assert_eq!(count(&storage.db, TRACK_METADATA, doomed), 1);
+            assert_eq!(count(&storage.db, CARD_MAPPINGS, doomed), 1);
+
+            // the neighbour was never in danger
+            assert!(kept.exists());
+            assert_eq!(count(&storage.db, FILES, other), 1);
+
+            assert_eq!(count_updates(&storage.db), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn execute_delete_leaves_lookalike_neighbours_alone() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let song = given_file(&storage, track, dir.path(), "song.mp3");
+
+            // everything sharing the name as a prefix, none of it recorded
+            let backup = dir.path().join("song.mp3.bak");
+            std::fs::write(&backup, AUDIO)?;
+            let stems = dir.path().join("song.mp3.stems");
+            std::fs::create_dir(&stems)?;
+            std::fs::write(stems.join("vocals.wav"), AUDIO)?;
+            let folder = dir.path().join("song");
+            std::fs::create_dir(&folder)?;
+            std::fs::write(folder.join("song.mp3"), AUDIO)?;
+
+            let plan = storage.plan_delete(track)?;
+            assert_eq!(plan.files.len(), 1);
+            let report = storage.execute_delete(plan)?;
+            assert_eq!(report.removed_files, 1);
+
+            assert!(!song.exists());
+            assert!(backup.exists());
+            assert!(stems.join("vocals.wav").exists());
+            assert!(folder.join("song.mp3").exists());
+            Ok(())
+        }
+
+        #[test]
+        fn execute_delete_refuses_if_a_file_changed_after_planning() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let first = given_file(&storage, track, dir.path(), "first.mp3");
+            let second = given_file(&storage, track, dir.path(), "second.mp3");
+
+            let plan = storage.plan_delete(track)?;
+            // the user hesitated at the prompt and something rewrote the second file meanwhile
+            std::fs::write(&second, b"audio frames + ID3 block")?;
+
+            let err = storage.execute_delete(plan).unwrap_err();
+            assert!(
+                matches!(err, StorageError::FileChangedSinceSync(ref p) if *p == second),
+                "{err}"
+            );
+
+            // all or nothing: the first file was not removed either
+            assert!(first.exists());
+            assert!(second.exists());
+            assert_eq!(count(&storage.db, FILES, track), 2);
+            assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn execute_delete_refuses_if_a_file_vanished_after_planning() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let first = given_file(&storage, track, dir.path(), "first.mp3");
+            let second = given_file(&storage, track, dir.path(), "second.mp3");
+
+            let plan = storage.plan_delete(track)?;
+            std::fs::remove_file(&second)?;
+
+            let err = storage.execute_delete(plan).unwrap_err();
+            assert!(matches!(err, StorageError::FileMissing(ref p) if *p == second), "{err}");
+            assert!(first.exists());
+            assert_eq!(count(&storage.db, FILES, track), 2);
             Ok(())
         }
     }

@@ -339,7 +339,6 @@ mod tests {
             library_source: root
                 .map(|root| LibrarySource {
                     roots: vec![root],
-                    follow_symlinks: false,
                     ignored_dirs: vec![],
                 })
                 .unwrap_or_default(),

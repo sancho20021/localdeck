@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{location::Location, track::TrackId};
+use crate::track::TrackId;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -31,4 +31,15 @@ pub enum StorageError {
 
     #[error("The path '{0}' is outside of all configured library directories and USB roots.")]
     PathOutsideLibrary(std::path::PathBuf),
+
+    #[error(
+        "file '{0}' is recorded in the database but does not exist on disk. Remove the record with `forget`. If you moved the file instead, run `update` before `forget`."
+    )]
+    FileMissing(std::path::PathBuf),
+
+    #[error("'{0}' is not a regular file (symlink or directory), refusing to touch it")]
+    NotARegularFile(std::path::PathBuf),
+
+    #[error("file '{0}' changed since the last update, run `update` first")]
+    FileChangedSinceSync(std::path::PathBuf),
 }

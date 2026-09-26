@@ -83,8 +83,8 @@ impl QrScanner {
     }
 }
 
-/// The port is opened here rather than on the scanning thread, so a caller that
-/// cannot run without a scanner learns that before it commits to anything else.
+/// Opens the port on the calling thread. A missing scanner fails this call
+/// before any thread starts.
 pub fn start_qr_scanner() -> Result<(Receiver<ScanEvent>, QrScanner), PortOpenError> {
     let port = serialport::new(LINUX_PORT_NAME, BAUD_RATE)
         .timeout(Duration::from_millis(1000))

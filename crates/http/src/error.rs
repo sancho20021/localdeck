@@ -41,7 +41,10 @@ impl From<StorageError> for ApiError {
             }
             StorageError::RequiredMetaMissing(_) => ApiError::BadRequest(err.to_string()),
             StorageError::SlaveTrackHasMetadata(_) => ApiError::BadRequest(err.to_string()),
-            StorageError::PathOutsideLibrary(_) => ApiError::BadRequest(err.to_string()),
+            StorageError::PathOutsideLibrary(_)
+            | StorageError::FileMissing(_)
+            | StorageError::NotARegularFile(_)
+            | StorageError::FileChangedSinceSync(_) => ApiError::BadRequest(err.to_string()),
         }
     }
 }

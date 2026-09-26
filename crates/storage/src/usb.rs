@@ -15,9 +15,9 @@ pub enum ResolveError {
     #[error("failed to query system mounts")]
     SystemQueryFail(#[from] std::io::Error),
 
+    #[cfg(target_os = "windows")]
     #[error("usb resolve failed, windows-specific error: {0}")]
-    WindowsError(String), // #[error("failed to parse mounts")]
-                          // Parse, // optional, if you want to distinguish further
+    WindowsError(String),
 }
 
 #[derive(Debug)]

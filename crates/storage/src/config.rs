@@ -19,7 +19,6 @@ pub enum Database {
 #[derive(Debug, Deserialize, Default)]
 pub struct LibrarySource {
     pub roots: Vec<Location>,
-    pub follow_symlinks: bool,
     /// directories on computer that should be ignored when scanning the library. Does not work with USB directories
     #[serde(default)]
     pub ignored_dirs: Vec<PathBuf>,
@@ -38,7 +37,6 @@ type = "InMemory"
 
 [library_source]
 roots = [{type = "File", path = "/home/sancho20021/Music"}]
-follow_symlinks = true
 ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 "#;
 
@@ -55,7 +53,6 @@ ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
                 path: PathBuf::from("/home/sancho20021/Music")
             }]
         );
-        assert!(cfg.library_source.follow_symlinks);
 
         Ok(())
     }

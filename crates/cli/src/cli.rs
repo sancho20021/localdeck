@@ -92,6 +92,20 @@ pub enum Commands {
         /// Directory or file to remove from database
         path: PathBuf,
     },
+    /// Delete every file of a track from disk and forget them.
+    ///
+    /// Shows what will be removed and asks for confirmation first.
+    /// The track keeps its metadata and becomes stale.
+    /// Refuses to touch anything if the database is out of sync with the disk.
+    Delete {
+        track_id: TrackId,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+        /// Only show what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Generate url for a track to be printed on qr code or nfc chip
     /// Currently does not include youtube link
     Url { track_id: TrackId },
@@ -483,6 +497,31 @@ pub fn run() -> anyhow::Result<()> {
                 );
             }
         }
+        Commands::Delete {
+            track_id,
+            yes,
+            dry_run,
+        } => {
+            let mut storage = Storage::new(cfg.storage)?;
+            let plan = storage.plan_delete(track_id)?;
+            if plan.files.is_empty() {
+                println!("Track {track_id} has no files, nothing to delete");
+                return Ok(());
+            }
+            println!("Track {track_id}, files to delete:");
+            for file in &plan.files {
+                println!("    - {}", file.path.display());
+            }
+            if dry_run {
+                return Ok(());
+            }
+            if !yes && !confirm("Delete them?")? {
+                println!("Aborted, nothing deleted");
+                return Ok(());
+            }
+            let report = storage.execute_delete(plan)?;
+            println!("Deleted {} file(s) of track {track_id}", report.removed_files);
+        }
         Commands::Url { track_id } => {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let _ = storage.get_track_metadata(track_id).unwrap();
@@ -611,4 +650,14 @@ pub fn pretty_metadata(m: TrackMetadata) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Asks a yes/no question on stdin. Anything but an explicit `y`/`yes` is a no.
+fn confirm(question: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }

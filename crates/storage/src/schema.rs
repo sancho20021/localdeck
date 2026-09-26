@@ -8,6 +8,7 @@ pub mod tables {
     pub const CARD_MAPPINGS: &str = "card_mappings";
     pub const PRINTED_TRACKS: &str = "printed_tracks";
 
+    #[cfg(test)]
     pub const ALL_TABLES: &[&str] = &[TRACKS, FILES, UPDATES, TRACK_METADATA, CARD_MAPPINGS, PRINTED_TRACKS];
 }
 
@@ -25,9 +26,6 @@ pub mod columns {
     pub const FILE_HASH: &str = "file_hash";
     pub const CARD_ID: &str = "card_id";
 }
-
-pub use columns::*;
-pub use tables::*;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tracks (

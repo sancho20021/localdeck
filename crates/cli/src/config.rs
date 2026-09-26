@@ -35,7 +35,6 @@ type = "InMemory"
 
 [storage.library_source]
 roots = [{type = "File", path = "/home/sancho20021/Music"}]
-follow_symlinks = true
 ignored_dirs = ['C:\Users\sanch\Music\music\Sample pack']
 
 [http]

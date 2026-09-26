@@ -5,11 +5,11 @@ use walkdir::WalkDir;
 
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::{
-    config::{self, LibrarySource},
+    config::LibrarySource,
     error::StorageError,
     file_hash::FileHash,
     location::Location,
@@ -59,19 +59,16 @@ impl FileStorage {
         })?;
         let root_str = root_path.to_string_lossy();
 
-        let walker = WalkDir::new(&root_path).follow_links(self.config.follow_symlinks);
-
-        walker
-            // filter out ignored directories
+        WalkDir::new(&root_path)
             .into_iter()
             .filter_entry(|entry| {
                 let entry_path = entry.path();
-                // keep the entry if it's not inside any ignored directory
-                !self
-                    .config
-                    .ignored_dirs
-                    .iter()
-                    .any(|ignored| entry_path.starts_with(ignored))
+                !entry.file_type().is_symlink()
+                    && !self
+                        .config
+                        .ignored_dirs
+                        .iter()
+                        .any(|ignored| entry_path.starts_with(ignored))
             })
             .filter_map(|e| match e {
                 Ok(e) => Some(e),
@@ -213,7 +210,6 @@ mod tests {
 
         let files = FileStorage::new(LibrarySource {
             roots: vec![root.clone()],
-            follow_symlinks: false,
             ignored_dirs: vec![],
         })
         .scan_dir(&root)
@@ -228,6 +224,41 @@ mod tests {
             .unwrap();
         assert!(paths.contains(&song1));
         assert!(paths.contains(&song2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinks() -> anyhow::Result<()> {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new()?;
+        let elsewhere = TempDir::new()?;
+        let root = Location::from_path(tmp.path());
+
+        let real = tmp.path().join("real.mp3");
+        std::fs::write(&real, b"aaa")?;
+
+        let target_file = elsewhere.path().join("target.mp3");
+        std::fs::write(&target_file, b"bbb")?;
+        std::os::unix::fs::symlink(&target_file, tmp.path().join("link.mp3"))?;
+
+        let target_dir = elsewhere.path().join("dir");
+        std::fs::create_dir(&target_dir)?;
+        std::fs::write(target_dir.join("inside.mp3"), b"ccc")?;
+        std::os::unix::fs::symlink(&target_dir, tmp.path().join("linked_dir"))?;
+
+        let files = FileStorage::new(LibrarySource {
+            roots: vec![root.clone()],
+            ignored_dirs: vec![],
+        })
+        .scan_dir(&root)?;
+
+        let paths: Vec<_> = files
+            .iter()
+            .map(|f| f.loc.as_path())
+            .collect::<Result<_, _>>()?;
+        assert_eq!(paths, vec![real]);
+        Ok(())
     }
 
     #[test]
@@ -247,7 +278,6 @@ mod tests {
         fs::write(&not_music, b"ignore me").unwrap();
 
         let config = LibrarySource {
-            follow_symlinks: false,
             roots: vec![
                 Location::from_path(dir1.path()),
                 Location::from_path(dir2.path()),
@@ -288,7 +318,6 @@ mod tests {
 
         let files = FileStorage::new(LibrarySource {
             roots: vec![Location::from_path(root)],
-            follow_symlinks: false,
             ignored_dirs: vec![ignored_dir.clone()],
         })
         .scan_dir(&Location::from_path(root))
@@ -322,7 +351,6 @@ mod tests {
 
         let mut fs_storage = FileStorage::new(LibrarySource {
             roots: vec![root.clone()],
-            follow_symlinks: false,
             ignored_dirs: vec![],
         });
 
@@ -354,7 +382,6 @@ mod tests {
 
         let mut fs_storage = FileStorage::new(LibrarySource {
             roots: vec![Location::from_path(&library_path)],
-            follow_symlinks: false,
             ignored_dirs: vec![],
         });
 
