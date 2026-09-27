@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::music_player::Output;
 use crate::{card_player, config};
 use localdeck_storage::operations::{
-    ChangedFile, FindFilter, HashedFile, LibraryStatus, MetadataUpdate, Storage,
+    ChangedFile, FilesFilter, FindFilter, HashedFile, LibraryStatus, MetadataUpdate, Storage,
 };
 use localdeck_storage::location::Location;
 use localdeck_storage::track::{ArtworkRef, TrackId, TrackMetadata};
@@ -78,12 +78,9 @@ pub enum Commands {
         /// Find tracks only without metadata
         #[arg(long)]
         no_meta: bool,
-        /// Find only stale tracks, the ones that have no files left
-        #[arg(long, conflicts_with = "with_files")]
-        no_files: bool,
-        /// Find only tracks that still have files
-        #[arg(long)]
-        with_files: bool,
+        /// Which tracks to report, by whether they still have files
+        #[arg(long, value_enum, default_value_t = FilesArg::With)]
+        files: FilesArg,
     },
     /// Remove specified path from the database.
     ///
@@ -131,6 +128,26 @@ pub enum Commands {
         #[command(subcommand)]
         action: PrintAction,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum FilesArg {
+    /// tracks that still have files
+    With,
+    /// stale tracks, the ones that lost every file
+    None,
+    /// both
+    Any,
+}
+
+impl From<FilesArg> for FilesFilter {
+    fn from(arg: FilesArg) -> Self {
+        match arg {
+            FilesArg::With => FilesFilter::WithFiles,
+            FilesArg::None => FilesFilter::NoFiles,
+            FilesArg::Any => FilesFilter::Any,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -451,19 +468,12 @@ pub fn run() -> anyhow::Result<()> {
         Commands::Find {
             track: name,
             no_meta,
-            no_files,
-            with_files,
+            files,
         } => {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
             let filter = FindFilter {
                 no_meta,
-                has_files: if no_files {
-                    Some(false)
-                } else if with_files {
-                    Some(true)
-                } else {
-                    None
-                },
+                files: files.into(),
             };
             let tracks = storage.find_tracks(&name, filter)?;
             if !tracks.is_empty() {

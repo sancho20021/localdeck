@@ -80,9 +80,18 @@ pub struct DeleteReport {
 pub struct FindFilter {
     /// keep only tracks that have no metadata
     pub no_meta: bool,
-    /// `Some(true)` keeps only tracks that still have files,
-    /// `Some(false)` only the stale ones that lost them
-    pub has_files: Option<bool>,
+    pub files: FilesFilter,
+}
+
+/// Which tracks [`Storage::find_tracks`] reports, by whether they still have files
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilesFilter {
+    /// tracks that still have files
+    #[default]
+    WithFiles,
+    /// stale tracks, the ones that lost every file
+    NoFiles,
+    Any,
 }
 
 /// A track matched by [`Storage::find_tracks`]
@@ -805,10 +814,10 @@ impl Storage {
             sql.push_str(&format!(" AND tm.{TRACK_ID} IS NULL"));
         }
 
-        match filter.has_files {
-            Some(true) => sql.push_str(&format!(" AND f.{TRACK_ID} IS NOT NULL")),
-            Some(false) => sql.push_str(&format!(" AND f.{TRACK_ID} IS NULL")),
-            None => {}
+        match filter.files {
+            FilesFilter::WithFiles => sql.push_str(&format!(" AND f.{TRACK_ID} IS NOT NULL")),
+            FilesFilter::NoFiles => sql.push_str(&format!(" AND f.{TRACK_ID} IS NULL")),
+            FilesFilter::Any => {}
         }
 
         // keeps the output stable between runs, and groups the files of a track together
@@ -1391,7 +1400,7 @@ mod tests {
         file_hash::FileHash,
         fs::{FileWithMeta, HashedFile},
         location::Location,
-        operations::{FindFilter, MetadataUpdate, Storage, TrackMatch, replace_windows_slashes},
+        operations::{FilesFilter, FindFilter, MetadataUpdate, Storage, TrackMatch, replace_windows_slashes},
         schema::{self, columns::*, tables::*},
         track::TrackId,
         usb::LocationResolver,
@@ -2343,14 +2352,18 @@ mod tests {
         )?;
 
         let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+        let any = FindFilter {
+            files: FilesFilter::Any,
+            ..Default::default()
+        };
 
         // By card alias: the stale track must still be retrievable, with no files
-        let results = storage.find_tracks("CARD_STALE", FindFilter::default())?;
+        let results = storage.find_tracks("CARD_STALE", any)?;
         assert_files(&results, [(tracks[1], vec![])]);
 
         // By track id. Substring matching may pull in other tracks through their file
         // hash, so only check that the stale one is in there
-        let results = storage.find_tracks(&tracks[1].to_string(), FindFilter::default())?;
+        let results = storage.find_tracks(&tracks[1].to_string(), any)?;
         let stale = results
             .iter()
             .find(|m| m.track == tracks[1])
@@ -2358,14 +2371,14 @@ mod tests {
         assert!(stale.files.is_empty());
 
         // By metadata, which is also reported back so the hit can be identified
-        let results = storage.find_tracks("lost", FindFilter::default())?;
+        let results = storage.find_tracks("lost", any)?;
         assert_files(&results, [(tracks[1], vec![])]);
         let meta = results[0].meta.as_ref().expect("metadata not reported");
         assert_eq!(meta.title, "Lost Track");
         assert_eq!(meta.artist, "DJ Gone");
 
         // Empty query lists every track
-        let results = storage.find_tracks("", FindFilter::default())?;
+        let results = storage.find_tracks("", any)?;
         assert_files(
             &results,
             [
@@ -2376,10 +2389,70 @@ mod tests {
         );
 
         // no_meta: the fileless track without metadata shows up next to the normal one
-        let results = storage.find_tracks("", FindFilter { no_meta: true, ..Default::default() })?;
+        let results = storage.find_tracks(
+            "",
+            FindFilter {
+                no_meta: true,
+                files: FilesFilter::Any,
+            },
+        )?;
         assert_files(
             &results,
             [(tracks[0], vec!["still_here.mp3"]), (tracks[2], vec![])],
+        );
+
+        // NoFiles: only the stale ones
+        let results = storage.find_tracks(
+            "",
+            FindFilter {
+                no_meta: false,
+                files: FilesFilter::NoFiles,
+            },
+        )?;
+        assert_files(&results, [(tracks[1], vec![]), (tracks[2], vec![])]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_tracks_default_excludes_tracks_without_files() -> anyhow::Result<()> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+
+        let tracks = insert_tracks(&mut conn, 2);
+        insert_fake_files(
+            &mut conn,
+            vec![(tracks[0], "still_here.mp3", MOCKED_FILE_SIZE)],
+            None,
+        );
+
+        // the stale track is reachable by card alias, metadata and id
+        conn.execute(
+            &format!("INSERT INTO {CARD_MAPPINGS} ({CARD_ID}, {TRACK_ID}) VALUES (?1, ?2)"),
+            rusqlite::params!["CARD_STALE", tracks[1]],
+        )?;
+        conn.execute(
+            &format!(
+                "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}, {YEAR}, {LABEL}, {ARTWORK_URL})
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL)"
+            ),
+            rusqlite::params![tracks[1], "Lost Track", "DJ Gone"],
+        )?;
+
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+        assert_eq!(FindFilter::default().files, FilesFilter::WithFiles);
+
+        assert_files(
+            &storage.find_tracks("", FindFilter::default())?,
+            [(tracks[0], vec!["still_here.mp3"])],
+        );
+        assert!(storage.find_tracks("CARD_STALE", FindFilter::default())?.is_empty());
+        assert!(storage.find_tracks("lost", FindFilter::default())?.is_empty());
+        assert!(
+            storage
+                .find_tracks(&tracks[1].to_string(), FindFilter::default())?
+                .iter()
+                .all(|m| m.track != tracks[1])
         );
 
         Ok(())
