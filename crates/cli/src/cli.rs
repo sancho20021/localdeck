@@ -568,6 +568,9 @@ pub fn run() -> anyhow::Result<()> {
 
                     storage.update_track_metadata(track_id, update, overwrite)?;
                     println!("Metadata updated for {}", track_id);
+                    if let Some(meta) = storage.get_track_metadata(track_id)? {
+                        println!("{}", pretty_metadata(meta));
+                    }
                 }
                 MetaAction::All => {
                     let meta = storage.scan_metadata()?;
