@@ -6,6 +6,7 @@ import subprocess
 import json
 import os
 import io
+import re
 import argparse
 import urllib.request
 from typing import List, Tuple, TypedDict
@@ -450,17 +451,34 @@ def generate_card(
 
     return used_square_artwork
 
+HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
 def parse_color(color_input: str):
     """
-    Tries to parse "R,G,B" into (int, int, int).
+    Accepts an HTML hex color (with or without "#", e.g. "2c5b02" or "#2c5b02"),
+    an "R,G,B" triple, or a named color.
     Falls back to the raw string if parsing fails.
     """
-    try:
-        # Split by comma, strip whitespace, and convert to int
-        return tuple(int(c.strip()) for c in color_input.split(","))
-    except (ValueError, AttributeError):
-        # If no commas, not integers, or not a string: return original
+    if not isinstance(color_input, str):
         return color_input
+
+    value = color_input.strip()
+
+    # HTML hex color, with or without the leading "#"
+    match = HEX_COLOR_RE.match(value)
+    if match:
+        return "#" + match.group(1)
+
+    # "R,G,B" (or "R,G,B,A") triple
+    if "," in value:
+        try:
+            return tuple(int(c.strip()) for c in value.split(","))
+        except ValueError:
+            return value
+
+    # Named color such as "red"
+    return value
 
 # =============================
 # CLI
