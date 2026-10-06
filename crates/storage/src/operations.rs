@@ -686,7 +686,10 @@ impl Storage {
                     }
                 }
                 Err(e) => match e {
-                    ResolveError::UsbNotFound { label } => unmounted_locations.push(label),
+                    ResolveError::UsbNotFound { label }
+                    | ResolveError::UsbNotMounted { label, .. } => {
+                        unmounted_locations.push(label)
+                    }
                     ResolveError::SystemQueryFail(..) => {
                         return Err(StorageError::Internal(anyhow!(
                             "Error while resolving location {loc}: {e}"

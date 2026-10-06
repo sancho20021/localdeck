@@ -9,8 +9,11 @@ use crate::location::Location;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
-    #[error("USB with label '{label}' not mounted")]
+    #[error("no drive with label '{label}' is connected")]
     UsbNotFound { label: String },
+
+    #[error("drive with label '{label}' ({}) is connected but not mounted", device.display())]
+    UsbNotMounted { label: String, device: PathBuf },
 
     #[error("failed to query system mounts")]
     SystemQueryFail(#[from] std::io::Error),
@@ -105,16 +108,80 @@ impl Default for LocationResolver {
 pub fn find_mount_by_label(label: &str) -> Result<PathBuf, ResolveError> {
     let mounts = std::fs::read_to_string("/proc/self/mounts")?;
 
+    if let Some(device) = device_for_label(label) {
+        for line in mounts.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(src), Some(mount)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let src = std::fs::canonicalize(unescape_mounts(src)).unwrap_or_default();
+            if src == device {
+                return Ok(PathBuf::from(unescape_mounts(mount)));
+            }
+        }
+        return Err(ResolveError::UsbNotMounted {
+            label: label.to_string(),
+            device,
+        });
+    }
+
     for line in mounts.lines() {
-        let parts: Vec<_> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[1].contains(label) {
-            return Ok(PathBuf::from(parts[1]));
+        let Some(mount) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        let mount = PathBuf::from(unescape_mounts(mount));
+        if mount.file_name().is_some_and(|name| name == label) {
+            return Ok(mount);
         }
     }
 
     Err(ResolveError::UsbNotFound {
         label: label.to_string(),
     })
+}
+
+/// Device node a filesystem label points at, or `None` when udev has no such label.
+#[cfg(not(target_os = "windows"))]
+fn device_for_label(label: &str) -> Option<PathBuf> {
+    std::fs::canonicalize(PathBuf::from("/dev/disk/by-label").join(udev_encode(label))).ok()
+}
+
+/// udev replaces every byte outside `[0-9A-Za-z#+-.:=@_]` with `\x<hex>` when it names
+/// a link in `/dev/disk/by-label`.
+#[cfg(not(target_os = "windows"))]
+fn udev_encode(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for b in label.bytes() {
+        if b.is_ascii_alphanumeric() || b"#+-.:=@_".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}
+
+/// `/proc/self/mounts` writes space, tab, newline and backslash as three-digit octal escapes.
+#[cfg(not(target_os = "windows"))]
+fn unescape_mounts(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let octal = rest.get(i + 1..i + 4).filter(|s| s.len() == 3);
+        match octal.and_then(|s| u8::from_str_radix(s, 8).ok()) {
+            Some(byte) => {
+                out.push(byte as char);
+                rest = &rest[i + 4..];
+            }
+            None => {
+                out.push('\\');
+                rest = &rest[i + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(target_os = "windows")]
@@ -222,5 +289,30 @@ mod for_windows {
                 println!("{x:?}");
             }
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn unescapes_octal_fields() {
+        assert_eq!(unescape_mounts("/media/u/MY\\040DISK"), "/media/u/MY DISK");
+        assert_eq!(unescape_mounts("/mnt/music"), "/mnt/music");
+        assert_eq!(unescape_mounts("/mnt/a\\134b"), "/mnt/a\\b");
+    }
+
+    #[test]
+    fn encodes_label_like_udev() {
+        assert_eq!(udev_encode("MUSIC_DRIVE"), "MUSIC_DRIVE");
+        assert_eq!(udev_encode("MY DISK"), "MY\\x20DISK");
+    }
+
+    #[test]
+    #[ignore = "depends on the labels of the machine running the test"]
+    fn finds_a_real_mount() {
+        let label = std::env::var("LOCALDECK_TEST_LABEL").unwrap();
+        println!("{label} -> {:?}", find_mount_by_label(&label));
     }
 }
