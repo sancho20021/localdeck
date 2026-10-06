@@ -21,7 +21,7 @@ pub enum StorageError {
     #[error("not allowed to modify metadata of track {0}")]
     MetadataOverwriteDenied(TrackId),
 
-    #[error("required metadata (title, artist, ...) not provided for track {0}")]
+    #[error("track {0} has no metadata yet, creating it requires both title and artist")]
     RequiredMetaMissing(TrackId),
 
     #[error(
