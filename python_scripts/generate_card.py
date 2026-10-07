@@ -27,11 +27,15 @@ SQUARE_TOLERANCE = 0.02  # if artwork is not square-ish, don't apply it
 CARD_WIDTH_MM: int = 55
 CARD_HEIGHT_MM: int = 90
 QR_SIZE_MM: int = 17
+QR_MARGIN_MODULES: int = 2  # quiet zone around the QR code, included in QR_SIZE_MM
 DPI: int = 300
 BEZEL_MM: int = 1
 
 FONT_PATH: str = "/home/sancho20021/.local/share/fonts/Montserrat/montserrat.semibold.otf"
 OUTPUT_DIR: str = "./cards"
+# Hand-made square artwork, <track_id>.<ext>; takes precedence over the metadata artwork
+ARTWORK_DIR: str = "./artwork"
+ARTWORK_EXTENSIONS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp")
 
 TOP_EMPTY_RATIO: float = CARD_WIDTH_MM / CARD_HEIGHT_MM
 MARGIN_RATIO: float = 0.08
@@ -53,6 +57,20 @@ class Layout(TypedDict):
     qr_position: Tuple[int, int]
     text_lines: List[TextLine]
 
+
+class CardData(TypedDict):
+    """Everything needed to draw a card, in pixels at DPI."""
+    width: int
+    height: int
+    bezel: int
+    layout: Layout  # positions relative to the area inside the bezel
+    play_url: str
+    artwork: PILImage | None  # square artwork, or None for the black square
+
+
+class ArtworkNeeded(Exception):
+    """No usable artwork, a human has to provide it; no card should be made."""
+
 # =============================
 # HELPERS
 # =============================
@@ -63,7 +81,7 @@ def mm_to_px(mm: int) -> int:
 def qr_size_px() -> int:
     return mm_to_px(QR_SIZE_MM)
 
-def get_metadata(track_id: str) -> Tuple[str, str, str]:
+def get_metadata(track_id: str) -> Tuple[str, str, str | None]:
     result = subprocess.run(
         ["localdeck", "meta", "get", track_id, "--json"],
         capture_output=True,
@@ -71,7 +89,7 @@ def get_metadata(track_id: str) -> Tuple[str, str, str]:
         check=True,
     )
     data: dict = json.loads(result.stdout)
-    return data["artist"], data["title"], data["artwork"]
+    return data["artist"], data["title"], data.get("artwork")
 
 def get_qr_string(track_id: str) -> str:
     """Gets the QR string for a given track_id."""
@@ -95,9 +113,32 @@ def get_qr_string(track_id: str) -> str:
 
 def generate_qr(url: str, output_path: str) -> None:
     subprocess.run(
-        ["qrencode", "-o", output_path, "-s", "8", "-m", "2", url],
+        ["qrencode", "-o", output_path, "-s", "8", "-m", str(QR_MARGIN_MODULES), url],
         check=True
     )
+
+
+def qr_modules(url: str) -> List[List[bool]]:
+    """QR code as a grid of modules (True = dark), without the quiet zone."""
+    png = subprocess.run(
+        ["qrencode", "-o", "-", "-s", "1", "-m", "0", url],
+        capture_output=True,
+        check=True,
+    ).stdout
+    img = Image.open(io.BytesIO(png)).convert("L")
+    w, h = img.size
+    return [[img.getpixel((x, y)) < 128 for x in range(w)] for y in range(h)]
+
+
+def qr_box(layout: Layout, bezel: int) -> Tuple[int, int, int]:
+    """Where the QR code sits on the card: (x, y, size) in pixels, quiet zone included."""
+    qr_x, qr_y = layout["qr_position"]
+    return qr_x + bezel, qr_y + bezel, qr_size_px()
+
+
+def qr_module_px(module_count: int) -> float:
+    """Size of one module when the code plus its quiet zone fills the QR box."""
+    return qr_size_px() / (module_count + 2 * QR_MARGIN_MODULES)
 
 
 def fetch_image(url: str) -> Image.Image:
@@ -128,6 +169,26 @@ def fetch_image(url: str) -> Image.Image:
         data = response.read()
 
     return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def find_artwork_override(track_id: str, artwork_dir: str = ARTWORK_DIR) -> str | None:
+    """The hand-made artwork for a track (newest one if there are several), if any."""
+    if not os.path.isdir(artwork_dir):
+        return None
+    candidates = [
+        os.path.join(artwork_dir, f)
+        for f in os.listdir(artwork_dir)
+        if os.path.splitext(f)[0] == track_id and os.path.splitext(f)[1].lower() in ARTWORK_EXTENSIONS
+    ]
+    return max(candidates, key=os.path.getmtime, default=None)
+
+
+def save_original_artwork(img: PILImage, track_id: str, artwork_dir: str = ARTWORK_DIR) -> str:
+    """Saves downloaded non-square artwork next to the overrides, ready to be cropped."""
+    os.makedirs(artwork_dir, exist_ok=True)
+    path = os.path.join(artwork_dir, f"{track_id}_original.png")
+    img.save(path)
+    return path
 
 
 def is_squareish(w: int, h: int, tolerance: float) -> bool:
@@ -381,12 +442,12 @@ def render_card(
             font=line["font"],
         )
 
+    qr_x, qr_y, qr_size = qr_box(layout, bezel)
     qr_resized: PILImage = qr_img.resize(
-            (qr_size_px(), qr_size_px()),
+            (qr_size, qr_size),
         # Image.LANCZOS
     )
-    qr_x, qr_y = layout["qr_position"]
-    img.paste(qr_resized, (qr_x + bezel, qr_y + bezel))
+    img.paste(qr_resized, (qr_x, qr_y))
 
     img.save(output_path, dpi=(DPI, DPI))
 
@@ -394,14 +455,47 @@ def render_card(
 # MAIN
 # =============================
 
-def generate_card(
+def load_artwork(
     track_id: str,
-    output_path: str,
-    color: str | tuple,
-    add_picture: bool = False,
-) -> bool:
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    artwork_url: str | None,
+    artwork_dir: str = ARTWORK_DIR,
+) -> PILImage:
+    """
+    Square artwork for the card: the hand-made one from artwork_dir if present,
+    otherwise the metadata one. Raises ArtworkNeeded, saying what to do, when
+    neither is usable; downloaded non-square artwork is saved for cropping.
+    """
+    target = f"{artwork_dir}/{track_id}.<png|jpg>"
 
+    override = find_artwork_override(track_id, artwork_dir)
+    if override is not None:
+        img = Image.open(override).convert("RGB")
+        w, h = img.size
+        if not is_squareish(w, h, SQUARE_TOLERANCE):
+            raise ArtworkNeeded(f"{override} is {w}x{h}, not square; replace it with a square version")
+        return crop_to_square(img)
+
+    if not artwork_url:
+        raise ArtworkNeeded(
+            f"no artwork in metadata; save a square image as {target} (a plain white square for a white card)"
+        )
+
+    try:
+        img = fetch_image(artwork_url)
+    except Exception as e:
+        raise ArtworkNeeded(
+            f"artwork download failed ({e}); run again to retry, or save a square image as {target}"
+        ) from e
+
+    w, h = img.size
+    if not is_squareish(w, h, SQUARE_TOLERANCE):
+        original = save_original_artwork(img, track_id, artwork_dir)
+        raise ArtworkNeeded(f"artwork is {w}x{h}, not square; crop {original} and save as {target}")
+    return crop_to_square(img)
+
+
+def prepare_card(track_id: str, add_picture: bool = False, artwork_dir: str = ARTWORK_DIR) -> CardData:
+    """With add_picture, raises ArtworkNeeded when there is no usable artwork (see load_artwork)."""
     width: int = mm_to_px(CARD_WIDTH_MM)
     height: int = mm_to_px(CARD_HEIGHT_MM)
     bezel: int = mm_to_px(BEZEL_MM)
@@ -412,11 +506,6 @@ def generate_card(
     artist, title, artwork_url = get_metadata(track_id)
 
     play_url: str = get_qr_string(track_id)
-
-    qr_tmp: str = "temp_qr.png"
-    generate_qr(play_url, qr_tmp)
-
-    qr_img: PILImage = Image.open(qr_tmp).convert("RGB")
 
     dummy_img: PILImage = Image.new("RGB", (payload_width, payload_height))
     dummy_draw: PILDraw = ImageDraw.Draw(dummy_img)
@@ -429,27 +518,47 @@ def generate_card(
         dummy_draw,
     )
 
-    artwork_img = None
-    used_square_artwork = False
+    artwork_img = load_artwork(track_id, artwork_url, artwork_dir) if add_picture else None
 
-    if add_picture:
-        img = fetch_image(artwork_url)
-        w, h = img.size
+    return {
+        "width": width,
+        "height": height,
+        "bezel": bezel,
+        "layout": layout,
+        "play_url": play_url,
+        "artwork": artwork_img,
+    }
 
-        if is_squareish(w, h, SQUARE_TOLERANCE):
-            artwork_img = crop_to_square(img)
-            # print(f"cropped image size: {artwork_img.size}")
-            used_square_artwork = True
-        else:
-            print(f"image size not square: {w}x{h}")
-            used_square_artwork = False
 
-    render_card(width, height, layout, qr_img, output_path, color, artwork_img)
+def generate_card(
+    track_id: str,
+    output_path: str,
+    color: str | tuple,
+    add_picture: bool = False,
+    artwork_dir: str = ARTWORK_DIR,
+) -> None:
+    """Raises ArtworkNeeded (see prepare_card), in which case no card is made."""
+    card: CardData = prepare_card(track_id, add_picture, artwork_dir)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    qr_tmp: str = "temp_qr.png"
+    generate_qr(card["play_url"], qr_tmp)
+
+    qr_img: PILImage = Image.open(qr_tmp).convert("RGB")
+
+    render_card(
+        card["width"],
+        card["height"],
+        card["layout"],
+        qr_img,
+        output_path,
+        color,
+        card["artwork"],
+    )
 
     os.remove(qr_tmp)
     print(f"Card saved to {output_path}")
-
-    return used_square_artwork
 
 HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
@@ -491,6 +600,7 @@ if __name__ == "__main__":
     parser.add_argument("output", nargs="?")
     parser.add_argument("--add-picture", action="store_true")
     parser.add_argument("--color", default="red",type=str)
+    parser.add_argument("--artwork-dir", default=ARTWORK_DIR, help=f"hand-made square artwork (default: {ARTWORK_DIR})")
 
     args = parser.parse_args()
 
@@ -499,13 +609,13 @@ if __name__ == "__main__":
 
     color = parse_color(args.color)
 
-
-    picture_applied = generate_card(
-        track_id,
-        output,
-        color=color,
-        add_picture=args.add_picture
-    )
-
-    if args.add_picture and not picture_applied:
-        print(f"\n=== Failed to apply picture to {track_id}  ===")
+    try:
+        generate_card(
+            track_id,
+            output,
+            color=color,
+            add_picture=args.add_picture,
+            artwork_dir=args.artwork_dir,
+        )
+    except ArtworkNeeded as e:
+        print(f"\n=== No card for {track_id}: {e} ===")
