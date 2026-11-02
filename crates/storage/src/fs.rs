@@ -152,37 +152,22 @@ impl HashedFile {
     }
 }
 
-/// Best-effort check that a path points to a real, playable music file.
-///
-/// This does NOT decode audio, but rules out:
-/// - missing paths
-/// - directories / special files
-/// - wrong extensions
-/// - empty files
-/// - unreadable files
-pub fn is_valid_music_path(path: &Path) -> bool {
-    // Must exist and be a file
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
+/// Best-effort check that a path points to a real, playable music file, without
+/// decoding audio. The error says which check failed.
+pub fn check_music_path(path: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
-        return false;
+        return Err("not a regular file".to_string());
     }
-
-    // Must look like music by extension
     if !is_music_file(path) {
-        return false;
+        return Err("extension is not a supported music format".to_string());
     }
-
-    // Must not be empty
     if meta.len() == 0 {
-        return false;
+        return Err("file is empty".to_string());
     }
-
-    // Must be readable (cheap probe)
-    std::fs::File::open(path).is_ok()
+    std::fs::File::open(path)
+        .map(|_| ())
+        .map_err(|e| format!("cannot open: {e}"))
 }
 
 #[cfg(test)]

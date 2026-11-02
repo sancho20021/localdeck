@@ -15,7 +15,7 @@ use crate::{
     db::{self, DBConfig, i64_seconds_to_local_time, system_time_to_i64},
     error::StorageError,
     file_hash::FileHash,
-    fs::{FileStorage, FileWithMeta, is_valid_music_path},
+    fs::{FileStorage, FileWithMeta, check_music_path},
     location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
     schema::{columns, tables},
     track::{ArtworkRef, Track, TrackId, TrackMetadata},
@@ -676,15 +676,15 @@ impl Storage {
         }
 
         let mut unmounted_locations = vec![];
+        let mut rejected_paths = vec![];
 
         for loc in paths {
             let path = self.fs.loc_resolver.resolve(&loc);
             match path {
-                Ok(p) => {
-                    if is_valid_music_path(&p) {
-                        return Ok((track_id, p, loc));
-                    }
-                }
+                Ok(p) => match check_music_path(&p) {
+                    Ok(()) => return Ok((track_id, p, loc)),
+                    Err(reason) => rejected_paths.push(format!("{p:?}: {reason}")),
+                },
                 Err(e) => match e {
                     ResolveError::UsbNotFound { label }
                     | ResolveError::UsbNotMounted { label, .. } => {
@@ -704,13 +704,13 @@ impl Storage {
                 },
             }
         }
+        let mut problems = rejected_paths;
+        if !unmounted_locations.is_empty() {
+            problems.push(format!("drive not mounted: {unmounted_locations:?}"));
+        }
         Err(StorageError::InvalidTrackFile {
             track: track_id,
-            extra: if !unmounted_locations.is_empty() {
-                format!("following drive labels are unmounted: {unmounted_locations:?}")
-            } else {
-                "".to_string()
-            },
+            extra: problems.join("; "),
         })
     }
 
