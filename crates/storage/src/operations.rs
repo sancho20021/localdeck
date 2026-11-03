@@ -951,27 +951,33 @@ impl Storage {
 
     /// removes all files inside specified directory from the database
     /// useful when some files got moved or deleted
+    ///
+    /// The path is mapped to a library location the same way `add` does it,
+    /// so it has to lie under a configured root but does not have to exist.
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
-        let tx = self.db.transaction()?;
+        let LocationRow {
+            usb_label,
+            path: path_prefix,
+        } = LocationRow::from_location(self.fs.reverse_resolve(path)?)?;
 
-        let path_prefix = replace_windows_slashes(path);
-
-        let dir_prefix = if path_prefix.ends_with(LOCATION_PATH_SEP) {
-            path_prefix.clone()
+        let dir_prefix = if path_prefix.is_empty() || path_prefix.ends_with(LOCATION_PATH_SEP) {
+            format!("{path_prefix}%")
         } else {
-            format!("{}{}%", path_prefix, LOCATION_PATH_SEP)
+            format!("{path_prefix}{LOCATION_PATH_SEP}%")
         };
+
+        let tx = self.db.transaction()?;
         // --------------------------------------------------
         // Collect affected track ids BEFORE deletion
         // --------------------------------------------------
 
         let mut stmt = tx.prepare(&format!(
             "SELECT DISTINCT {TRACK_ID} FROM {FILES}
-         WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
+         WHERE {USB_LABEL} = ?3 AND ({PATH} = ?1 OR {PATH} LIKE ?2)"
         ))?;
 
         let affected_track_ids = stmt
-            .query_map(params![path_prefix, dir_prefix], |row| {
+            .query_map(params![path_prefix, dir_prefix, usb_label], |row| {
                 row.get::<_, TrackId>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -987,9 +993,9 @@ impl Storage {
         let removed_files = tx.execute(
             &format!(
                 "DELETE FROM {FILES}
-             WHERE {PATH} = ?1 OR {PATH} LIKE ?2"
+             WHERE {USB_LABEL} = ?3 AND ({PATH} = ?1 OR {PATH} LIKE ?2)"
             ),
-            params![path_prefix, dir_prefix],
+            params![path_prefix, dir_prefix, usb_label],
         )?;
 
         // --------------------------------------------------
@@ -2517,95 +2523,194 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn test_forget_path_removes_files_and_tracks() {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::init(&conn).unwrap();
+    mod forget_tests {
+        use std::path::{Path, PathBuf};
 
-        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
-        let mut storage = storage;
+        use tempfile::tempdir;
 
-        let tracks = insert_tracks(&mut storage.db, 3);
-        let track_files = [
-            (tracks[0], "/music/track_a1.mp3", MOCKED_FILE_SIZE),
-            (tracks[0], "/music/subdir/track_a2.mp3", MOCKED_FILE_SIZE),
-            (tracks[1], "/music/track_b.mp3", MOCKED_FILE_SIZE),
-            (tracks[2], "/hello/track_c.mp3", MOCKED_FILE_SIZE), // outside deleted path
-            (tracks[0], "/hello/track_a3.mp3", MOCKED_FILE_SIZE), // outside deleted path
-        ];
-        insert_fake_files(&storage.db, track_files, None);
+        use super::*;
+        use crate::usb::LocationResolver;
 
-        // Forget top-level directory
-        let path_to_forget = Path::new("/music");
-        let report = storage.forget_path(path_to_forget).unwrap();
+        const LABEL: &str = "DJ_USB";
 
-        assert_eq!(report.removed_files, 3); // a1 + a2 + b
-        assert_eq!(report.affected_tracks, 2); // a + b
-        assert_eq!(report.removed_tracks, 1); // b
+        fn usb_storage(mount: &Path) -> Storage {
+            let conn = Connection::open_in_memory().unwrap();
+            schema::init(&conn).unwrap();
+            let mut storage = Storage::from_existing_conn(
+                conn,
+                LibrarySource {
+                    roots: vec![Location::Usb {
+                        label: LABEL.to_string(),
+                        path: PathBuf::new(),
+                    }],
+                    ..Default::default()
+                },
+            );
+            storage.fs.loc_resolver =
+                LocationResolver::test_resolver([(LABEL.to_string(), mount.to_path_buf())]);
+            storage
+        }
 
-        // Remaining DB entries
-        let remaining: Vec<TrackId> = storage
-            .db
-            .prepare("SELECT track_id FROM files")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        fn recorded_paths(storage: &Storage) -> Vec<(String, String)> {
+            storage
+                .db
+                .prepare(&format!("SELECT {USB_LABEL}, {PATH} FROM {FILES} ORDER BY {PATH}"))
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
 
-        assert!(remaining.len() == 2);
-    }
+        #[test]
+        fn forget_dir_removes_its_files_and_reports_tracks() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let root = dir.path();
+            std::fs::create_dir(root.join("music"))?;
+            let mut storage = setup_storage(root)?;
+            let tracks = insert_tracks(&mut storage.db, 3);
+            let at = |rel: &str| replace_windows_slashes(&root.join(rel));
+            insert_fake_files(
+                &storage.db,
+                [
+                    (tracks[0], at("music/a1.mp3"), MOCKED_FILE_SIZE),
+                    (tracks[0], at("music/subdir/a2.mp3"), MOCKED_FILE_SIZE),
+                    (tracks[1], at("music/b.mp3"), MOCKED_FILE_SIZE),
+                    (tracks[2], at("hello/c.mp3"), MOCKED_FILE_SIZE),
+                    (tracks[0], at("hello/a3.mp3"), MOCKED_FILE_SIZE),
+                ],
+                None,
+            );
 
-    #[test]
-    fn test_forget_windows() {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::init(&conn).unwrap();
+            let report = storage.forget_path(&root.join("music"))?;
 
-        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
-        let mut storage = storage;
+            assert_eq!(report.removed_files, 3);
+            assert_eq!(report.affected_tracks, 2);
+            assert_eq!(report.removed_tracks, 1);
+            assert_eq!(recorded_paths(&storage).len(), 2);
+            Ok(())
+        }
 
-        let track = insert_tracks(&mut storage.db, 1)[0];
-        let track_files = [
-            (track, "C:/music/track_a1.mp3", MOCKED_FILE_SIZE),
-            (track, "C:/music/subdir/track_a2.mp3", MOCKED_FILE_SIZE),
-        ];
-        insert_fake_files(&storage.db, track_files, None);
+        #[test]
+        fn forget_dir_without_recorded_files_removes_nothing() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let tracks = insert_tracks(&mut storage.db, 1);
+            let kept = replace_windows_slashes(&dir.path().join("kept.mp3"));
+            insert_fake_files(&storage.db, [(tracks[0], kept, MOCKED_FILE_SIZE)], None);
 
-        let path_to_forget = Path::new("C:\\music\\subdir");
-        let report = storage.forget_path(path_to_forget).unwrap();
+            let report = storage.forget_path(&dir.path().join("empty"))?;
 
-        assert_eq!(report.removed_files, 1);
-        assert_eq!(report.affected_tracks, 1);
-        assert_eq!(report.removed_tracks, 0);
+            assert_eq!(report.removed_files, 0);
+            assert_eq!(report.affected_tracks, 0);
+            assert_eq!(recorded_paths(&storage).len(), 1);
+            Ok(())
+        }
 
-        // Remaining DB entries
-        let remaining: Vec<String> = storage
-            .db
-            .prepare("SELECT path FROM files")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        #[test]
+        fn forget_path_outside_library_fails_and_removes_nothing() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let elsewhere = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let tracks = insert_tracks(&mut storage.db, 1);
+            let stray = replace_windows_slashes(&elsewhere.path().join("stray.mp3"));
+            insert_fake_files(&storage.db, [(tracks[0], stray, MOCKED_FILE_SIZE)], None);
 
-        assert_eq!(remaining, vec!["C:/music/track_a1.mp3"]);
-    }
+            let err = storage.forget_path(&elsewhere.path().join("stray.mp3")).unwrap_err();
 
-    #[test]
-    fn test_forget_path_empty_dir_no_crash() {
-        let conn = Connection::open_in_memory().unwrap();
-        schema::init(&conn).unwrap();
+            assert!(matches!(err, StorageError::PathOutsideLibrary(_)), "{err}");
+            assert_eq!(recorded_paths(&storage).len(), 1);
+            Ok(())
+        }
 
-        let storage = Storage::from_existing_conn(conn, LibrarySource::default());
-        let mut storage = storage;
+        #[test]
+        fn forget_deleted_usb_file_by_mount_path() -> anyhow::Result<()> {
+            let mount = tempdir()?;
+            std::fs::create_dir(mount.path().join("album"))?;
+            let mut storage = usb_storage(mount.path());
+            let tracks = insert_tracks(&mut storage.db, 1);
+            insert_fake_files(
+                &storage.db,
+                [
+                    (tracks[0], "album/old.mp3", MOCKED_FILE_SIZE),
+                    (tracks[0], "album/new.flac", MOCKED_FILE_SIZE),
+                ],
+                Some(LABEL.to_string()),
+            );
 
-        // Forget a directory that doesn't exist
-        let path_to_forget = Path::new("/nonexistent");
-        let report = storage.forget_path(path_to_forget).unwrap();
+            let report = storage.forget_path(&mount.path().join("album/old.mp3"))?;
 
-        assert_eq!(report.removed_files, 0);
-        assert_eq!(report.affected_tracks, 0);
-        assert_eq!(report.removed_tracks, 0);
+            assert_eq!(report.removed_files, 1);
+            assert_eq!(report.removed_tracks, 0);
+            assert_eq!(
+                recorded_paths(&storage),
+                vec![(LABEL.to_string(), "album/new.flac".to_string())]
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn forget_usb_dir_leaves_local_file_with_same_relative_path() -> anyhow::Result<()> {
+            let mount = tempdir()?;
+            std::fs::create_dir(mount.path().join("album"))?;
+            let mut storage = usb_storage(mount.path());
+            let tracks = insert_tracks(&mut storage.db, 2);
+            insert_fake_files(
+                &storage.db,
+                [(tracks[0], "album/song.mp3", MOCKED_FILE_SIZE)],
+                Some(LABEL.to_string()),
+            );
+            insert_fake_files(&storage.db, [(tracks[1], "album/song.mp3", MOCKED_FILE_SIZE)], None);
+
+            let report = storage.forget_path(&mount.path().join("album"))?;
+
+            assert_eq!(report.removed_files, 1);
+            assert_eq!(
+                recorded_paths(&storage),
+                vec![(String::new(), "album/song.mp3".to_string())]
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn forget_usb_mount_root_forgets_whole_drive() -> anyhow::Result<()> {
+            let mount = tempdir()?;
+            let mut storage = usb_storage(mount.path());
+            let tracks = insert_tracks(&mut storage.db, 1);
+            insert_fake_files(
+                &storage.db,
+                [
+                    (tracks[0], "top.mp3", MOCKED_FILE_SIZE),
+                    (tracks[0], "album/deep.mp3", MOCKED_FILE_SIZE),
+                ],
+                Some(LABEL.to_string()),
+            );
+
+            let report = storage.forget_path(mount.path())?;
+
+            assert_eq!(report.removed_files, 2);
+            assert_eq!(report.removed_tracks, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn forget_deleted_local_file_reached_through_symlink() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let root = dir.path().join("music");
+            std::fs::create_dir(&root)?;
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&root, &link)?;
+            let mut storage = setup_storage(&root)?;
+            let tracks = insert_tracks(&mut storage.db, 1);
+            let recorded = replace_windows_slashes(&root.join("old.mp3"));
+            insert_fake_files(&storage.db, [(tracks[0], &recorded, MOCKED_FILE_SIZE)], None);
+
+            let report = storage.forget_path(&link.join("old.mp3"))?;
+
+            assert_eq!(report.removed_files, 1);
+            assert!(recorded_paths(&storage).is_empty());
+            Ok(())
+        }
     }
 
     mod update_meta_tests {

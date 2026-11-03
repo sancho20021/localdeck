@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 
 use std::{
     collections::HashSet,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -106,8 +106,9 @@ impl FileStorage {
 
     /// Takes a physical system path and maps it back to a logical library Location
     /// based on the currently configured roots.
+    /// The path does not have to exist, only the root it lies under.
     pub fn reverse_resolve(&mut self, physical_path: &Path) -> Result<Location, StorageError> {
-        let target = physical_path.canonicalize()?;
+        let target = canonicalize_existing_prefix(physical_path)?;
 
         // Iterate through all roots defined in your config
         for root in &self.config.roots {
@@ -122,6 +123,28 @@ impl FileStorage {
             }
         }
         Err(StorageError::PathOutsideLibrary(target))
+    }
+}
+
+/// Canonicalizes the longest existing ancestor of `path` and appends the
+/// components below it unchanged, so a deleted file still maps to the
+/// location it was recorded under.
+fn canonicalize_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let abs = std::path::absolute(path)?;
+    let mut missing = Vec::new();
+    let mut existing = abs.as_path();
+    loop {
+        match existing.canonicalize() {
+            Ok(base) => return Ok(missing.iter().rev().fold(base, |acc, c| acc.join(c))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return Err(e);
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
