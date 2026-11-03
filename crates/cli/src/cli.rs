@@ -616,8 +616,11 @@ pub fn run() -> anyhow::Result<()> {
         }
         Commands::Add { track_id, path } => {
             let mut storage = Storage::new(cfg.storage)?;
-            storage.add_file_to_track(track_id, &path)?;
-            println!("Linked {} to track {}", path.to_string_lossy(), track_id);
+            if storage.add_file_to_track(track_id, &path)? {
+                println!("Linked {} to track {}", path.to_string_lossy(), track_id);
+            } else {
+                println!("{} is already linked to track {}", path.to_string_lossy(), track_id);
+            }
         }
         Commands::Merge {
             slave_id,

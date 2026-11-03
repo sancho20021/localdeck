@@ -40,6 +40,15 @@ pub enum StorageError {
     #[error("'{0}' is not a regular file (symlink or directory), refusing to touch it")]
     NotARegularFile(std::path::PathBuf),
 
+    #[error(
+        "file '{path}' is already recorded on track {track}, move it with `merge {track} --into {target}`"
+    )]
+    FileOnAnotherTrack {
+        path: std::path::PathBuf,
+        track: TrackId,
+        target: TrackId,
+    },
+
     #[error("file '{0}' is not recorded in the library, nothing to delete")]
     FileNotRecorded(std::path::PathBuf),
 

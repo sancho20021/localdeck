@@ -597,11 +597,15 @@ impl Storage {
 
     /// Links a physical file path to an existing master track.
     /// This is useful for adding high-quality, fixed, or alternative versions.
+    /// Returns false when the file was already linked to this track.
+    ///
+    /// [`StorageError::FileOnAnotherTrack`] when the file is already recorded
+    /// on a different track; nothing changes then.
     pub fn add_file_to_track(
         &mut self,
         master_id: TrackId,
         physical_path: &Path,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         // 1. Invert the physical path back to a structured library Location
         let location = self.fs.reverse_resolve(physical_path)?;
         // 2. Compute the file properties needed for insertion
@@ -621,9 +625,23 @@ impl Storage {
         let inserted = Self::insert_file(&tx, master_id, &hashed_file)?;
         if inserted {
             Self::insert_update_time(&tx)?;
+        } else {
+            let row = LocationRow::from_location(hashed_file.file.loc)?;
+            let owner: TrackId = tx.query_row(
+                &format!("SELECT {TRACK_ID} FROM {FILES} WHERE {USB_LABEL} = ?1 AND {PATH} = ?2"),
+                params![row.usb_label, row.path],
+                |r| r.get(0),
+            )?;
+            if owner != master_id {
+                return Err(StorageError::FileOnAnotherTrack {
+                    path: physical_path.to_path_buf(),
+                    track: owner,
+                    target: master_id,
+                });
+            }
         }
         tx.commit()?;
-        Ok(())
+        Ok(inserted)
     }
 
     pub fn get_track_metadata(
@@ -1776,6 +1794,49 @@ mod tests {
         assert_eq!(linked_track_id, master_id);
         assert!(file_path.ends_with("song_hq.mp3"));
 
+        Ok(())
+    }
+
+    fn track_of(conn: &Connection, path: &Path) -> Vec<TrackId> {
+        conn.prepare(&format!("SELECT {TRACK_ID} FROM {FILES} WHERE {PATH} = ?1"))
+            .unwrap()
+            .query_map(params![replace_windows_slashes(path)], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn add_file_already_on_another_track_fails_and_leaves_it_there() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("song.flac");
+        std::fs::write(&path, b"lossless audio")?;
+        let mut storage = setup_storage(dir.path())?;
+        let tracks = insert_tracks(&mut storage.db, 2);
+        let (target, owner) = (tracks[0], tracks[1]);
+        storage.add_file_to_track(owner, &path)?;
+
+        let err = storage.add_file_to_track(target, &path).unwrap_err();
+
+        assert!(
+            matches!(err, StorageError::FileOnAnotherTrack { track, .. } if track == owner),
+            "{err}"
+        );
+        assert_eq!(track_of(&storage.db, &path), vec![owner]);
+        Ok(())
+    }
+
+    #[test]
+    fn add_file_already_on_same_track_succeeds() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("song.flac");
+        std::fs::write(&path, b"lossless audio")?;
+        let mut storage = setup_storage(dir.path())?;
+        let track = insert_tracks(&mut storage.db, 1)[0];
+        assert!(storage.add_file_to_track(track, &path)?);
+
+        assert!(!storage.add_file_to_track(track, &path)?);
+        assert_eq!(track_of(&storage.db, &path), vec![track]);
         Ok(())
     }
 
