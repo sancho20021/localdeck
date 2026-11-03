@@ -55,18 +55,22 @@ pub struct CleanDanglingReport {
 pub struct PlannedFile {
     /// physical path on disk, already resolved
     pub path: PathBuf,
+    /// the recorded location, identifies the row to remove
+    pub loc: Location,
     /// size recorded in the database, re-checked right before removal
     pub file_size: i64,
 }
 
-/// Everything [`Storage::execute_delete`] will remove for one track.
-/// Produced by [`Storage::plan_delete`] which validates every file up front,
-/// so the plan can be shown to the user before anything is touched.
+/// Everything [`Storage::execute_delete`] will remove, all from one track.
+/// Produced by [`Storage::plan_delete`] or [`Storage::plan_delete_file`],
+/// which validate every file up front, so the plan can be shown to the user
+/// before anything is touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletePlan {
     pub track: TrackId,
-    /// every file of the track, one to a few entries
     pub files: Vec<PlannedFile>,
+    /// the track has no files left once the plan is executed
+    pub leaves_track_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1073,18 +1077,70 @@ impl Storage {
             Self::check_deletable(&path, file_size)?;
             // never touch anything outside the configured library roots
             self.fs.reverse_resolve(&path)?;
-            files.push(PlannedFile { path, file_size });
+            files.push(PlannedFile {
+                path,
+                loc,
+                file_size,
+            });
         }
 
-        Ok(DeletePlan { track, files })
+        Ok(DeletePlan {
+            track,
+            leaves_track_stale: !files.is_empty(),
+            files,
+        })
+    }
+
+    /// Resolves one recorded file the same way `add` does and checks it is
+    /// safe to remove. Read-only: touches neither the disk nor the database.
+    ///
+    /// [`StorageError::FileNotRecorded`] when no track has this file.
+    /// Refuses `path` when it is itself a symlink, even one pointing at a
+    /// recorded file.
+    pub fn plan_delete_file(&mut self, path: &Path) -> Result<DeletePlan, StorageError> {
+        let loc = self.fs.reverse_resolve(path)?;
+        let row = LocationRow::from_location(loc.clone())?;
+
+        let (track, file_size): (TrackId, i64) = self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT {TRACK_ID}, {FILE_SIZE} FROM {FILES}
+                     WHERE {USB_LABEL} = ?1 AND {PATH} = ?2"
+                ),
+                params![row.usb_label, row.path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::FileNotRecorded(path.to_path_buf()))?;
+
+        Self::check_deletable(path, file_size)?;
+        let resolved = self.resolve_path(&loc)?;
+
+        let track_files: i64 = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM {FILES} WHERE {TRACK_ID} = ?1"),
+            params![track],
+            |r| r.get(0),
+        )?;
+
+        Ok(DeletePlan {
+            track,
+            files: vec![PlannedFile {
+                path: resolved,
+                loc,
+                file_size,
+            }],
+            leaves_track_stale: track_files == 1,
+        })
     }
 
     /// Removes the planned files from disk, then their rows from `{FILES}`.
-    /// The track row and its metadata stay, the track becomes stale.
+    /// The track row and its metadata stay, even when no files are left.
     ///
-    /// Every file is re-checked (regular file, same size) before the first
-    /// removal, so a file that changed between planning and execution
-    /// fails the whole operation with nothing removed.
+    /// Every row and file is re-checked (still recorded for the track, regular
+    /// file, same size) before the first removal, so anything that changed
+    /// between planning and execution fails the whole operation with nothing
+    /// removed.
     pub fn execute_delete(&mut self, plan: DeletePlan) -> Result<DeleteReport, StorageError> {
         if plan.files.is_empty() {
             return Ok(DeleteReport { removed_files: 0 });
@@ -1092,18 +1148,27 @@ impl Storage {
 
         let tx = self.db.transaction()?;
 
-        // the database must still describe exactly what was planned
-        let recorded: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM {FILES} WHERE {TRACK_ID} = ?1"),
-            params![plan.track],
-            |row| row.get(0),
-        )?;
-        if recorded != plan.files.len() as i64 {
-            return Err(StorageError::Internal(anyhow!(
-                "track {} has {recorded} recorded files but {} were planned, plan again",
-                plan.track,
-                plan.files.len()
-            )));
+        let mut rows = Vec::with_capacity(plan.files.len());
+        for file in &plan.files {
+            let row = LocationRow::from_location(file.loc.clone())?;
+            let recorded: Option<i64> = tx
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM {FILES}
+                         WHERE {TRACK_ID} = ?1 AND {USB_LABEL} = ?2 AND {PATH} = ?3"
+                    ),
+                    params![plan.track, row.usb_label, row.path],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if recorded.is_none() {
+                return Err(StorageError::Internal(anyhow!(
+                    "{} is no longer recorded for track {}, plan again",
+                    file.path.display(),
+                    plan.track
+                )));
+            }
+            rows.push(row);
         }
 
         // all or nothing: re-check everything before removing anything
@@ -1118,10 +1183,15 @@ impl Storage {
             removed_files += 1;
         }
 
-        tx.execute(
-            &format!("DELETE FROM {FILES} WHERE {TRACK_ID} = ?1"),
-            params![plan.track],
-        )?;
+        for row in &rows {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {FILES}
+                     WHERE {TRACK_ID} = ?1 AND {USB_LABEL} = ?2 AND {PATH} = ?3"
+                ),
+                params![plan.track, row.usb_label, row.path],
+            )?;
+        }
         Self::insert_update_time(&tx)?;
         tx.commit()?;
 
@@ -4029,6 +4099,7 @@ mod tests {
 
             let expected = PlannedFile {
                 path: mp3.clone(),
+                loc: Location::from_path(&mp3),
                 file_size: AUDIO.len() as i64,
             };
             assert_eq!(plan.track, track);
@@ -4063,7 +4134,14 @@ mod tests {
             given_metadata(&storage.db, track);
 
             let plan = storage.plan_delete(track)?;
-            assert_eq!(plan, DeletePlan { track, files: vec![] });
+            assert_eq!(
+                plan,
+                DeletePlan {
+                    track,
+                    files: vec![],
+                    leaves_track_stale: false
+                }
+            );
 
             let report = storage.execute_delete(plan)?;
             assert_eq!(report.removed_files, 0);
@@ -4224,16 +4302,204 @@ mod tests {
                     track,
                     files: vec![PlannedFile {
                         path: on_usb,
+                        loc: Location::Usb {
+                            label: usb_label.to_string(),
+                            path: PathBuf::from("song.mp3"),
+                        },
                         file_size: AUDIO.len() as i64
                     }],
+                    leaves_track_stale: true,
                 }
             );
             Ok(())
         }
 
         // ------------------------------------------------------------
+        // plan_delete_file
+        // ------------------------------------------------------------
+
+        #[test]
+        fn plan_delete_file_plans_only_that_file() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            let flac = given_file(&storage, track, dir.path(), "song.flac");
+
+            let plan = storage.plan_delete_file(&mp3)?;
+
+            assert_eq!(
+                plan,
+                DeletePlan {
+                    track,
+                    files: vec![PlannedFile {
+                        path: mp3.clone(),
+                        loc: Location::from_path(&mp3),
+                        file_size: AUDIO.len() as i64,
+                    }],
+                    leaves_track_stale: false,
+                }
+            );
+            assert!(mp3.exists());
+            assert!(flac.exists());
+            assert_eq!(count(&storage.db, FILES, track), 2);
+            assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_flags_last_file_of_track() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let tracks = insert_tracks(&mut storage.db, 2);
+            let only = given_file(&storage, tracks[0], dir.path(), "only.mp3");
+            given_file(&storage, tracks[1], dir.path(), "other.mp3");
+
+            let plan = storage.plan_delete_file(&only)?;
+
+            assert!(plan.leaves_track_stale);
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_refuses_unrecorded_file() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let stranger = dir.path().join("stranger.mp3");
+            std::fs::write(&stranger, AUDIO)?;
+
+            let err = storage.plan_delete_file(&stranger).unwrap_err();
+
+            assert!(matches!(err, StorageError::FileNotRecorded(_)), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_refuses_path_outside_library() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let elsewhere = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let stray = given_file(&storage, track, elsewhere.path(), "stray.mp3");
+
+            let err = storage.plan_delete_file(&stray).unwrap_err();
+
+            assert!(matches!(err, StorageError::PathOutsideLibrary(_)), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_refuses_symlink_to_recorded_file() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let real = given_file(&storage, track, dir.path(), "real.mp3");
+            let link = dir.path().join("link.mp3");
+            std::os::unix::fs::symlink(&real, &link)?;
+
+            let err = storage.plan_delete_file(&link).unwrap_err();
+
+            assert!(matches!(err, StorageError::NotARegularFile(ref p) if *p == link), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_refuses_file_changed_since_sync() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let song = given_file(&storage, track, dir.path(), "song.mp3");
+            std::fs::write(&song, b"re-tagged audio frames")?;
+
+            let err = storage.plan_delete_file(&song).unwrap_err();
+
+            assert!(matches!(err, StorageError::FileChangedSinceSync(_)), "{err}");
+            Ok(())
+        }
+
+        #[test]
+        fn plan_delete_file_resolves_usb_mount_path() -> anyhow::Result<()> {
+            let temp = tempdir()?;
+            let usb_mount = temp.path().join("usb");
+            std::fs::create_dir_all(&usb_mount)?;
+            let usb_label = "DJ_USB";
+
+            let conn = Connection::open_in_memory()?;
+            schema::init(&conn)?;
+            let mut storage = Storage::from_existing_conn(
+                conn,
+                LibrarySource {
+                    roots: vec![Location::Usb {
+                        label: usb_label.to_string(),
+                        path: PathBuf::new(),
+                    }],
+                    ..Default::default()
+                },
+            );
+            storage.fs.loc_resolver =
+                LocationResolver::test_resolver([(usb_label.to_string(), usb_mount.clone())]);
+
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let on_usb = usb_mount.join("song.mp3");
+            std::fs::write(&on_usb, AUDIO)?;
+            insert_fake_files(
+                &storage.db,
+                [(track, "song.mp3", AUDIO.len() as i64)],
+                Some(usb_label.to_string()),
+            );
+
+            let plan = storage.plan_delete_file(&on_usb)?;
+
+            assert_eq!(plan.track, track);
+            assert_eq!(plan.files.len(), 1);
+            assert_eq!(plan.files[0].path, on_usb);
+            Ok(())
+        }
+
+        // ------------------------------------------------------------
         // execute_delete
         // ------------------------------------------------------------
+
+        #[test]
+        fn execute_delete_file_keeps_the_other_version() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            let flac = given_file(&storage, track, dir.path(), "song.flac");
+            given_metadata(&storage.db, track);
+            given_card(&storage.db, track, "CARD");
+
+            let plan = storage.plan_delete_file(&mp3)?;
+            let report = storage.execute_delete(plan)?;
+
+            assert_eq!(report.removed_files, 1);
+            assert!(!mp3.exists());
+            assert!(flac.exists());
+            assert_eq!(count(&storage.db, FILES, track), 1);
+            assert_eq!(count(&storage.db, TRACK_METADATA, track), 1);
+            assert_eq!(count(&storage.db, CARD_MAPPINGS, track), 1);
+            assert_eq!(count_updates(&storage.db), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn execute_delete_refuses_if_row_forgotten_after_planning() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let first = given_file(&storage, track, dir.path(), "first.mp3");
+            let second = given_file(&storage, track, dir.path(), "second.mp3");
+
+            let plan = storage.plan_delete(track)?;
+            storage.forget_path(&second)?;
+
+            assert!(storage.execute_delete(plan).is_err());
+            assert!(first.exists());
+            assert!(second.exists());
+            assert_eq!(count(&storage.db, FILES, track), 1);
+            Ok(())
+        }
 
         #[test]
         fn execute_delete_removes_files_and_their_rows_only() -> anyhow::Result<()> {

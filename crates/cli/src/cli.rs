@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use log::info;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -89,13 +89,18 @@ pub enum Commands {
         /// Directory or file to remove from database
         path: PathBuf,
     },
-    /// Delete every file of a track from disk and forget them.
+    /// Delete one recorded file, or every file of a track, from disk and forget them.
     ///
     /// Shows what will be removed and asks for confirmation first.
-    /// The track keeps its metadata and becomes stale.
+    /// The track keeps its metadata, even when it has no files left.
     /// Refuses to touch anything if the database is out of sync with the disk.
+    #[command(group(ArgGroup::new("target").required(true).args(["path", "track"])))]
     Delete {
-        track_id: TrackId,
+        /// Music file to delete
+        path: Option<PathBuf>,
+        /// Delete every file of this track
+        #[arg(long)]
+        track: Option<TrackId>,
         /// Skip the confirmation prompt
         #[arg(short, long)]
         yes: bool,
@@ -508,12 +513,18 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Delete {
-            track_id,
+            path,
+            track,
             yes,
             dry_run,
         } => {
             let mut storage = Storage::new(cfg.storage)?;
-            let plan = storage.plan_delete(track_id)?;
+            let plan = match (path, track) {
+                (Some(path), _) => storage.plan_delete_file(&path)?,
+                (None, Some(track)) => storage.plan_delete(track)?,
+                (None, None) => unreachable!("clap requires a path or --track"),
+            };
+            let track_id = plan.track;
             if plan.files.is_empty() {
                 println!("Track {track_id} has no files, nothing to delete");
                 return Ok(());
@@ -521,6 +532,9 @@ pub fn run() -> anyhow::Result<()> {
             println!("Track {track_id}, files to delete:");
             for file in &plan.files {
                 println!("    - {}", file.path.display());
+            }
+            if plan.leaves_track_stale {
+                println!("Track {track_id} will have no files left");
             }
             if dry_run {
                 return Ok(());

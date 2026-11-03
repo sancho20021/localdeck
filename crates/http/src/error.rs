@@ -44,6 +44,7 @@ impl From<StorageError> for ApiError {
             StorageError::PathOutsideLibrary(_)
             | StorageError::FileMissing(_)
             | StorageError::NotARegularFile(_)
+            | StorageError::FileNotRecorded(_)
             | StorageError::FileChangedSinceSync(_) => ApiError::BadRequest(err.to_string()),
         }
     }

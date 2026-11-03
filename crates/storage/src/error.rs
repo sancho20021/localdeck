@@ -40,6 +40,9 @@ pub enum StorageError {
     #[error("'{0}' is not a regular file (symlink or directory), refusing to touch it")]
     NotARegularFile(std::path::PathBuf),
 
+    #[error("file '{0}' is not recorded in the library, nothing to delete")]
+    FileNotRecorded(std::path::PathBuf),
+
     #[error("file '{0}' changed since the last update, run `update` first")]
     FileChangedSinceSync(std::path::PathBuf),
 }
