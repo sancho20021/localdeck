@@ -73,6 +73,22 @@ pub struct DeletePlan {
     pub leaves_track_stale: bool,
 }
 
+/// One file to link, produced by [`Storage::plan_add`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPlan {
+    pub track: TrackId,
+    /// the path as given, used in error messages
+    pub path: PathBuf,
+    pub file: HashedFile,
+}
+
+/// Produced by [`Storage::plan_replace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacePlan {
+    pub add: AddPlan,
+    pub delete: DeletePlan,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DeleteReport {
     /// files removed from disk and from the database
@@ -598,50 +614,86 @@ impl Storage {
     /// Links a physical file path to an existing master track.
     /// This is useful for adding high-quality, fixed, or alternative versions.
     /// Returns false when the file was already linked to this track.
-    ///
-    /// [`StorageError::FileOnAnotherTrack`] when the file is already recorded
-    /// on a different track; nothing changes then.
     pub fn add_file_to_track(
         &mut self,
         master_id: TrackId,
         physical_path: &Path,
     ) -> Result<bool, StorageError> {
-        // 1. Invert the physical path back to a structured library Location
-        let location = self.fs.reverse_resolve(physical_path)?;
-        // 2. Compute the file properties needed for insertion
-        let file_size = std::fs::metadata(physical_path)?.len() as i64;
-        let hash = FileHash::from_file(physical_path)?;
+        let plan = self.plan_add(master_id, physical_path)?;
+        self.execute_add(plan)
+    }
 
-        let hashed_file = HashedFile::new(
-            hash,
-            FileWithMeta {
-                loc: location,
-                file_size,
-            },
-        );
+    /// Resolves and hashes the file the way `add` records it.
+    /// Read-only: touches neither the disk nor the database.
+    pub fn plan_add(&mut self, track: TrackId, path: &Path) -> Result<AddPlan, StorageError> {
+        let loc = self.fs.reverse_resolve(path)?;
+        let file_size = std::fs::metadata(path)?.len() as i64;
+        let hash = FileHash::from_file(path)?;
+
         let mut tx = self.db.transaction()?;
-        // Make sure master track exists
-        let _ = Self::_resolve_track(&mut tx, master_id.to_string())?;
-        let inserted = Self::insert_file(&tx, master_id, &hashed_file)?;
+        Self::_resolve_track(&mut tx, track.to_string())?;
+        Self::check_file_owner(&tx, track, path, &loc)?;
+        drop(tx);
+
+        Ok(AddPlan {
+            track,
+            path: path.to_path_buf(),
+            file: HashedFile::new(hash, FileWithMeta { loc, file_size }),
+        })
+    }
+
+    /// Records the planned file for its track.
+    /// Returns false when the file was already linked to this track.
+    pub fn execute_add(&mut self, plan: AddPlan) -> Result<bool, StorageError> {
+        let tx = self.db.transaction()?;
+        let inserted = Self::insert_file(&tx, plan.track, &plan.file)?;
         if inserted {
             Self::insert_update_time(&tx)?;
         } else {
-            let row = LocationRow::from_location(hashed_file.file.loc)?;
-            let owner: TrackId = tx.query_row(
-                &format!("SELECT {TRACK_ID} FROM {FILES} WHERE {USB_LABEL} = ?1 AND {PATH} = ?2"),
-                params![row.usb_label, row.path],
-                |r| r.get(0),
-            )?;
-            if owner != master_id {
-                return Err(StorageError::FileOnAnotherTrack {
-                    path: physical_path.to_path_buf(),
-                    track: owner,
-                    target: master_id,
-                });
-            }
+            Self::check_file_owner(&tx, plan.track, &plan.path, &plan.file.file.loc)?;
         }
         tx.commit()?;
         Ok(inserted)
+    }
+
+    /// [`StorageError::FileOnAnotherTrack`] when `loc` is recorded on a track
+    /// other than `track`.
+    fn check_file_owner(
+        conn: &rusqlite::Connection,
+        track: TrackId,
+        path: &Path,
+        loc: &Location,
+    ) -> Result<(), StorageError> {
+        let row = LocationRow::from_location(loc.clone())?;
+        let owner: Option<TrackId> = conn
+            .query_row(
+                &format!("SELECT {TRACK_ID} FROM {FILES} WHERE {USB_LABEL} = ?1 AND {PATH} = ?2"),
+                params![row.usb_label, row.path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match owner {
+            Some(owner) if owner != track => Err(StorageError::FileOnAnotherTrack {
+                path: path.to_path_buf(),
+                track: owner,
+                target: track,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Plans linking `new` to the track of `old`, then deleting `old`.
+    /// Read-only. Execute with [`Storage::execute_add`] first, then
+    /// [`Storage::execute_delete`], so a failure leaves both files recorded.
+    ///
+    /// [`StorageError::ReplaceWithItself`] when both paths are the same file.
+    pub fn plan_replace(&mut self, old: &Path, new: &Path) -> Result<ReplacePlan, StorageError> {
+        let delete = self.plan_delete_file(old)?;
+        let add = self.plan_add(delete.track, new)?;
+        if delete.files.iter().any(|f| f.loc == add.file.file.loc) {
+            return Err(StorageError::ReplaceWithItself(old.to_path_buf()));
+        }
+        Ok(ReplacePlan { add, delete })
     }
 
     pub fn get_track_metadata(
@@ -4649,6 +4701,113 @@ mod tests {
             assert!(second.exists());
             assert_eq!(count(&storage.db, FILES, track), 2);
             assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        // ------------------------------------------------------------
+        // plan_add / plan_replace
+        // ------------------------------------------------------------
+
+        fn unrecorded_file(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, b"lossless audio frames").unwrap();
+            path
+        }
+
+        #[test]
+        fn plan_add_touches_nothing() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let flac = unrecorded_file(dir.path(), "song.flac");
+
+            let plan = storage.plan_add(track, &flac)?;
+
+            assert_eq!(plan.track, track);
+            assert_eq!(plan.file.file.loc, Location::from_path(&flac));
+            assert_eq!(count(&storage.db, FILES, track), 0);
+            assert_eq!(count_updates(&storage.db), 0);
+            Ok(())
+        }
+
+        #[test]
+        fn replace_mp3_with_flac_keeps_track_metadata_and_card() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            given_metadata(&storage.db, track);
+            given_card(&storage.db, track, "CARD");
+            let flac = unrecorded_file(dir.path(), "song.flac");
+
+            let plan = storage.plan_replace(&mp3, &flac)?;
+            assert_eq!(count(&storage.db, FILES, track), 1);
+            assert!(storage.execute_add(plan.add)?);
+            storage.execute_delete(plan.delete)?;
+
+            assert!(!mp3.exists());
+            assert!(flac.exists());
+            let files: Vec<String> = storage
+                .db
+                .prepare(&format!("SELECT {PATH} FROM {FILES} WHERE {TRACK_ID} = ?1"))?
+                .query_map(rusqlite::params![track], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            assert_eq!(files, vec![replace_windows_slashes(&flac)]);
+            assert_eq!(count(&storage.db, TRACK_METADATA, track), 1);
+            assert_eq!(count(&storage.db, CARD_MAPPINGS, track), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn replace_with_file_already_on_same_track_deletes_only_old() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            let flac = given_file(&storage, track, dir.path(), "song.flac");
+
+            let plan = storage.plan_replace(&mp3, &flac)?;
+            assert!(!storage.execute_add(plan.add)?);
+            storage.execute_delete(plan.delete)?;
+
+            assert!(!mp3.exists());
+            assert!(flac.exists());
+            assert_eq!(count(&storage.db, FILES, track), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn replace_with_itself_is_refused() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+
+            let err = storage.plan_replace(&mp3, &mp3).unwrap_err();
+
+            assert!(matches!(err, StorageError::ReplaceWithItself(_)), "{err}");
+            assert!(mp3.exists());
+            assert_eq!(count(&storage.db, FILES, track), 1);
+            Ok(())
+        }
+
+        #[test]
+        fn replace_keeps_both_when_old_changes_after_planning() -> anyhow::Result<()> {
+            let dir = tempdir()?;
+            let mut storage = setup_storage(dir.path())?;
+            let track = insert_tracks(&mut storage.db, 1)[0];
+            let mp3 = given_file(&storage, track, dir.path(), "song.mp3");
+            let flac = unrecorded_file(dir.path(), "song.flac");
+
+            let plan = storage.plan_replace(&mp3, &flac)?;
+            std::fs::write(&mp3, b"re-tagged audio frames")?;
+            storage.execute_add(plan.add)?;
+            let err = storage.execute_delete(plan.delete).unwrap_err();
+
+            assert!(matches!(err, StorageError::FileChangedSinceSync(_)), "{err}");
+            assert!(mp3.exists());
+            assert!(flac.exists());
+            assert_eq!(count(&storage.db, FILES, track), 2);
             Ok(())
         }
 

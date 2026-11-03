@@ -108,6 +108,23 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Link a new file to the track of an old one, then delete the old one.
+    ///
+    /// Shows both and asks for confirmation first.
+    /// If the old file cannot be deleted, the new one stays linked.
+    Replace {
+        /// Recorded music file to delete
+        old: PathBuf,
+        /// Music file to link in its place
+        #[arg(long, short = 'w')]
+        with: PathBuf,
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+        /// Only show what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Generate url for a track to be printed on qr code or nfc chip
     /// Currently does not include youtube link
     Url { track_id: TrackId },
@@ -545,6 +562,38 @@ pub fn run() -> anyhow::Result<()> {
             }
             let report = storage.execute_delete(plan)?;
             println!("Deleted {} file(s) of track {track_id}", report.removed_files);
+        }
+        Commands::Replace {
+            old,
+            with: new,
+            yes,
+            dry_run,
+        } => {
+            let mut storage = Storage::new(cfg.storage)?;
+            let plan = storage.plan_replace(&old, &new)?;
+            let track_id = plan.delete.track;
+            println!("Track {track_id}:");
+            for file in &plan.delete.files {
+                println!("  - delete  {}", file.path.display());
+            }
+            let shown_new = std::path::absolute(&new).unwrap_or_else(|_| new.clone());
+            println!("  + link    {}", shown_new.display());
+            if dry_run {
+                return Ok(());
+            }
+            if !yes && !confirm("Replace?")? {
+                println!("Aborted, nothing changed");
+                return Ok(());
+            }
+            storage.execute_add(plan.add)?;
+            storage.execute_delete(plan.delete).with_context(|| {
+                format!(
+                    "{} is linked to track {track_id}, but {} was not deleted",
+                    new.display(),
+                    old.display()
+                )
+            })?;
+            println!("Replaced {} with {}", old.display(), new.display());
         }
         Commands::Url { track_id } => {
             let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");

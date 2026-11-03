@@ -49,6 +49,9 @@ pub enum StorageError {
         target: TrackId,
     },
 
+    #[error("'{0}' is both the old and the new file")]
+    ReplaceWithItself(std::path::PathBuf),
+
     #[error("file '{0}' is not recorded in the library, nothing to delete")]
     FileNotRecorded(std::path::PathBuf),
 

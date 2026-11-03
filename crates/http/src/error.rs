@@ -46,6 +46,7 @@ impl From<StorageError> for ApiError {
             | StorageError::NotARegularFile(_)
             | StorageError::FileNotRecorded(_)
             | StorageError::FileOnAnotherTrack { .. }
+            | StorageError::ReplaceWithItself(_)
             | StorageError::FileChangedSinceSync(_) => ApiError::BadRequest(err.to_string()),
         }
     }
