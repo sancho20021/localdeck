@@ -16,7 +16,7 @@ use crate::{
     error::StorageError,
     file_hash::FileHash,
     fs::{FileStorage, FileWithMeta, check_music_path},
-    location::{LOCATION_PATH_SEP, Location, replace_windows_slashes},
+    location::{Location, replace_windows_slashes},
     schema::{columns, tables},
     track::{ArtworkRef, Track, TrackId, TrackMetadata},
     usb::ResolveError,
@@ -36,12 +36,9 @@ pub struct Storage {
 
 #[derive(Debug)]
 pub struct ForgetReport {
-    /// files removed
-    pub removed_files: usize,
-    /// tracks where some of its location removed
-    pub affected_tracks: usize,
-    /// tracks which no longer exist
-    pub removed_tracks: usize,
+    pub track: TrackId,
+    /// true when the track has no recorded files left
+    pub track_emptied: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +98,17 @@ pub struct FindFilter {
     /// keep only tracks that have no metadata
     pub no_meta: bool,
     pub files: FilesFilter,
+}
+
+impl FindFilter {
+    fn keeps(&self, has_meta: bool, has_files: bool) -> bool {
+        let files_ok = match self.files {
+            FilesFilter::WithFiles => has_files,
+            FilesFilter::NoFiles => !has_files,
+            FilesFilter::Any => true,
+        };
+        files_ok && !(self.no_meta && has_meta)
+    }
 }
 
 /// Which tracks [`Storage::find_tracks`] reports, by whether they still have files
@@ -834,131 +842,97 @@ impl Storage {
         Ok((path, loc, meta))
     }
 
-    /// searches for tracks whose path, track_id, hash, card_id, artist or title matches the query
+    /// Tracks whose id, card id, artist, title, or recorded file path or hash contains
+    /// `query`, ignoring case.
     ///
-    /// tracks with no files at all are matched too, so that an old card alias still
-    /// resolves to the track it was printed for
-    ///
-    /// a matched track is reported with *all* of its files, not just the ones that
-    /// matched the query
-    ///
-    /// results are ordered by track id
+    /// A matched track is reported with all of its files. Results are ordered by track id.
     pub fn find_tracks(
         &mut self,
         query: &str,
         filter: FindFilter,
     ) -> Result<Vec<TrackMatch>, StorageError> {
-        let tx = self.db.transaction()?;
+        struct Row {
+            track: TrackId,
+            file: Option<LocationRow>,
+            hash: Option<String>,
+            meta: Option<TrackMetadata>,
+        }
 
-        let cleaned_query = query.trim().to_lowercase();
-        let like_query = format!("%{}%", cleaned_query);
+        let mut cards: HashMap<TrackId, Vec<String>> = HashMap::new();
+        let mut stmt = self
+            .db
+            .prepare(&format!("SELECT {TRACK_ID}, {CARD_ID} FROM {CARD_MAPPINGS}"))?;
+        for row in stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))? {
+            let (track, card) = row?;
+            cards.entry(track).or_default().push(card);
+        }
 
-        // 1. Pick the matching track ids. Driven by {TRACKS} so that stale tracks
-        //    (no files left on disk, but still reachable through an old card alias)
-        //    are found as well.
-        let matching_tracks = format!(
-            "SELECT m.{TRACK_ID}
-             FROM {TRACKS} m
-             LEFT JOIN {FILES} mf ON m.{TRACK_ID} = mf.{TRACK_ID}
-             LEFT JOIN {TRACK_METADATA} mtm ON m.{TRACK_ID} = mtm.{TRACK_ID}
-             LEFT JOIN {CARD_MAPPINGS} mcm ON m.{TRACK_ID} = mcm.{TRACK_ID}
-             WHERE
-                LOWER(mf.{PATH}) LIKE ?1 OR
-                LOWER(m.{TRACK_ID}) LIKE ?1 OR
-                LOWER(mf.{FILE_HASH}) LIKE ?1 OR
-                LOWER(mcm.{CARD_ID}) LIKE ?1 OR
-                LOWER(mtm.{ARTIST}) LIKE ?1 OR
-                LOWER(mtm.{TITLE}) LIKE ?1"
-        );
-
-        // 2. Collect them with everything we want to report back
-        let mut sql = format!(
-            "SELECT DISTINCT
-                t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH},
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}, f.{FILE_HASH},
                 tm.{TITLE}, tm.{ARTIST}, tm.{YEAR}, tm.{LABEL}, tm.{ARTWORK_URL}
              FROM {TRACKS} t
              LEFT JOIN {FILES} f ON t.{TRACK_ID} = f.{TRACK_ID}
              LEFT JOIN {TRACK_METADATA} tm ON t.{TRACK_ID} = tm.{TRACK_ID}
-             WHERE 1=1"
-        );
-
-        // 3. Append the filters
-        if !cleaned_query.is_empty() {
-            sql.push_str(&format!(" AND t.{TRACK_ID} IN ({matching_tracks})"));
-        }
-
-        if filter.no_meta {
-            sql.push_str(&format!(" AND tm.{TRACK_ID} IS NULL"));
-        }
-
-        match filter.files {
-            FilesFilter::WithFiles => sql.push_str(&format!(" AND f.{TRACK_ID} IS NOT NULL")),
-            FilesFilter::NoFiles => sql.push_str(&format!(" AND f.{TRACK_ID} IS NULL")),
-            FilesFilter::Any => {}
-        }
-
-        // keeps the output stable between runs, and groups the files of a track together
-        sql.push_str(&format!(
-            " ORDER BY t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}"
-        ));
-
-        let mut stmt = tx.prepare(&sql)?;
-
-        let params = if !cleaned_query.is_empty() {
-            rusqlite::params![like_query]
-        } else {
-            rusqlite::params![]
-        };
-
+             ORDER BY t.{TRACK_ID}, f.{USB_LABEL}, f.{PATH}"
+        ))?;
         let rows = stmt
-            .query_map(params, |row| {
-                let track_id: TrackId = row.get(0)?;
-                // NULL when the track has no files left
-                let usb_label: Option<String> = row.get(1)?;
-                let path: Option<String> = row.get(2)?;
-                // NULL when the track has no metadata
-                let title: Option<String> = row.get(3)?;
-                let artist: Option<String> = row.get(4)?;
-
-                let loc = usb_label
-                    .zip(path)
-                    .map(|(usb_label, path)| LocationRow { usb_label, path }.into());
-
-                let meta = title
-                    .zip(artist)
+            .query_map([], |row| {
+                let file = row
+                    .get::<_, Option<String>>(1)?
+                    .zip(row.get::<_, Option<String>>(2)?)
+                    .map(|(usb_label, path)| LocationRow { usb_label, path });
+                let meta = row
+                    .get::<_, Option<String>>(4)?
+                    .zip(row.get::<_, Option<String>>(5)?)
                     .map(|(title, artist)| {
                         Ok::<_, rusqlite::Error>(TrackMetadata {
                             title,
                             artist,
-                            year: row.get(5)?,
-                            label: row.get(6)?,
-                            artwork: row.get::<_, Option<String>>(7)?.map(ArtworkRef),
+                            year: row.get(6)?,
+                            label: row.get(7)?,
+                            artwork: row.get::<_, Option<String>>(8)?.map(ArtworkRef),
                         })
                     })
                     .transpose()?;
-
-                Ok((track_id, loc, meta))
-            })?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-
-        drop(stmt);
-        tx.commit()?;
-
-        // 4. Fold the rows of one track into a single match. They are adjacent thanks
-        //    to the ORDER BY.
-        let mut matches: Vec<TrackMatch> = Vec::new();
-        for (track, loc, meta) in rows {
-            match matches.last_mut() {
-                Some(last) if last.track == track => last.files.extend(loc),
-                _ => matches.push(TrackMatch {
-                    track,
-                    files: loc.into_iter().collect(),
+                Ok(Row {
+                    track: row.get(0)?,
+                    file,
+                    hash: row.get(3)?,
                     meta,
-                }),
-            }
-        }
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(matches)
+        let query = query.trim().to_lowercase();
+        let contains_query = |text: &str| text.to_lowercase().contains(&query);
+        let mentions_query = |track: &[Row]| {
+            let first = &track[0];
+            contains_query(&first.track.to_string())
+                || first
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| contains_query(&m.title) || contains_query(&m.artist))
+                || cards
+                    .get(&first.track)
+                    .is_some_and(|cards| cards.iter().any(|c| contains_query(c)))
+                || track.iter().any(|r| {
+                    r.file.as_ref().is_some_and(|f| contains_query(&f.path))
+                        || r.hash.as_deref().is_some_and(contains_query)
+                })
+        };
+
+        // the ORDER BY keeps the rows of one track adjacent; a track without files has
+        // a single row with no file
+        Ok(rows
+            .chunk_by(|a, b| a.track == b.track)
+            .filter(|track| filter.keeps(track[0].meta.is_some(), track[0].file.is_some()))
+            .filter(|track| mentions_query(track))
+            .map(|track| TrackMatch {
+                track: track[0].track,
+                files: track.iter().filter_map(|r| r.file.clone()).map(Into::into).collect(),
+                meta: track[0].meta.clone(),
+            })
+            .collect())
     }
 
     /// Removes dangling track entries from the database.
@@ -1023,87 +997,40 @@ impl Storage {
         Ok(CleanDanglingReport { removed_tracks })
     }
 
-    /// removes all files inside specified directory from the database
-    /// useful when some files got moved or deleted
+    /// Removes the record of the file at `path`.
+    /// The track stays, with its metadata and cards, even when no files are left.
     ///
     /// The path is mapped to a library location the same way `add` does it,
     /// so it has to lie under a configured root but does not have to exist.
+    ///
+    /// [`StorageError::FileNotRecorded`] when no track has this file.
     pub fn forget_path(&mut self, path: &Path) -> Result<ForgetReport, StorageError> {
-        let LocationRow {
-            usb_label,
-            path: path_prefix,
-        } = LocationRow::from_location(self.fs.reverse_resolve(path)?)?;
-
-        let dir_prefix = if path_prefix.is_empty() || path_prefix.ends_with(LOCATION_PATH_SEP) {
-            format!("{path_prefix}%")
-        } else {
-            format!("{path_prefix}{LOCATION_PATH_SEP}%")
-        };
+        let row = LocationRow::from_location(self.fs.reverse_resolve(path)?)?;
 
         let tx = self.db.transaction()?;
-        // --------------------------------------------------
-        // Collect affected track ids BEFORE deletion
-        // --------------------------------------------------
-
-        let mut stmt = tx.prepare(&format!(
-            "SELECT DISTINCT {TRACK_ID} FROM {FILES}
-         WHERE {USB_LABEL} = ?3 AND ({PATH} = ?1 OR {PATH} LIKE ?2)"
-        ))?;
-
-        let affected_track_ids = stmt
-            .query_map(params![path_prefix, dir_prefix, usb_label], |row| {
-                row.get::<_, TrackId>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        drop(stmt);
-
-        let affected_tracks = affected_track_ids.len();
-
-        // --------------------------------------------------
-        // Delete entries
-        // --------------------------------------------------
-
-        let removed_files = tx.execute(
-            &format!(
-                "DELETE FROM {FILES}
-             WHERE {USB_LABEL} = ?3 AND ({PATH} = ?1 OR {PATH} LIKE ?2)"
-            ),
-            params![path_prefix, dir_prefix, usb_label],
-        )?;
-
-        // --------------------------------------------------
-        // Count removed tracks (tracks with zero files left)
-        // --------------------------------------------------
-
-        let mut removed_tracks = 0;
-
-        for track_id in &affected_track_ids {
-            let remaining: isize = tx.query_row(
+        let track: TrackId = tx
+            .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM {FILES}
-                 WHERE {TRACK_ID} = ?1"
+                    "DELETE FROM {FILES} WHERE {USB_LABEL} = ?1 AND {PATH} = ?2
+                     RETURNING {TRACK_ID}"
                 ),
-                params![track_id],
-                |row| row.get(0),
-            )?;
+                params![row.usb_label, row.path],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::FileNotRecorded(path.to_path_buf()))?;
 
-            if remaining == 0 {
-                removed_tracks += 1;
-            }
-        }
-
-        // --------------------------------------------------
-        // Record update timestamp
-        // --------------------------------------------------
+        let has_files: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {FILES} WHERE {TRACK_ID} = ?1)"),
+            params![track],
+            |r| r.get(0),
+        )?;
         Self::insert_update_time(&tx)?;
-
         tx.commit()?;
 
         Ok(ForgetReport {
-            removed_tracks,
-            affected_tracks,
-            removed_files,
+            track,
+            track_emptied: !has_files,
         })
     }
 
@@ -1471,7 +1398,7 @@ impl Storage {
 }
 
 /// DB format of storing file location
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LocationRow {
     /// present if file is stored on usb, empty otherwise
     usb_label: String,
@@ -2472,6 +2399,46 @@ mod tests {
     }
 
     #[test]
+    fn test_find_tracks_ignores_case_of_cyrillic() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init(&conn).unwrap();
+        let tracks = insert_tracks(&mut conn, 2);
+        insert_fake_files(
+            &mut conn,
+            vec![
+                (tracks[0], "Жёлтая ветка.m4a", MOCKED_FILE_SIZE),
+                (tracks[1], "track.m4a", MOCKED_FILE_SIZE),
+            ],
+            None,
+        );
+        conn.execute(
+            &format!(
+                "INSERT INTO {TRACK_METADATA} ({TRACK_ID}, {TITLE}, {ARTIST}) VALUES (?1, ?2, ?3)"
+            ),
+            rusqlite::params![tracks[1], "Первый Снег", "Сова"],
+        )
+        .unwrap();
+        let mut storage = Storage::from_existing_conn(conn, LibrarySource::default());
+
+        for query in ["Жёл", "жёл", "ЖЁЛ"] {
+            let results = storage.find_tracks(query, FindFilter::default()).unwrap();
+            assert_eq!(
+                results.iter().map(|m| m.track).collect::<Vec<_>>(),
+                vec![tracks[0]],
+                "path, query {query:?}"
+            );
+        }
+        for query in ["снег", "СНЕГ", "сова", "СОВА"] {
+            let results = storage.find_tracks(query, FindFilter::default()).unwrap();
+            assert_eq!(
+                results.iter().map(|m| m.track).collect::<Vec<_>>(),
+                vec![tracks[1]],
+                "metadata, query {query:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_find_tracks_by_card_id() -> anyhow::Result<()> {
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init(&conn).unwrap();
@@ -2746,51 +2713,6 @@ mod tests {
         }
 
         #[test]
-        fn forget_dir_removes_its_files_and_reports_tracks() -> anyhow::Result<()> {
-            let dir = tempdir()?;
-            let root = dir.path();
-            std::fs::create_dir(root.join("music"))?;
-            let mut storage = setup_storage(root)?;
-            let tracks = insert_tracks(&mut storage.db, 3);
-            let at = |rel: &str| replace_windows_slashes(&root.join(rel));
-            insert_fake_files(
-                &storage.db,
-                [
-                    (tracks[0], at("music/a1.mp3"), MOCKED_FILE_SIZE),
-                    (tracks[0], at("music/subdir/a2.mp3"), MOCKED_FILE_SIZE),
-                    (tracks[1], at("music/b.mp3"), MOCKED_FILE_SIZE),
-                    (tracks[2], at("hello/c.mp3"), MOCKED_FILE_SIZE),
-                    (tracks[0], at("hello/a3.mp3"), MOCKED_FILE_SIZE),
-                ],
-                None,
-            );
-
-            let report = storage.forget_path(&root.join("music"))?;
-
-            assert_eq!(report.removed_files, 3);
-            assert_eq!(report.affected_tracks, 2);
-            assert_eq!(report.removed_tracks, 1);
-            assert_eq!(recorded_paths(&storage).len(), 2);
-            Ok(())
-        }
-
-        #[test]
-        fn forget_dir_without_recorded_files_removes_nothing() -> anyhow::Result<()> {
-            let dir = tempdir()?;
-            let mut storage = setup_storage(dir.path())?;
-            let tracks = insert_tracks(&mut storage.db, 1);
-            let kept = replace_windows_slashes(&dir.path().join("kept.mp3"));
-            insert_fake_files(&storage.db, [(tracks[0], kept, MOCKED_FILE_SIZE)], None);
-
-            let report = storage.forget_path(&dir.path().join("empty"))?;
-
-            assert_eq!(report.removed_files, 0);
-            assert_eq!(report.affected_tracks, 0);
-            assert_eq!(recorded_paths(&storage).len(), 1);
-            Ok(())
-        }
-
-        #[test]
         fn forget_path_outside_library_fails_and_removes_nothing() -> anyhow::Result<()> {
             let dir = tempdir()?;
             let elsewhere = tempdir()?;
@@ -2823,8 +2745,7 @@ mod tests {
 
             let report = storage.forget_path(&mount.path().join("album/old.mp3"))?;
 
-            assert_eq!(report.removed_files, 1);
-            assert_eq!(report.removed_tracks, 0);
+            assert!(!report.track_emptied);
             assert_eq!(
                 recorded_paths(&storage),
                 vec![(LABEL.to_string(), "album/new.flac".to_string())]
@@ -2833,7 +2754,31 @@ mod tests {
         }
 
         #[test]
-        fn forget_usb_dir_leaves_local_file_with_same_relative_path() -> anyhow::Result<()> {
+        fn forget_unrecorded_path_fails_and_removes_nothing() -> anyhow::Result<()> {
+            let mount = tempdir()?;
+            std::fs::create_dir(mount.path().join("album"))?;
+            let mut storage = usb_storage(mount.path());
+            let tracks = insert_tracks(&mut storage.db, 1);
+            insert_fake_files(
+                &storage.db,
+                [(tracks[0], "album/song.mp3", MOCKED_FILE_SIZE)],
+                Some(LABEL.to_string()),
+            );
+
+            for unrecorded in ["album", "album/other.mp3"] {
+                let err = storage.forget_path(&mount.path().join(unrecorded)).unwrap_err();
+
+                assert!(matches!(err, StorageError::FileNotRecorded(_)), "{unrecorded}: {err}");
+                assert_eq!(
+                    recorded_paths(&storage),
+                    vec![(LABEL.to_string(), "album/song.mp3".to_string())]
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn forget_usb_file_leaves_local_file_with_same_relative_path() -> anyhow::Result<()> {
             let mount = tempdir()?;
             std::fs::create_dir(mount.path().join("album"))?;
             let mut storage = usb_storage(mount.path());
@@ -2845,34 +2790,14 @@ mod tests {
             );
             insert_fake_files(&storage.db, [(tracks[1], "album/song.mp3", MOCKED_FILE_SIZE)], None);
 
-            let report = storage.forget_path(&mount.path().join("album"))?;
+            let report = storage.forget_path(&mount.path().join("album/song.mp3"))?;
 
-            assert_eq!(report.removed_files, 1);
+            assert_eq!(report.track, tracks[0]);
+            assert!(report.track_emptied);
             assert_eq!(
                 recorded_paths(&storage),
                 vec![(String::new(), "album/song.mp3".to_string())]
             );
-            Ok(())
-        }
-
-        #[test]
-        fn forget_usb_mount_root_forgets_whole_drive() -> anyhow::Result<()> {
-            let mount = tempdir()?;
-            let mut storage = usb_storage(mount.path());
-            let tracks = insert_tracks(&mut storage.db, 1);
-            insert_fake_files(
-                &storage.db,
-                [
-                    (tracks[0], "top.mp3", MOCKED_FILE_SIZE),
-                    (tracks[0], "album/deep.mp3", MOCKED_FILE_SIZE),
-                ],
-                Some(LABEL.to_string()),
-            );
-
-            let report = storage.forget_path(mount.path())?;
-
-            assert_eq!(report.removed_files, 2);
-            assert_eq!(report.removed_tracks, 1);
             Ok(())
         }
 
@@ -2888,9 +2813,8 @@ mod tests {
             let recorded = replace_windows_slashes(&root.join("old.mp3"));
             insert_fake_files(&storage.db, [(tracks[0], &recorded, MOCKED_FILE_SIZE)], None);
 
-            let report = storage.forget_path(&link.join("old.mp3"))?;
+            storage.forget_path(&link.join("old.mp3"))?;
 
-            assert_eq!(report.removed_files, 1);
             assert!(recorded_paths(&storage).is_empty());
             Ok(())
         }

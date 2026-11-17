@@ -82,11 +82,12 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = FilesArg::With)]
         files: FilesArg,
     },
-    /// Remove specified path from the database.
+    /// Remove the record of one file from the database.
     ///
-    /// Useful to stop tracking moved or deleted files
+    /// For a file you removed or moved out of the library yourself.
+    /// The track keeps its metadata and cards, even when no files are left.
     Forget {
-        /// Directory or file to remove from database
+        /// Music file to forget
         path: PathBuf,
     },
     /// Delete one recorded file, or every file of a track, from disk and forget them.
@@ -518,15 +519,11 @@ pub fn run() -> anyhow::Result<()> {
             }
         }
         Commands::Forget { path } => {
-            let mut storage = Storage::new(cfg.storage).expect("Failed to initialize storage");
+            let mut storage = Storage::new(cfg.storage)?;
             let report = storage.forget_path(&path)?;
-            if report.affected_tracks == 0 {
-                println!("No tracks located under {} found", path.to_string_lossy());
-            } else {
-                println!(
-                    "Forget operation completed:\n  Removed files: {}\n  Affected tracks: {}\n  Removed tracks: {}",
-                    report.removed_files, report.affected_tracks, report.removed_tracks
-                );
+            println!("Forgot {} from track {}", path.to_string_lossy(), report.track);
+            if report.track_emptied {
+                println!("Track {} has no files left", report.track);
             }
         }
         Commands::Delete {

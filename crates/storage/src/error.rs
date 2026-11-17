@@ -52,7 +52,7 @@ pub enum StorageError {
     #[error("'{0}' is both the old and the new file")]
     ReplaceWithItself(std::path::PathBuf),
 
-    #[error("file '{0}' is not recorded in the library, nothing to delete")]
+    #[error("file '{0}' is not recorded in the library")]
     FileNotRecorded(std::path::PathBuf),
 
     #[error("file '{0}' changed since the last update, run `update` first")]
